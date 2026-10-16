@@ -342,7 +342,10 @@ class InspectorPanel(QScrollArea):
         self._draw_widgets: dict = {}      # live widgets of the Draw section, if shown
         # wide enough for the richest param row (label + spinbox + unit + ƒ-auto button)
         # PLUS the vertical scrollbar, so the right edge (the ƒ-auto buttons) never clips.
-        self.setFixedWidth(376)
+        # A FLOOR, not a fixed width (2026-10-14): tabbed with Spreadsheet and LabLink, the
+        # column is as wide as its widest member, and a fixed 376 left Properties short of
+        # it with a blank strip down its right side.
+        self.setMinimumWidth(376)
         self.setStyleSheet(_inspector_qss())
         self._node: Optional[NodeItem] = None
         self._auto_boxes = []              # (node, socket, box) — live ƒmd refresh (G8)

@@ -23,7 +23,8 @@ def _compute_plot_timeseries(ctx: EvalContext) -> Dataset:
     * reads one table (``domain``, ``table``) and its ``value``, ``t`` and optional
       ``group_by`` columns; each row's frame ``t`` is placed on the time axis;
     * ``time`` elapsed: seconds since the first frame from the file's own per-frame clock
-      (``frame_time_jd``), else ``t x dt_s``, else the frame index (and the axis label says
+      (``frame_time_jd``), else the per-frame seconds an uneven subset of a clockless series
+      kept (``frame_time_s``), else ``t x dt_s``, else the frame index (and the axis label says
       so) — in s, min or h by the span; clock: wall-clock time when the file has a clock;
       frame: the frame index;
     * ``error`` (default sem): the rows of a frame summarised as mean ± spread, bars or band;
@@ -54,7 +55,8 @@ def _compute_plot_timeseries(ctx: EvalContext) -> Dataset:
     dt = ctx.calib("dt_s")
     times, xl, xkind = FIG.frame_times(frames, frame_time_jd=md.get("frame_time_jd"),
                                        dt_s=dt, mode=str(modes.get("time", "elapsed")),
-                                       utc_offset_s=md.get("utc_offset_s"))
+                                       utc_offset_s=md.get("utc_offset_s"),
+                                       frame_time_s=md.get("frame_time_s"))
     x = np.array([times[int(i)] if np.isfinite(i) and 0 <= int(i) < len(times) else np.nan
                   for i in tcol], dtype=float)
     if str(modes.get("time", "elapsed")) == "elapsed" and \

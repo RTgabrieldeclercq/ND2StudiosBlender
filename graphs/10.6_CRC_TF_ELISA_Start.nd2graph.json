@@ -1,0 +1,617 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg2",
+    "next_page_seq": 5,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n5",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n7",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n9",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_1_T1.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_1_T1.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_1_T5"
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_1_T1"
+              }
+            },
+            {
+              "id": "n3",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_1_T2.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_1_T2.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n4",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_1_T2"
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_1_T3.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_1_T3.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n6",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_1_T3"
+              }
+            },
+            {
+              "id": "n7",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_1_T4.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_1_T4.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n8",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_1_T4"
+              }
+            },
+            {
+              "id": "n9",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_1_T5.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_1_T5.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "input",
+        "master": null,
+        "name": "Image Input",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 142.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 1510.0
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 142.0
+            },
+            "n3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 484.0
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 484.0
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 826.0
+            },
+            "n6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 826.0
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 1168.0
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 1168.0
+            },
+            "n9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 1510.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "file_2",
+              "kind": "forward",
+              "src": "n10",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n13",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n11",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n9",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n12",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n7",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n12",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n5",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n6",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "file_3",
+              "kind": "forward",
+              "src": "n7",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "file_4",
+              "kind": "forward",
+              "src": "n8",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "file_5",
+              "kind": "forward",
+              "src": "n9",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_1_T5"
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {}
+            },
+            {
+              "id": "n11",
+              "modes": {},
+              "op_key": "util.timeseries",
+              "params": {}
+            },
+            {
+              "id": "n12",
+              "modes": {
+                "region": "frames"
+              },
+              "op_key": "util.crop",
+              "params": {
+                "__locked__": [
+                  "frames"
+                ],
+                "frames": "m0-39,t0-6,z0-2"
+              }
+            },
+            {
+              "id": "n13",
+              "modes": {},
+              "op_key": "registration.stabilize",
+              "params": {
+                "__locked__": [
+                  "ref_channel"
+                ],
+                "ref_channel": 1
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_1_T1"
+              }
+            },
+            {
+              "id": "n3",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_1_T2"
+              }
+            },
+            {
+              "id": "n4",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_1_T3"
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_1_T4"
+              }
+            },
+            {
+              "id": "n6",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {}
+            },
+            {
+              "id": "n7",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {}
+            },
+            {
+              "id": "n8",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {}
+            },
+            {
+              "id": "n9",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {}
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg2",
+        "kind": "refine",
+        "master": null,
+        "name": "Image Refinement",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 120.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 413.7535499999998,
+              "y": 802.7972749999999
+            },
+            "n11": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1176.3202749999996,
+              "y": 409.00056874999973
+            },
+            "n12": {
+              "collapsed": false,
+              "muted": false,
+              "x": 402.8761412612888,
+              "y": 984.8626146374604
+            },
+            "n13": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1641.3810368749992,
+              "y": 605.5888712499997
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 358.0
+            },
+            "n3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 596.0
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 83.72515625,
+              "y": 823.5059625000001
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 1072.0
+            },
+            "n6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 413.7535499999998,
+              "y": 326.79727499999984
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 413.7535499999998,
+              "y": 564.7972749999999
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 413.7535499999998,
+              "y": 1278.797275
+            },
+            "n9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 760.0567874999995,
+              "y": 944.6019312499996
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [],
+          "nodes": []
+        },
+        "groups": [],
+        "id": "pg3",
+        "kind": "process",
+        "master": null,
+        "name": "Image Processing",
+        "ui": {
+          "frames": {},
+          "nodes": {}
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [],
+          "nodes": []
+        },
+        "groups": [],
+        "id": "pg4",
+        "kind": "analyze",
+        "master": null,
+        "name": "Analysis",
+        "ui": {
+          "frames": {},
+          "nodes": {}
+        },
+        "zones": []
+      }
+    ]
+  }
+}

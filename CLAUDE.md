@@ -101,6 +101,10 @@ running code  >  codemap/gen/*.jsonl  >  codemap/*.md  >  the skills
 - The GUI gates run offscreen; they need `QT_QPA_PLATFORM=offscreen` on a headless box.
 - CellSAM's *second* model pull in one process crashes the interpreter — a native heap fault
   no `except` can catch. One pull per process.
+- **Selftest with the app open:** `test_analysis_store` fails with "two units ran serially
+  despite a pool … (in this process)". The cause is free RAM under the governor's 6 GB floor;
+  a running `run.py` can hold hundreds of GB. Run the selftest with
+  `NODEGRAPH_MIN_FREE_RAM=1G`, which still exercises the real pool.
 
 ## Two people, two Claudes — sync first, say why after
 

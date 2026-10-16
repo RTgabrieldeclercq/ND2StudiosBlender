@@ -2755,9 +2755,10 @@ class MainWindow(QMainWindow):
 
         A request below a dock's minimum (or against a fixed size) is clamped by Qt, so the
         Viewer sits at its minimum height on a short window, and the Properties column is
-        today held at the LabLink tab's minimum width (868 px, measured 2026-10-06) with the
-        panel itself fixed at 376 (``InspectorPanel.setFixedWidth``) — that request is a
-        no-op until those panels can shrink."""
+        today held at the LabLink tab's minimum width (868 px, measured 2026-10-06), and the
+        panel's own floor is 376 (``InspectorPanel.setMinimumWidth``) — that request is a
+        no-op until those panels can shrink. A floor, so the panel FILLS whatever width the
+        column has (it was fixed at 376 until 2026-10-14 and left a blank strip beside it)."""
         viewers = self.shell.docks_of(VIEWER_KIND)
         if viewers:
             d = viewers[0]
@@ -3046,9 +3047,14 @@ class MainWindow(QMainWindow):
             rec = self.doc.nodes.get(req.node_id)
             prm = rec.params if rec is not None else {}
             from nodegraph.placement import canvas_flip
+            on_canvas = md.get("canvas_flip") is not None
             req = _dc_replace(req, base=tuple(
                 (n, float(prm.get(n, 0.0) or 0.0)) for n in req.bounds),
-                mirror=canvas_flip(md) if md.get("canvas_flip") is not None else None)
+                mirror=canvas_flip(md) if on_canvas else None,
+                # off a canvas the primary runs the camera's way — the Overlay's own Flip X/Y
+                # (`placement.frame_mapping`), with the sockets' defaults
+                frame=None if on_canvas else (bool(prm.get("flip_x", True)),
+                                              bool(prm.get("flip_y", False))))
         v = v if v is not None else self._ensure_viewer()
         self._open_viewer(v)
         # the pick is for a node of the ACTIVE page: say so, so that it is written back

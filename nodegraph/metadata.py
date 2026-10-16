@@ -559,13 +559,27 @@ def stamp_source_file(env: "MetaEnvelope", path: str) -> "MetaEnvelope":
 #: list silently pairs frame 0 of one acquisition against frame 0 of the other's ORIGINAL
 #: numbering, and channel.merge then reads two different moments as one.
 #:
-#: Two members: the clock in Julian days and its readable twin ``frame_datetime``
+#: Three members: the clock in Julian days and its readable twin ``frame_datetime``
 #: (``YYYY-MM-DD HH:MM:SS.mmm``, 2026-10-02), which must reindex together or a frame would
-#: show one time and pair by another. ``frame_timestamps_s`` is deliberately absent: it
-#: never reaches a Dataset (:data:`nodelab_v2.ingest.PLACEMENT_KEYS` does not carry it),
-#: and ``dt_s`` is a scalar INTERVAL rather than a per-T list, so a subset re-spaces it
-#: instead of reindexing it (see :func:`respaced`).
-PER_TIME_KEYS: Tuple[str, ...] = ("frame_time_jd", "frame_datetime")
+#: show one time and pair by another; and :data:`FRAME_TIME_S_KEY` (2026-10-16), the
+#: per-frame seconds a CLOCKLESS series keeps once it is no longer evenly spaced (see
+#: :func:`retime`). ``frame_timestamps_s`` is deliberately absent: it never reaches a
+#: Dataset (:data:`nodelab_v2.ingest.PLACEMENT_KEYS` does not carry it), and ``dt_s`` is a
+#: scalar INTERVAL rather than a per-T list, so a subset re-spaces it instead of reindexing
+#: it (see :func:`respaced`).
+PER_TIME_KEYS: Tuple[str, ...] = ("frame_time_jd", "frame_datetime", "frame_time_s")
+
+#: The per-T list of each frame's time in SECONDS on its series' own timeline (2026-10-16).
+#: Written only where nothing else can say when a frame was taken: a series with an interval
+#: (``dt_s``) but no per-frame clock (a TIFF stack, a phantom, a typed interval) that a subset
+#: leaves UNEVENLY spaced — Trim's ``span``, a hand-picked Crop. Without it that series'
+#: timing is simply gone: ``dt_s`` can no longer describe it and there is no clock to fall
+#: back on, so every rate downstream would refuse and every time axis read frame numbers.
+#: Its origin is arbitrary (the source's frame 0); readers use differences, or subtract the
+#: first entry, exactly as they do with the clock (:func:`frame_times_s`). A concatenation
+#: (Merge onto T, a Timeseries Builder) drops it: each input's list is on its OWN timeline,
+#: and the seam between them is exactly what no clockless input can say.
+FRAME_TIME_S_KEY = "frame_time_s"
 
 
 def time_subset(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
@@ -694,6 +708,170 @@ def respaced(value: Any, keep: Sequence[int]) -> Any:
         return None
 
 
+# ── the time axis: one rule to rebuild it, one to read it (2026-10-16) ──────────────────
+#
+# A series says when its frames were taken in up to three ways: a per-frame clock
+# (``frame_time_jd``), per-frame seconds a clockless subset kept (``frame_time_s``), and one
+# interval (``dt_s``). Every node that narrows, reorders or concatenates T rebuilds all three
+# through :func:`retime` / :func:`concat_interval`, and every node that turns frames into
+# time reads them through :func:`frame_times_s` / :func:`series_seconds`. ``dt_s`` is
+# therefore present ONLY where it is true of every neighbouring pair, which is what lets a
+# rate divide by it without checking; where it is absent, the per-frame times say the rest.
+
+
+def series_seconds(metadata: Mapping[str, Any], n_t: int) -> Optional[List[float]]:
+    """Each frame's time in seconds since the FIRST frame, from what the series records PER
+    FRAME — its clock (``frame_time_jd``), else :data:`FRAME_TIME_S_KEY` — or ``None`` when it
+    records neither for exactly ``n_t`` frames. ``dt_s`` is not read: this is the per-frame
+    half that :func:`frame_times_s` falls back from, and what a rate reads when the interval
+    is absent because the frames are not evenly spaced."""
+    from nodegraph.placement import frame_seconds
+    md = metadata or {}
+    n = int(n_t)
+    secs = frame_seconds(md.get("frame_time_jd"), n)
+    if secs is not None:
+        return secs
+    vals = md.get(FRAME_TIME_S_KEY)
+    if n < 1 or not isinstance(vals, (list, tuple)) or len(vals) != n:
+        return None
+    try:
+        v = [float(x) for x in vals]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(x) for x in v):
+        return None
+    return [x - v[0] for x in v]
+
+
+def frame_times_s(metadata: Mapping[str, Any], n_t: int,
+                  dt_s: Any = None) -> Optional[List[float]]:
+    """Each frame's time in seconds since the first frame — the reading every time axis
+    shares: the per-frame clock, else the per-frame seconds a clockless subset kept, else
+    ``t × dt_s``, else ``None`` (the series is untimed). ``dt_s`` is for a caller that read
+    it memo-fenced (``ctx.calib``); left ``None``, the metadata's own is used."""
+    secs = series_seconds(metadata, n_t)
+    if secs is not None:
+        return secs
+    raw = dt_s if dt_s is not None else (metadata or {}).get("dt_s")
+    try:
+        d = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if int(n_t) < 1 or not (math.isfinite(d) and d > 0):
+        return None
+    return [i * d for i in range(int(n_t))]
+
+
+def uniform_step_s(seconds: Optional[Sequence[float]]) -> Optional[float]:
+    """The single spacing of per-frame times in seconds, or ``None`` when they have none —
+    :func:`chain_uniform_step_s`'s rule (every step forward and within
+    :data:`CHAIN_UNIFORM_STEP_TOL` of the median step) applied to seconds rather than to a
+    Julian-day clock, so a subset and a Timeseries Builder call the same frames even."""
+    if seconds is None or len(seconds) < 2:
+        return None
+    try:
+        steps = sorted(float(b) - float(a) for a, b in zip(seconds, seconds[1:]))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(s) and s > 0 for s in steps):
+        return None
+    med = steps[len(steps) // 2]
+    if steps[0] < med * (1 - CHAIN_UNIFORM_STEP_TOL) or \
+            steps[-1] > med * (1 + CHAIN_UNIFORM_STEP_TOL):
+        return None
+    return med
+
+
+def retime(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
+    """The ``{key: value}`` changes that rebuild a series' TIME after T is subset to ``keep``
+    (validated indices, in output order) — the one rule every node that narrows or reorders T
+    applies (Crop's frames mode, Select Frame, Trim, Batch's alignment, a zone's frame slice),
+    so a time axis downstream reads the same whichever node cut it.
+
+    * **the per-frame lists follow** (:func:`time_subset`): the clock, its readable text, a
+      bundle's per-file clocks, :data:`FRAME_TIME_S_KEY`;
+    * **``dt_s`` is the interval that is true of the KEPT frames.** A contiguous run keeps
+      it (nothing was skipped, so it says what it said of the source). A pick that SKIPS
+      frames is checked against the kept frames' own times where the series has them: an
+      evenly strided pick multiplies the interval (:func:`respaced`) when the clock bears that
+      out, takes the clock's single step when it does not (the source paused), and any pick
+      whose kept times are not even (:func:`uniform_step_s`) drops the key — a rate
+      downstream then divides each step by that step's own gap (:func:`series_seconds`)
+      rather than by one number that is wrong for some of them. A series that had no
+      interval gains the clock's, where the kept frames are even;
+    * **a clockless series picked unevenly keeps each frame's time** as
+      :data:`FRAME_TIME_S_KEY` (source index × ``dt_s``) — the only way its timing survives,
+      since afterwards neither an interval nor a clock could say it.
+
+    One kept frame keeps the source interval (``respaced``: it is still one frame of a series
+    with that interval), and a series with no timing at all gains none."""
+    md = metadata or {}
+    keep = [int(i) for i in keep]
+    changes: Dict[str, Any] = dict(time_subset(md, keep))
+    dt = md.get("dt_s")
+    new_dt = respaced(dt, keep)
+    skips = any(b - a != 1 for a, b in zip(keep, keep[1:]))
+    if len(keep) >= 2 and (skips or new_dt is None):
+        secs = series_seconds({**md, **changes}, len(keep))
+        if secs is not None:
+            uni = uniform_step_s(secs)
+            try:
+                nominal = float(new_dt) if new_dt is not None else None
+            except (TypeError, ValueError):
+                nominal = None
+            if not (uni is not None and nominal is not None
+                    and abs(nominal - uni) <= CHAIN_UNIFORM_STEP_TOL * uni):
+                new_dt = uni
+        elif new_dt is None and dt is not None:
+            try:
+                d = float(dt)
+            except (TypeError, ValueError):
+                d = float("nan")
+            if math.isfinite(d) and d > 0:
+                changes[FRAME_TIME_S_KEY] = [i * d for i in keep]
+    changes["dt_s"] = new_dt
+    return changes
+
+
+def concat_interval(member_dts: Sequence[Any],
+                    seconds: Optional[Sequence[float]]) -> Optional[float]:
+    """``dt_s`` for a series laid end to end from several inputs (Merge onto T, a Timeseries
+    Builder) — :func:`retime`'s rule for a concatenation.
+
+    With the result's full per-frame times (``seconds``) the interval is what those frames
+    really have: the inputs' own when they all agree and the clock bears it out across every
+    seam (within :data:`CHAIN_UNIFORM_STEP_TOL`), else the clock's single step, else none —
+    a gap between two files is a step like any other, and an in-file interval that survived
+    across it would be believed by every rate at the seam. Without per-frame times the seam
+    cannot be known: the inputs' interval when they all agree, else none."""
+    vals = set()
+    for v in member_dts:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f) and f > 0:
+            vals.add(f)
+    agreed = next(iter(vals)) if len(vals) == 1 else None
+    if seconds is None:
+        return agreed
+    uni = uniform_step_s(seconds)
+    if uni is None:
+        return None
+    if agreed is not None and abs(agreed - uni) <= CHAIN_UNIFORM_STEP_TOL * uni:
+        return agreed
+    return uni
+
+
+def drop_time_lists(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    """``{key: None}`` for every per-frame time list ``metadata`` carries (the clock, its
+    text, :data:`FRAME_TIME_S_KEY`, a bundle's per-file clocks) and for ``dt_s`` — what a
+    node that REDUCES T to one frame applies (a temporal stack): the result is no single
+    moment, so any one frame's time would be believed and be wrong."""
+    keys = (*PER_TIME_KEYS, SOURCE_CLOCK_KEY, "dt_s")
+    return {k: None for k in keys if (metadata or {}).get(k) is not None}
+
+
 def z_home_after(metadata: Mapping[str, Any], keep: Sequence[int]) -> Dict[str, Any]:
     """``{"z_home_index": …}`` for a Z axis subset to ``keep``, or ``{}`` if nothing to say.
 
@@ -774,18 +952,31 @@ def z_project(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelop
 
 
 def stack_time(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
-    """Temporal stack T→1; drop ``dt_s``. A ``sum`` combiner also widens ``bit_depth``
-    (n_t summed samples) — the "12-bit in, 16-bit out" case."""
+    """Temporal stack T→1; drop ``dt_s`` AND every per-frame time list
+    (:func:`drop_time_lists`, 2026-10-16) — the stacked frame is no single moment, and a
+    full-length clock left on a one-frame result reads as frame 0's time. A ``sum`` combiner
+    also widens ``bit_depth`` (n_t summed samples) — the "12-bit in, 16-bit out" case."""
     widen = (bit_depth_after_sum(env, env.axes.t)
              if modes.get("method") == "sum" else {})
-    return env.with_axes(replace(env.axes, t=1)).with_metadata(dt_s=None, **widen)
+    return (env.with_axes(replace(env.axes, t=1))
+               .with_metadata(**drop_time_lists(env.metadata), **widen))
 
 
 def frame_slice(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
-    """Per-frame-T slice (``zone.frame``): select one timepoint → T=1. The frame index
-    picks *which* frame (a value, not geometry), so axes just collapse to t=1; ``dt_s``
-    is kept (it still describes the source series' interval)."""
-    return env.with_axes(replace(env.axes, t=1))
+    """Per-frame-T slice (``zone.frame``): select one timepoint → T=1. The per-frame lists
+    are subset to that frame (:func:`retime`, 2026-10-16 — they used to stay full length on
+    a one-frame result, so the slice of frame 5 claimed frame 0's time); ``dt_s`` is kept
+    (one frame of a series keeps the series' interval). The frame is the zone's
+    ``__frame__`` stamp, 0 when unstamped — the compute's own default."""
+    ax = env.axes
+    try:
+        t = int((params or {}).get("__frame__", 0) or 0)
+    except (TypeError, ValueError):
+        t = 0
+    out = env.with_axes(replace(ax, t=1))
+    if 0 <= t < int(ax.t):
+        out = out.with_metadata(**retime(env.metadata, [t]))
+    return out
 
 
 def parse_channels(raw) -> Optional[List[int]]:
@@ -1304,8 +1495,7 @@ def crop_frames(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvel
     if ms is not None:
         changes.update(position_subset(env.metadata, keep_m))
     if ts is not None:
-        changes.update(time_subset(env.metadata, keep_t))
-        changes["dt_s"] = respaced(env.metadata.get("dt_s"), keep_t)
+        changes.update(retime(env.metadata, keep_t))
     z_step = env.metadata.get("z_step_um")
     if zs is not None:
         changes["z_step_um"] = respaced(z_step, keep_z)
@@ -1566,19 +1756,16 @@ def select_frame(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnve
     T-axis member of the tap family and the tap ``util.split_t``'s per-frame outputs
     materialize into.
 
-    The T half of :func:`crop_frames` exactly: the per-T lists follow (:func:`time_subset`)
-    and ``dt_s`` survives (one frame keeps the source interval — :func:`respaced`), so this
-    and a Crop keeping ``t3`` describe the frame the same way. Blank resolves to frame 0; an
+    The T half of :func:`crop_frames` exactly, through the same :func:`retime`: the per-T
+    lists follow and ``dt_s`` survives (one frame keeps the source interval), so this and a
+    Crop keeping ``t3`` describe the frame the same way. Blank resolves to frame 0; an
     out-of-range or unparseable value HOLDS the envelope and lets the payload raise the real
     message; a single-frame input is the identity."""
     ax = env.axes
     k = frame_pick(int(ax.t), params.get("frame"))
     if k is None or int(ax.t) <= 1:
         return env
-    md = env.metadata
-    changes: Dict[str, Any] = dict(time_subset(md, (k,)))
-    changes["dt_s"] = respaced(md.get("dt_s"), (k,))
-    return env.with_axes(replace(ax, t=1)).with_metadata(**changes)
+    return env.with_axes(replace(ax, t=1)).with_metadata(**retime(env.metadata, (k,)))
 
 
 def stitch(env: MetaEnvelope, params: Mapping, modes: Mapping) -> MetaEnvelope:
@@ -2181,12 +2368,24 @@ def chained_metadata(members: Sequence[ChainMember], axis: str, n: int,
         if perm is not None:
             out.update(time_subset({key: out[key] for key in PER_TIME_KEYS
                                     if isinstance(out.get(key), list)}, perm))
-            # Interleaved, neighbouring output frames are no longer one in-file interval
-            # apart, so the file's `dt_s` would be believed and be wrong (a speed divided
-            # by 163 min where the frames are 30 min apart). The `respaced` rule: a uniform
-            # merge has a spacing and gets it; an irregular one has none and drops it.
-            if members[0].metadata.get("dt_s") is not None:
-                out["dt_s"] = chain_uniform_step_s(out.get("frame_time_jd"))
+        # Each member's per-frame seconds are on its OWN timeline, so laid end to end they
+        # describe no seam at all (FRAME_TIME_S_KEY): dropped, never concatenated.
+        if any(mm.metadata.get(FRAME_TIME_S_KEY) is not None for mm in members):
+            out[FRAME_TIME_S_KEY] = None
+        # dt_s — interleaved and block order alike (2026-10-16): the interval the BUILT
+        # frames really have (`concat_interval`). Interleaved, neighbouring output frames
+        # are no longer one in-file interval apart (a speed divided by 163 min where the
+        # frames are 30 min apart). Block order used to keep the first file's in-file
+        # interval across every seam — believed by every rate at the seam however long the
+        # gap between files — and files of one frame each (a per-frame export) came out with
+        # no interval at all however evenly they were taken.
+        from nodegraph.placement import frame_seconds
+        total = sum(mm.extent(axis) for mm in members)
+        secs = frame_seconds(out.get("frame_time_jd"), total)
+        member_dts = [mm.metadata.get("dt_s") for mm in members]
+        dt = concat_interval(member_dts, secs)
+        if dt is not None or any(v is not None for v in member_dts):
+            out["dt_s"] = dt
     return out
 
 
@@ -2663,5 +2862,7 @@ __all__ = [
     "chained_metadata", "ChainMember", "chain_members", "chain_member_frame_clock",
     "chain_frame_order", "chain_uniform_step_s", "stamp_source_file", "scope_stamp_subset",
     "PER_TIME_KEYS", "CONDITION_KEY", "CONDITION_SET_KEY", "time_subset", "respaced", "z_home_after",
+    "FRAME_TIME_S_KEY", "series_seconds", "frame_times_s", "uniform_step_s", "retime",
+    "concat_interval", "drop_time_lists",
     "eval_derive", "resolve_dim_default",
 ]

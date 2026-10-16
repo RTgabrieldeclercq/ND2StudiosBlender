@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 138,
+    "nodes": 143,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 960,
-    "outputs": 145,
+    "inputs": 1028,
+    "outputs": 150,
     "gui_ops_included": true
   },
   "stages": {
@@ -103,6 +103,7 @@
         "util.split_t",
         "util.split_z",
         "util.timeseries",
+        "util.trim",
         "util.unbatch"
       ]
     },
@@ -205,6 +206,7 @@
         "analysis.dic_correlate",
         "analysis.dvc_field",
         "analysis.filter_labels",
+        "analysis.gradient_map",
         "analysis.if_else",
         "analysis.measure",
         "analysis.object_field",
@@ -239,6 +241,9 @@
         "table.aggregate",
         "table.concat",
         "table.join",
+        "table.point_source_fit",
+        "table.register_positions",
+        "table.standard_curve",
         "table.unique_objects",
         "track.link",
         "track.objects"
@@ -320,8 +325,8 @@
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
       "stage": "acquire_and_organize",
-      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, timepoints, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
-      "count": 15,
+      "description": "Bookkeeping on the Dataset's axes without arithmetic on pixels: pick or split channels, z planes, timepoints, thin an axis to evenly spaced frames, stack files on the batch axis and fan them back out, lay files along one axis, merge Datasets, keep one specimen group of positions, keep one PART of a Dataset (the image alone, or one mask, label set or table - the tap a card's part socket makes).",
+      "count": 16,
       "ops": [
         {
           "op": "channel.select",
@@ -392,6 +397,11 @@
           "op": "util.timeseries",
           "label": "Timeseries Builder",
           "summary": "Build one series from many source FILES: wire each file (or multi-file card) into its own slot — a new empty slot appears as you fill the last — and the files are laid onto ONE axis (Time by default; or Channels, Z, positions) in the order their acquisition clocks say, so the series is right whatever order you dropped them in. Falls back to the counting number in the filenames, then to wiring order, and says which on the card. A pure index remap: nothing is resampled or copied. Put it directly after the loaders — it refuses an input that already carries masks, labels or measurements, since those are indexed by the axis it re-addresses. (Formerly Chain Files, util.chain.)"
+        },
+        {
+          "op": "util.trim",
+          "label": "Trim",
+          "summary": "Scale one axis down by keeping evenly spaced frames — 12 timepoints trimmed to a third are frames 0, 3, 7 and 11 (or a fixed number of frames). Time by default, or Z planes or positions. The per-frame clock, masks and detections follow, and it works before a Timeseries Builder (each file's frames are trimmed and still interleave by their real times) or after it (the built series is trimmed). A lazy view: dropped frames are never read."
         },
         {
           "op": "util.unbatch",
@@ -599,7 +609,7 @@
         {
           "op": "util.stack",
           "label": "Stack (T→1)",
-          "summary": "Stack the Timepoint axis → one frame (SNR↑) with a robust combiner (mean/median/sigma-clip/trimmed); drops dt_s."
+          "summary": "Stack the Timepoint axis → one frame (SNR↑) with a robust combiner (mean/median/sigma-clip/trimmed); drops dt_s and the per-frame clock, since the fused frame is no single moment."
         },
         {
           "op": "util.stitch",
@@ -758,13 +768,18 @@
     "measurement_and_statistics": {
       "label": "Measurement & statistics",
       "stage": "quantify",
-      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, point clustering, and reduction of any layer or column to one Global scalar.",
-      "count": 5,
+      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
+      "count": 6,
       "ops": [
         {
           "op": "analysis.cluster_points",
           "label": "Cluster Points",
           "summary": "Cluster a Point cloud into groups (GaussianMixture / KMeans, BIC model-order sweep over n_clusters ± relax%) → a per-point cluster-id label column; µm-scaled so anisotropic Z doesn't bias the fit (ported v1 kernel; scikit-learn)."
+        },
+        {
+          "op": "analysis.gradient_map",
+          "label": "Gradient Map",
+          "summary": "A value measured at scattered objects (capture beads' MFI) as a map over an image: the exponential decay fitted against distance from a point source, times the objects' own deviations interpolated between them — one map per frame or per timepoint, as a lattice Point table that Plot Field and the Viewer's Field tab colour."
         },
         {
           "op": "analysis.measure",
@@ -832,8 +847,8 @@
     "table_synthesis": {
       "label": "Table synthesis",
       "stage": "quantify",
-      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N.",
-      "count": 4,
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N. Register Positions moves a later run's stage positions into a reference run's frame by the objects both contain, for a plate taken off the stage and put back. Standard Curve turns a measured signal into a concentration through a Langmuir or linear curve fitted from standards measured the same way. Point-Source Fit fits Crank's continuous point source to those concentrations against distance and time, for a secreting source's production rate (and the diffusivity).",
+      "count": 7,
       "ops": [
         {
           "op": "table.aggregate",
@@ -849,6 +864,21 @@
           "op": "table.join",
           "label": "Table Join",
           "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame or track — left or inner — as a new joined table."
+        },
+        {
+          "op": "table.point_source_fit",
+          "label": "Point-Source Fit (Crank)",
+          "summary": "Fit Crank's continuous point source (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — for its production rate per timepoint (or per interval) with bootstrap intervals, and the diffusivity if asked; adds the model's value per row and a rates table, and records the fit for Plot XY's and Gradient Map's trend."
+        },
+        {
+          "op": "table.register_positions",
+          "label": "Register Positions",
+          "summary": "Move a table's stage positions into a reference table's frame, fitted on the objects both contain: the shift is voted from every row pair, the objects are paired within a tolerance, and a rigid turn + shift (or a shift) is fitted to them — a plate re-imaged after it was taken off the stage."
+        },
+        {
+          "op": "table.standard_curve",
+          "label": "Standard Curve",
+          "summary": "Turn a measured signal (a bead's MFI) into a concentration through a standard curve — Langmuir or linear, fitted from standards measured the same way and wired in, or typed — with each row flagged in range, extrapolated, under the detection limit or past the curve."
         },
         {
           "op": "table.unique_objects",
@@ -1173,6 +1203,7 @@
       "analysis.edt",
       "analysis.extract_boundary",
       "analysis.filter_labels",
+      "analysis.gradient_map",
       "analysis.histogram_threshold",
       "analysis.if_else",
       "analysis.label",
@@ -1291,6 +1322,9 @@
       "table.aggregate",
       "table.concat",
       "table.join",
+      "table.point_source_fit",
+      "table.register_positions",
+      "table.standard_curve",
       "table.unique_objects"
     ],
     "transform": [
@@ -1321,6 +1355,7 @@
       "util.stitch",
       "util.time_shift",
       "util.timeseries",
+      "util.trim",
       "util.unbatch",
       "util.zproject"
     ],
@@ -3292,6 +3327,352 @@
         "percentile"
       ]
     },
+    "analysis.gradient_map": {
+      "op": "analysis.gradient_map",
+      "label": "Gradient Map",
+      "category": "analysis",
+      "role": "measurement_and_statistics",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/gradient_map.py",
+      "gui_only": false,
+      "summary": "A value measured at scattered objects (capture beads' MFI) as a map over an image: the exponential decay fitted against distance from a point source, times the objects' own deviations interpolated between them — one map per frame or per timepoint, as a lattice Point table that Plot Field and the Viewer's Field tab colour.",
+      "overview": "A value measured at scattered objects (capture beads' MFI) as a FIELD over an image, following the exponential decay those values show with distance from a point source. Resolved spec (2026-10-15, `build-node-v2`): * **Kind** analysis → ``analysis.gradient_map``: tables in, two Point tables out, on the image of ``data`` (an Experiment Canvas with a baked background, a stitched mosaic): ONE field (M = 1) and one plane (Z = 1), placed by its stage box — refused otherwise with the node that makes one. * **Inputs** the objects' table (``points``, or ``data``'s own when unwired): ``x`` / ``y`` / ``z`` stage columns (z blank = distances in the XY plane) and ``value``; the ``source`` table, whose rows' mean x / y / z is the source (required by the trend methods, optional for ``idw``). * **Frames** blank ``per_by`` = one map per frame of ``data`` from the rows with that ``t``; a column = one frame per distinct value in first-seen order (three timepoints from different files), T becomes their count — data-dependent, so the envelope marks T unknown — the image repeats its first frame (or frame k when the counts agree), the clock keys are dropped and ``frame_names`` carries the values (titles say them). * **Method** ``trend_idw`` (default): the exponential of :func:`frame_map` (the same ``xy_exponential`` Plot XY draws, ``weight`` relative = ln y / absolute = data units, rows under ``fit_floor`` left out) times ``exp`` of the inverse-distance-weighted (``power``) log residuals — exact at every object, the decay's shape between them, the trend again past ``reach`` (0 = never); ``trend`` the exponential alone; ``idw`` plain IDW of ln value. With a Z column the map is the horizontal plane ``height`` above the source, and every distance is 3-D: the trend's (node → source) and the interpolation's (node → object), so an object far above the plane weighs as far away — a dim bead 665 µm over a spheroid does not punch a hole beside it at the spheroid's own height (2026-10-15, seen at T1). Without Z, both are XY. ``exclude`` (µm, or a column's median) blanks the nodes within that XY distance of the source — the source itself. * **Lattice** nodes ``spacing`` apart (rounded so they tile the image exactly), centred in their cells, in the compositor's continuous pixel convention (pixel i spans [i, i+1]; Measure's centroids sit half a pixel off it). Columns: ``id m t c z y x`` (z = 0), ``stage_x_um`` / ``stage_y_um``, ``distance_um`` (to the source), ``<value>``, ``trend``, ``nearest_um``. The objects table copies each used row with its position on this image and ``distance_um``, ``trend``, ``log_residual`` and the frame's ``trend_a`` / ``trend_lambda_um`` / ``trend_r2``. Both carry the value column's unit. * **Footprint** WHOLE_SERIES, empty kernel_axes: no pixel is read; the image is passed on (re-indexed along T when frames are groups). Numpy only (scipy via the exponential's absolute fit). A frame with fewer than two usable objects is all-NaN, said on the rail.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": [
+          "point"
+        ]
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "description": "Which kind of table holds the measured objects.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        },
+        {
+          "name": "source_domain",
+          "label": "Source domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "description": "Which kind of table on the Source wire locates the source.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        },
+        {
+          "name": "method",
+          "label": "Method",
+          "choices": [
+            "trend_idw",
+            "trend",
+            "idw",
+            "point_source_idw",
+            "point_source"
+          ],
+          "default": "trend_idw",
+          "description": "How the space between the objects is filled.",
+          "choice_docs": {
+            "trend_idw": "The exponential decay fitted to the objects against their distance from the source, times their inverse-distance-weighted log deviations from it: the map passes through every object's value and between them changes the way the decay does; beyond Reach it is the decay alone. Needs Source.",
+            "trend": "The fitted exponential decay alone — a smooth radial field round the source that ignores how each object departs from it (an outlier bead leaves no mark). Needs Source.",
+            "idw": "Inverse-distance weighting of the log values, no model and no source: the map is a weighted geometric mean of nearby objects, flat between them and the average far from them.",
+            "point_source_idw": "As trend_idw, but the trend is the Crank point-source profile a Point-Source Fit upstream fitted (its D, and this timepoint's time), its AMPLITUDE refitted to these objects — so a subset (beads near the floor) sets the level, every bead the shape. Through the fit's standard curve when Value is the signal. Needs Source and the fit; Per column must be the fit's Group.",
+            "point_source": "The refitted point-source profile alone (see point_source_idw) — a smooth radial field that ignores how each object departs from it. Needs Source and the fit."
+          }
+        },
+        {
+          "name": "weight",
+          "label": "Trend weighting",
+          "choices": [
+            "relative",
+            "absolute"
+          ],
+          "default": "relative",
+          "available_in": {
+            "method": [
+              "point_source",
+              "point_source_idw",
+              "trend",
+              "trend_idw"
+            ]
+          },
+          "description": "How the decay is fitted to the objects — the same choice as Plot XY's exponential trendline. Moves λ and every map value.",
+          "choice_docs": {
+            "relative": "Fit ln value: each object weighs by its ratio to the curve, so dim far beads count as much as bright near ones and λ is stable between timepoints.",
+            "absolute": "Least squares in the value's own units: the brightest few objects decide the curve, as the eye does on a linear plot; λ can swing with a few bright beads."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The image the map is drawn on — ONE field and ONE plane with a stage placement: an Experiment Canvas spanning every file (Overlay output = resample bakes a background onto it) or a stitched, projected mosaic. Passed on with the map's two Point tables added."
+        },
+        {
+          "name": "points",
+          "label": "Points",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "The Dataset whose table holds the measured objects — beads with their stage position and value. Unwired: `data`'s own table."
+        },
+        {
+          "name": "source",
+          "label": "Source",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "The Dataset whose table locates the point source (the Measure of a spheroid's whole mass): the mean of its rows' X / Y / Z. Required by the trend methods; optional for idw."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "layer_from": "points",
+          "description": "The objects' table. Blank uses the only one of its kind on the Points wire (or on `data` when Points is unwired)."
+        },
+        {
+          "name": "source_table",
+          "label": "Source table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "source_domain",
+          "layer_from": "source",
+          "description": "The table on the Source wire whose rows locate the source. Blank uses the only one of its kind there."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column mapped — each object's measurement (a bead's background-subtracted MFI, or its concentration after a Standard Curve). Required. The map is in its units."
+        },
+        {
+          "name": "x",
+          "label": "X",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_x_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The objects' stage X in µm, in the SAME stage frame as `data` and the source (register later runs first)."
+        },
+        {
+          "name": "y",
+          "label": "Y",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_y_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The objects' stage Y in µm, as X."
+        },
+        {
+          "name": "z",
+          "label": "Z",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_z_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The objects' focus in µm: distances become 3-D — to the source for the trend, and from each map node (in the plane Plane height above the source) to each object for the interpolation — so a bead high above a spheroid counts as far from it. Blank uses XY distances only. Changes the fitted λ and every map value."
+        },
+        {
+          "name": "per_by",
+          "label": "Per column",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "One map per distinct value of this column — a Table Concat's `condition` (timepoints from different files) — in first-seen order, as the frames of the output; titles name them. Blank: one map per frame of `data`, from the rows of that frame."
+        },
+        {
+          "name": "spacing",
+          "label": "Spacing",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 25.0,
+          "description": "Distance between the map's nodes. SMALLER is smoother and slower (rows grow with the square: a 9 mm canvas at 25 µm is ~130,000 nodes a frame). Rounded so the nodes tile the image exactly."
+        },
+        {
+          "name": "fit_floor",
+          "label": "Fit floor",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Objects whose value is below this leave the fit and the interpolation (they stay in the objects table) — a background-subtracted reading near zero is noise, and on a log scale a 0.01 weighs like a real hundred-fold drop. ~1 count for a bead MFI. 0 uses every value > 0. Moves every map value."
+        },
+        {
+          "name": "power",
+          "label": "Power",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 2.0,
+          "available_in": {
+            "method": [
+              "idw",
+              "point_source_idw",
+              "trend_idw"
+            ]
+          },
+          "description": "How fast an object's influence falls with distance: weight = 1/d^power. HIGHER keeps each object's value close to it and lets the trend (or the next object) take over sooner; LOWER smooths the map toward the average. 2 is the common choice."
+        },
+        {
+          "name": "reach",
+          "label": "Reach",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "available_in": {
+            "method": [
+              "point_source_idw",
+              "trend_idw"
+            ]
+          },
+          "description": "Beyond about this distance from every object the map relaxes to the trend alone — a residual is only trusted near the bead that measured it. 0 never relaxes (far away the map is the trend times the objects' typical deviation). Only read by trend_idw."
+        },
+        {
+          "name": "height",
+          "label": "Plane height",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "The mapped plane's height above the source, for the distances the trend is evaluated at: 0 is the plane through the source's centre. Raise it to map the field at the beads' typical height. Only read with a Z column."
+        },
+        {
+          "name": "exclude",
+          "label": "Exclude",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Leave the nodes within this XY distance of the source blank: a number of µm, or a column whose median is the radius (a spheroid's `spheroid_edge_um`) — the source's own body, where the decay was never measured. Blank excludes nothing."
+        },
+        {
+          "name": "flip_x",
+          "label": "Flip X",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "The camera handedness of a `data` image that is not an Experiment Canvas — a camera field or a stage-Stitched mosaic, which keeps the camera's: on = the image's +x runs along stage −x, this scope's default, as Measure uses it. Ignored on a canvas, which carries its own orientation."
+        },
+        {
+          "name": "flip_y",
+          "label": "Flip Y",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": false,
+          "description": "As Flip X, for the image's +y. Off by default."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "gradient",
+          "description": "Name of the map's lattice table (a Point table the Viewer's Field tab and Plot Field colour); the objects placed on this image are written beside it as `<name>_objects`."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_gradient_map",
+      "meta_transform": "_meta_gradient",
+      "extra_layers": "_gm_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "exclude",
+        "fit_floor",
+        "flip_x",
+        "flip_y",
+        "height",
+        "name",
+        "per_by",
+        "power",
+        "reach",
+        "source_table",
+        "spacing",
+        "table",
+        "value",
+        "x",
+        "y",
+        "z"
+      ]
+    },
     "analysis.histogram_threshold": {
       "op": "analysis.histogram_threshold",
       "label": "Histogram Threshold",
@@ -3852,7 +4233,7 @@
             ]
           },
           "layer_in": "voxel",
-          "description": "Which Label instance to split — a raster plus its table, from Segmentation, Connected Components or Histogram Threshold. This layer is left UNCHANGED on the wire; the two sides go to the output layers named below, so all three are available downstream and the viewer can show what moved."
+          "description": "Which Label instance to split — a raster plus its table, from Segmentation, Connected Components or Histogram Threshold. This layer is left UNCHANGED on the wire; the two sides go to the output layers named below, so all three are available downstream and the viewer can show what moved. A Label table with no raster (Table Concat's rows from several files) is split as a table only."
         },
         {
           "name": "points",
@@ -4411,7 +4792,7 @@
           "role": "parameter",
           "is_field": false,
           "default": true,
-          "description": "Whether the image's +x runs along stage −x when the `stage_x_um` column places each row on the microscope. ON (the default) is this scope's handedness and Stitch's, Overlay's and Merge's default — so one object seen from two overlapping fields gets ONE stage position. Changes only `stage_x_um`; every local and intensity column is unaffected."
+          "description": "Whether the image's +x runs along stage −x when the `stage_x_um` column places each row on the microscope. ON (the default) is this scope's handedness and Stitch's, Overlay's and Merge's default — so one object seen from two overlapping fields gets ONE stage position. It applies to a stage-Stitched mosaic too, which keeps the camera's handedness. Changes only `stage_x_um`; every local and intensity column is unaffected."
         },
         {
           "name": "flip_y",
@@ -5290,7 +5671,7 @@
       "module": "nodegraph/catalog/analysis/piv.py",
       "gui_only": false,
       "summary": "2D particle image velocimetry (OpenPIV: multipass FFT correlation with window deformation, universal outlier detection, per-vector S/N) → a Point displacement field per frame pair; previous/fixed self-reference, ENSEMBLE correlation averaging (one time-averaged field — the micro-PIV method for sparse seeding), or an external reference Dataset + optional ROI mask; optional vy/vx/speed µm/s via the file's dt_s and optional per-vector unc_y/unc_x µm (Sciacchitano image-matching, dep: pivuq). The FLOW sibling of DIC — independent windows, far faster, per-vector confidence. Wired to the piv_field kernel; needs openpiv (dep-gated: friendly ImportError at run time until installed).",
-      "overview": "2D Particle Image Velocimetry (OpenPIV: multipass FFT cross-correlation with symmetric window deformation, Westerweel–Scarano universal outlier detection, local-mean vector replacement, optional Garcia-2010 smoothn predictor smoothing) → a **Point** displacement field per frame pair — the FLOW sibling of ``analysis.dic_correlate``. Resolved design (§0 grill, 2026-08-10): analysis → Point; consumes one reference channel of the input series plus an optional external ``reference`` Dataset (a separate rest-state acquisition, e.g. traction-force microscopy's relaxed-gel bead image — always a FIXED reference); loops m/z and hands each (m, z) line the ordered T stack in ONE :func:`nodegraph.kernels.piv_field.run_piv_series` call (frames stream lazily through :class:`_PIVPlaneSeq`, ~two planes of memory). 2D only — PIV has no volumetric form here; a z-stack is analysed per plane (use ``analysis.dvc_field`` for true 3D). Footprint WHOLE_SERIES / {t, y, x}: ``previous_frame`` pairing reads t-1 and t. No axis or calibration change → no meta_transform. Backend re-verified in-env against openpiv 0.25.4 (signatures read from installed source; sign conventions established empirically — raw OpenPIV u/v are +x-right/+y-DOWN, i.e. this repo's (dy, dx) with no swap; bit-identical parity with ``windef.simple_multipass`` in the kernel bench). The hot path is FFT/vectorized numpy inside openpiv → no numba. Window/pass params are in px deliberately: interrogation windows are texture-statistics units (features per window), not physical lengths, so a µm derive would mislead more than help. ``reference_mode`` defaults to ``previous_frame`` (flow: one field per frame step). ``fixed_frame`` measures total displacement since a chosen frame, like DIC. ``ensemble`` (V3 W5-P2 step 1; Meinhart–Wereley–Santiago 2000) averages the CORRELATION PLANES of every consecutive pair before peak-finding and emits ONE time-averaged field per (m, z) line, stamped ``t = 0`` — the micro-PIV method for seeding too sparse for any single pair (kernel bench: 2.63 → 0.41 px RMSE at ~3 particles/window over 16 pairs); it assumes the flow is statistically steady, and with an external reference wired it averages (ref → t) pairs instead (static deformation, e.g. a TFM bead series). ``velocity`` (step 3) divides the µm displacement by the frame interval — the ``frame_interval`` socket if set, else the file's ``dt_s`` via the shared :func:`_frame_interval_s` resolver, which REFUSES when neither exists rather than mislabel µm/frame as µm/s — and emits ``vy``/``vx``/ ``speed`` columns (µm/s, names matching ``analysis.object_metrics``). Velocity is refused for ``fixed_frame`` or an external reference (cumulative displacement has no per-row rate). ``uncertainty`` (step 5) emits per-vector ``unc_y``/``unc_x`` (µm) via the Sciacchitano-2013 image-matching disparity method — the external ``pivuq`` package, lazily imported through :func:`disparity_uncertainty`, whose docstring pins the probed conventions; refused in ``ensemble`` mode (a per-pair method). Per pair the kernel runs a coarse-to-fine window ladder (each pass 2× the next, ending at ``window_size``) with symmetric image deformation between passes; each pass validates (global limit / global std / median test / signal-to-noise) and inpaints failures — mandatory between passes (holes poison the predictor), governed by ``replace`` on the final field. Vectors that end non-finite (outside the ROI, or failed with replacement off/impossible) are DROPPED, not emitted as NaN rows; the count lands in provenance metadata as ``piv_invalid_points``. Output: a Point layer, one row per interrogation-window centre — ``disp_y``/``disp_x``/ ``disp_mag_um`` in µm (grid px × ``pixel_size_um``), ``qfactor`` = the final pass's correlation signal-to-noise (the per-vector confidence DIC cannot provide), and ``replaced`` (1 = failed validation, value inpainted from neighbours). The grid is COARSER than the image (pitch = window × (1 − overlap)) — feed it to ``transform.rasterize_field`` for a dense map. Reuses the shared :func:`_dvc_rows` flattener, so columns align with the DVC/DIC siblings.",
+      "overview": "2D Particle Image Velocimetry (OpenPIV: multipass FFT cross-correlation with symmetric window deformation, Westerweel–Scarano universal outlier detection, local-mean vector replacement, optional Garcia-2010 smoothn predictor smoothing) → a **Point** displacement field per frame pair — the FLOW sibling of ``analysis.dic_correlate``. Resolved design (§0 grill, 2026-08-10): analysis → Point; consumes one reference channel of the input series plus an optional external ``reference`` Dataset (a separate rest-state acquisition, e.g. traction-force microscopy's relaxed-gel bead image — always a FIXED reference); loops m/z and hands each (m, z) line the ordered T stack in ONE :func:`nodegraph.kernels.piv_field.run_piv_series` call (frames stream lazily through :class:`_PIVPlaneSeq`, ~two planes of memory). 2D only — PIV has no volumetric form here; a z-stack is analysed per plane (use ``analysis.dvc_field`` for true 3D). Footprint WHOLE_SERIES / {t, y, x}: ``previous_frame`` pairing reads t-1 and t. No axis or calibration change → no meta_transform. Backend re-verified in-env against openpiv 0.25.4 (signatures read from installed source; sign conventions established empirically — raw OpenPIV u/v are +x-right/+y-DOWN, i.e. this repo's (dy, dx) with no swap; bit-identical parity with ``windef.simple_multipass`` in the kernel bench). The hot path is FFT/vectorized numpy inside openpiv → no numba. Window/pass params are in px deliberately: interrogation windows are texture-statistics units (features per window), not physical lengths, so a µm derive would mislead more than help. ``reference_mode`` defaults to ``previous_frame`` (flow: one field per frame step). ``fixed_frame`` measures total displacement since a chosen frame, like DIC. ``ensemble`` (V3 W5-P2 step 1; Meinhart–Wereley–Santiago 2000) averages the CORRELATION PLANES of every consecutive pair before peak-finding and emits ONE time-averaged field per (m, z) line, stamped ``t = 0`` — the micro-PIV method for seeding too sparse for any single pair (kernel bench: 2.63 → 0.41 px RMSE at ~3 particles/window over 16 pairs); it assumes the flow is statistically steady, and with an external reference wired it averages (ref → t) pairs instead (static deformation, e.g. a TFM bead series). ``velocity`` (step 3) divides the µm displacement by the frame interval — the ``frame_interval`` socket if set, else the file's ``dt_s``, else (an unevenly spaced series) each pair's own gap from the per-frame times, via the shared :func:`_frame_timebase` resolver, which REFUSES when none exists rather than mislabel µm/frame as µm/s — and emits ``vy``/``vx``/ ``speed`` columns (µm/s, names matching ``analysis.object_metrics``). Velocity is refused for ``fixed_frame`` or an external reference (cumulative displacement has no per-row rate). ``uncertainty`` (step 5) emits per-vector ``unc_y``/``unc_x`` (µm) via the Sciacchitano-2013 image-matching disparity method — the external ``pivuq`` package, lazily imported through :func:`disparity_uncertainty`, whose docstring pins the probed conventions; refused in ``ensemble`` mode (a per-pair method). Per pair the kernel runs a coarse-to-fine window ladder (each pass 2× the next, ending at ``window_size``) with symmetric image deformation between passes; each pass validates (global limit / global std / median test / signal-to-noise) and inpaints failures — mandatory between passes (holes poison the predictor), governed by ``replace`` on the final field. Vectors that end non-finite (outside the ROI, or failed with replacement off/impossible) are DROPPED, not emitted as NaN rows; the count lands in provenance metadata as ``piv_invalid_points``. Output: a Point layer, one row per interrogation-window centre — ``disp_y``/``disp_x``/ ``disp_mag_um`` in µm (grid px × ``pixel_size_um``), ``qfactor`` = the final pass's correlation signal-to-noise (the per-vector confidence DIC cannot provide), and ``replaced`` (1 = failed validation, value inpainted from neighbours). The grid is COARSER than the image (pitch = window × (1 − overlap)) — feed it to ``transform.rasterize_field`` for a dense map. Reuses the shared :func:`_dvc_rows` flattener, so columns align with the DVC/DIC siblings.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -18302,7 +18683,7 @@
       "module": "nodegraph/catalog/plot/field.py",
       "gui_only": false,
       "summary": "A measured field drawn on its image as a figure: the image plane in grey, a field column as a colour map with a colour bar, optional arrows and contours, a µm scale bar. The Viewer's playback strip picks the position, frame and plane shown, as it does for the image; Export Figure writes one view, Export Movie sweeps time or planes.",
-      "overview": "A measured field drawn on its image, as a PICTURE. Resolved spec (§0, 2026-10-09): * **Kind** plot → ``op_key=\"plot.field\"``, category ``plot``: a picture of the input like every plot node (``fresh_output``, the ``figure_frame`` envelope), whole table at once (WHOLE_SERIES, empty kernel_axes — the background plane is read through the provider). * **What it draws** the image plane of the viewed position / frame / plane and of ``channel`` (auto contrast, pooled to ≤ 512 px on screen, ≤ 1024 px when Export Figure writes it) in grey; the ``value`` column of the ``table`` field as a colour map at ``opacity`` — rasterised by :mod:`nodegraph.fieldmap`, the Viewer's own Field-overlay rasteriser, so screen and figure agree — with a colour bar naming the column and its unit; optional arrows (auto length: the 95th-percentile vector one node spacing) and iso-contours; a µm scale bar. * **Views, not sockets** (2026-10-09, the user's call). The picture has the input's M, T and Z, one view each, drawn lazily the first time the Viewer shows it (:class:`FIG.ViewFigureProvider`). The Viewer's playback strip therefore picks position, frame and plane, as it does for the image; the node has no Frame, Position or Plane socket and no Per mode. Export Figure picks a view with its own Frame / Position / Plane, since a writer cannot follow the strip; Export Movie sweeps T or Z. * **Limits** ``color_range`` 'low, high'; blank = the column's 1st–99th percentile over the whole table, so every view (position, frame, plane) shares one scale. Blank limits on a DIVERGING map are made symmetric about zero, so its neutral colour sits on 0 (the Viewer Field overlay's ``center_zero`` default). Typed limits are kept as typed.",
+      "overview": "A measured field drawn on its image, as a PICTURE. Resolved spec (§0, 2026-10-09): * **Kind** plot → ``op_key=\"plot.field\"``, category ``plot``: a picture of the input like every plot node (``fresh_output``, the ``figure_frame`` envelope), whole table at once (WHOLE_SERIES, empty kernel_axes — the background plane is read through the provider). * **What it draws** the image plane of the viewed position / frame / plane and of ``channel`` (auto contrast, pooled to ≤ 512 px on screen, ≤ 1024 px when Export Figure writes it) in grey; the ``value`` column of the ``table`` field as a colour map at ``opacity`` — rasterised by :mod:`nodegraph.fieldmap`, the Viewer's own Field-overlay rasteriser, so screen and figure agree — with a colour bar naming the column and its unit; optional arrows (auto length: the 95th-percentile vector one node spacing) and iso-contours; a µm scale bar. * **Views, not sockets** (2026-10-09, the user's call). The picture has the input's M, T and Z, one view each, drawn lazily the first time the Viewer shows it (:class:`FIG.ViewFigureProvider`). The Viewer's playback strip therefore picks position, frame and plane, as it does for the image; the node has no Frame, Position or Plane socket and no Per mode. Export Figure picks a view with its own Frame / Position / Plane, since a writer cannot follow the strip; Export Movie sweeps T or Z. * **Limits** ``color_range`` 'low, high'; blank = the column's 1st–99th percentile over the whole table, so every view (position, frame, plane) shares one scale. Blank limits on a DIVERGING map are made symmetric about zero, so its neutral colour sits on 0 (the Viewer Field overlay's ``center_zero`` default). Typed limits are kept as typed. * **Colour scale and marks** (2026-10-15, an IL-8 gradient interpolated from capture beads). ``color_scale = log`` spaces the colours and the contour levels by ratio — a decay spanning decades — over the positive values (a blank low limit is the 1st percentile of the POSITIVE values). ``marks`` names a Point table on the same wire whose rows of the viewed frame are drawn as white rings — the measured objects a map was made from — each labelled with ``mark_label`` rounded to ``mark_decimals`` and placed clear of the others, as Plot XY's Label by. The colour bar takes ``color_label`` (blank: the column and its unit) and an arrow at an end the table's values pass — an extrapolated core brighter than the scale says so.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -18332,6 +18713,7 @@
             "turbo",
             "viridis",
             "magma",
+            "inferno",
             "cividis",
             "coolwarm"
           ],
@@ -18342,8 +18724,23 @@
             "turbo": "A high-contrast rainbow — what displacement magnitude is usually shown in; not perceptually uniform, so judge levels from the bar.",
             "viridis": "Dark purple to yellow, perceptually uniform and colour-blind safe — the accessible choice for a one-signed quantity.",
             "magma": "Black through red to pale yellow, perceptually uniform — strong contrast where the field peaks.",
+            "inferno": "Black through red and orange to pale yellow, perceptually uniform — a heat scale where the source glows; dark areas stay dark over a dark background, so raise the opacity.",
             "cividis": "Blue to yellow, designed to read the same for the common colour-vision deficiencies.",
             "coolwarm": "Blue through white to red, diverging — for a signed quantity whose zero must read as neutral. Blank limits are centred on zero."
+          }
+        },
+        {
+          "name": "color_scale",
+          "label": "Colour scale",
+          "choices": [
+            "linear",
+            "log"
+          ],
+          "default": "linear",
+          "description": "How the field's values map onto the colours, and how the contour levels are spaced. Changes the picture only.",
+          "choice_docs": {
+            "linear": "Equal steps in value are equal steps in colour and equal gaps between contours — a decay reads as it is: a hot core that fades fast, with the far field in the bottom colours.",
+            "log": "Equal RATIOS are equal steps — a field spanning decades shows structure everywhere and contours fall at 1, 2, 5, … ratios. Zero and below are not drawn; needs a positive low limit."
           }
         },
         {
@@ -18446,6 +18843,15 @@
           "description": "Fix the colour scale as 'low, high'. Blank uses the column's 1st–99th percentile over the whole table, so every position, frame and plane shares one scale; on the diverging coolwarm map, blank is also made symmetric about zero so white means 0. A peak beyond the range saturates: type a wider range to see it."
         },
         {
+          "name": "color_label",
+          "label": "Colour bar label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The colour bar's title. Blank uses the value column's name and unit. Changes the picture only."
+        },
+        {
           "name": "opacity",
           "label": "Opacity",
           "type": "float",
@@ -18480,6 +18886,36 @@
           "is_field": false,
           "default": 0,
           "description": "How many iso-lines to draw over the colour map; 0 draws none."
+        },
+        {
+          "name": "marks",
+          "label": "Marks",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "point",
+          "description": "A Point table drawn as white rings over the map — the measured objects a field was interpolated from (Gradient Map writes them as `<name>_objects`). Only rows of the frame shown are drawn. Blank draws none. Changes no measurement."
+        },
+        {
+          "name": "mark_label",
+          "label": "Mark label",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in": "point",
+          "column_from": "marks",
+          "description": "A column of the marks table printed beside each ring — the bead's own measured value, say — placed clear of the others. Blank prints none. Only read with Marks set."
+        },
+        {
+          "name": "mark_decimals",
+          "label": "Mark decimals",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0,
+          "description": "Decimal places of a numeric mark label: 0 prints 918, 1 prints 918.7. Rounding only. Only read with Marks and Mark label set."
         },
         {
           "name": "scale_bar_um",
@@ -18657,6 +19093,7 @@
         "arrow_every",
         "arrows",
         "channel",
+        "color_label",
         "color_range",
         "contours",
         "dpi",
@@ -18665,7 +19102,10 @@
         "height_mm",
         "legend",
         "line_width",
+        "mark_decimals",
+        "mark_label",
         "marker_size",
+        "marks",
         "opacity",
         "scale_bar_um",
         "table",
@@ -19148,7 +19588,7 @@
       "module": "nodegraph/catalog/plot/timeseries.py",
       "gui_only": false,
       "summary": "A Label, Point or Track table column over the experiment's own time axis (elapsed, wall clock or frame), one curve per group with its mean and spread — or one figure per frame, drawn as a true-colour picture.",
-      "overview": "A column against TIME, one series per ``group_by`` value. Resolved spec (V4.00 step 8, `build-node-v2`): * reads one table (``domain``, ``table``) and its ``value``, ``t`` and optional ``group_by`` columns; each row's frame ``t`` is placed on the time axis; * ``time`` elapsed: seconds since the first frame from the file's own per-frame clock (``frame_time_jd``), else ``t x dt_s``, else the frame index (and the axis label says so) — in s, min or h by the span; clock: wall-clock time when the file has a clock; frame: the frame index; * ``error`` (default sem): the rows of a frame summarised as mean ± spread, bars or band; * ``per`` frame: one figure per frame — the course up to that frame, a cursor at it; * a PICTURE output like every plot; the whole table at once.",
+      "overview": "A column against TIME, one series per ``group_by`` value. Resolved spec (V4.00 step 8, `build-node-v2`): * reads one table (``domain``, ``table``) and its ``value``, ``t`` and optional ``group_by`` columns; each row's frame ``t`` is placed on the time axis; * ``time`` elapsed: seconds since the first frame from the file's own per-frame clock (``frame_time_jd``), else the per-frame seconds an uneven subset of a clockless series kept (``frame_time_s``), else ``t x dt_s``, else the frame index (and the axis label says so) — in s, min or h by the span; clock: wall-clock time when the file has a clock; frame: the frame index; * ``error`` (default sem): the rows of a frame summarised as mean ± spread, bars or band; * ``per`` frame: one figure per frame — the course up to that frame, a cursor at it; * a PICTURE output like every plot; the whole table at once.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -19622,7 +20062,7 @@
       "module": "nodegraph/catalog/plot/xy.py",
       "gui_only": false,
       "summary": "A line or scatter chart of two columns of a Label, Point or Track table, one series per group, optionally averaged with error bars and fitted with a trendline (straight in the plotted axes, so log-log fits a power law) — drawn as a true-colour picture the Viewer shows and Export Figure writes.",
-      "overview": "Draw ``y`` against ``x`` from one structure table, one series per ``group_by`` value. Resolved spec (V4.00 step 7, `build-node-v2`): * reads one table — ``domain`` label | point | track, its name from ``table`` (the only one on the wire when blank) — and its ``x``, ``y`` and optional ``group_by`` columns; * ``error = none`` draws every row; ``sd`` / ``sem`` / ``ci95`` summarise the rows that share an x as mean ± that spread, as bars or a band (``error_style``); * renders through matplotlib's Agg canvas (``_shared/figure``) into a PICTURE dataset — one RGB plane, ``(1, 1, 1, 3, H, W)`` uint8, fresh metadata with no calibration — whose size the style decides and ``figure_frame`` predicts at edit time; * footprint: the whole table at once, no image axes read (``WHOLE_SERIES``, no kernel axes); no 2D/3D lever — a chart has no Z. **Trendline and x ≤ 0** (2026-10-13, for a standard curve: concentration on a log x axis, blanks at 0). ``fit = linear`` fits each series a least-squares line IN THE PLOTTED COORDINATES (:func:`~nodegraph.catalog._shared.figure.xy_fit`) — log10 of an axis that is logarithmic — so turning on log x and log y fits a power law and the line is straight on the figure; it is fitted to the points the series draws (the means when ``error`` summarises rows), and its equation and R² join the series' legend entry. ``zero_x = reference_line`` keeps a log-x plot's rows at x <= 0 instead of dropping them: each series' mean there is a dashed horizontal line in its colour, outside the fit. Both default to the old behaviour (``none`` / ``drop``), so a saved graph draws as before. **Langmuir, and a blank on linear axes** (2026-10-13, the same standard curve once its signal was read on linear axes). ``fit = langmuir`` fits each series the one-site binding curve ``y = Bmax·x / (Kd + x)`` in DATA units (:func:`~nodegraph.catalog._shared.figure. xy_langmuir`) on its x > 0 points, Bmax, Kd and R² in the legend. ``zero_x = reference_line`` now acts on a linear x axis too: the x <= 0 rows leave the points and become the dashed line, as on a log axis. A graph saved with ``reference_line`` on a linear x axis therefore draws its blank as a line where it drew points; ``drop`` on a linear axis is unchanged (those rows are ordinary points). **Colour by and Label by** (2026-10-14, for IL-8 capture beads around a spheroid: x the distance from it, y the height, each bead lit by its MFI and labelled with its true 3-D distance). Both read one value per POINT, so both live under ``error = none`` only (hidden otherwise — a summarised point is several rows). ``color_by`` names a numeric column; every marker takes its value on ``colormap`` (``color_scale`` linear | log), with a colour bar labelled ``color_label`` (blank: the column and its unit). The range is ``color_range`` where fixed, else the data's — over EVERY row, so the frames of a per-frame figure share one scale and a colour means the same number in each; values past it (zero and below on a log scale) take the end colours and the bar shows an arrow; a missing value is grey. With Colour by the series keep apart by marker shape, not hue. ``label_by`` names any column printed beside each point — a number rounded to ``label_decimals`` with the column's unit, text as it is — placed after the layout, clear of the other labels and points (``_shared/figure._place_point_labels``). Neither changes a measurement; both default blank, so a saved graph draws as before.",
+      "overview": "Draw ``y`` against ``x`` from one structure table, one series per ``group_by`` value. Resolved spec (V4.00 step 7, `build-node-v2`): * reads one table — ``domain`` label | point | track, its name from ``table`` (the only one on the wire when blank) — and its ``x``, ``y`` and optional ``group_by`` columns; * ``error = none`` draws every row; ``sd`` / ``sem`` / ``ci95`` summarise the rows that share an x as mean ± that spread, as bars or a band (``error_style``); * renders through matplotlib's Agg canvas (``_shared/figure``) into a PICTURE dataset — one RGB plane, ``(1, 1, 1, 3, H, W)`` uint8, fresh metadata with no calibration — whose size the style decides and ``figure_frame`` predicts at edit time; * footprint: the whole table at once, no image axes read (``WHOLE_SERIES``, no kernel axes); no 2D/3D lever — a chart has no Z. **Trendline and x ≤ 0** (2026-10-13, for a standard curve: concentration on a log x axis, blanks at 0). ``fit = linear`` fits each series a least-squares line IN THE PLOTTED COORDINATES (:func:`~nodegraph.catalog._shared.figure.xy_fit`) — log10 of an axis that is logarithmic — so turning on log x and log y fits a power law and the line is straight on the figure; it is fitted to the points the series draws (the means when ``error`` summarises rows), and its equation and R² join the series' legend entry. ``zero_x = reference_line`` keeps a log-x plot's rows at x <= 0 instead of dropping them: each series' mean there is a dashed horizontal line in its colour, outside the fit. Both default to the old behaviour (``none`` / ``drop``), so a saved graph draws as before. **Langmuir, and a blank on linear axes** (2026-10-13, the same standard curve once its signal was read on linear axes). ``fit = langmuir`` fits each series the one-site binding curve ``y = Bmax·x / (Kd + x)`` in DATA units (:func:`~nodegraph.catalog._shared.figure. xy_langmuir`) on its x > 0 points, Bmax, Kd and R² in the legend. ``zero_x = reference_line`` now acts on a linear x axis too: the x <= 0 rows leave the points and become the dashed line, as on a log axis. A graph saved with ``reference_line`` on a linear x axis therefore draws its blank as a line where it drew points; ``drop`` on a linear axis is unchanged (those rows are ordinary points). **Exponential** (2026-10-15, capture-bead MFI against distance from a secreting spheroid). ``fit = exponential`` fits each series ``y = A·e^(-x/λ)`` as a straight line to ``ln y`` whatever the axes (:func:`~nodegraph.catalog._shared.figure.xy_exponential`) on its y > 0 points; A, λ (the e-fold length, in x's units) and R² of ln y join the legend. Fitting the logarithm weighs each point by its relative miss, so three decades of MFI are not fitted to the brightest beads alone; the curve is straight on Log Y. ``fit_weight`` (2026-10-15, the same decay on LINEAR axes) picks how the exponential weighs its points: ``relative`` fits ln y as above, ``absolute`` fits in data units, where the brightest points decide the curve as the eye does on a linear y axis. ``fit_span`` (any trendline) is where the curves are DRAWN, 'low, high', each a number or a column's median — a decay extrapolated in to a spheroid's edge; the fit is unchanged. ``fit_floor`` (only read with ``exponential``) keeps rows below it out of the fit but on the figure: a background-subtracted reading at the noise floor would otherwise pull λ. **Colour by and Label by** (2026-10-14, for IL-8 capture beads around a spheroid: x the distance from it, y the height, each bead lit by its MFI and labelled with its true 3-D distance). Both read one value per POINT, so both live under ``error = none`` only (hidden otherwise — a summarised point is several rows). ``color_by`` names a numeric column; every marker takes its value on ``colormap`` (``color_scale`` linear | log), with a colour bar labelled ``color_label`` (blank: the column and its unit). The range is ``color_range`` where fixed, else the data's — over EVERY row, so the frames of a per-frame figure share one scale and a colour means the same number in each; values past it (zero and below on a log scale) take the end colours and the bar shows an arrow; a missing value is grey. With Colour by the series keep apart by marker shape, not hue. ``label_by`` names any column printed beside each point — a number rounded to ``label_decimals`` with the column's unit, text as it is — placed after the layout, clear of the other labels and points (``_shared/figure._place_point_labels``). Neither changes a measurement; both default blank, so a saved graph draws as before.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -19694,7 +20134,8 @@
             "sd",
             "sem",
             "ci95",
-            "pooled_sd"
+            "pooled_sd",
+            "column"
           ],
           "default": "none",
           "description": "Whether rows that share an x are summarised, and with what spread.",
@@ -19703,7 +20144,8 @@
             "sd": "Average the rows at each x and show ± one standard deviation — the spread of the population itself, which does not shrink as n grows.",
             "sem": "Average the rows at each x and show ± the standard error of the mean (sd/√n) — how well the mean is known; narrows as n grows.",
             "ci95": "Average the rows at each x and show the 95 % confidence interval of the mean (Student's t, n-1 degrees of freedom) — wider than sem, the honest bar for comparing two groups.",
-            "pooled_sd": "Read each row as a SUMMARY of raw measurements (a bead's pixels: Y their mean, Pool count how many, Pool SD their spread) and pool them: the point is the mean of every pixel at that x and the bar ± the SD of all of them together — exactly what listing every pixel would give. Wider than sd over the row means, because the spread inside each object counts too. Needs Measure's count and std stats."
+            "pooled_sd": "Read each row as a SUMMARY of raw measurements (a bead's pixels: Y their mean, Pool count how many, Pool SD their spread) and pool them: the point is the mean of every pixel at that x and the bar ± the SD of all of them together — exactly what listing every pixel would give. Wider than sd over the row means, because the spread inside each object counts too. Needs Measure's count and std stats.",
+            "column": "Draw every row as its own point with ± the half-width a column holds — an interval computed upstream (a fitted rate's bootstrap 95 % interval). Nothing is averaged; Error column names it."
           }
         },
         {
@@ -19717,6 +20159,7 @@
           "available_in": {
             "error": [
               "ci95",
+              "column",
               "pooled_sd",
               "sd",
               "sem"
@@ -19734,14 +20177,37 @@
           "choices": [
             "none",
             "linear",
-            "langmuir"
+            "langmuir",
+            "exponential",
+            "point_source"
           ],
           "default": "none",
-          "description": "Whether each series gets a fitted trendline, and which model. Linear is fitted in the PLOTTED coordinates, so it follows Log X / Log Y; Langmuir is fitted in data units whatever the axes. Either reads the plot's points and changes no measurement.",
+          "description": "Whether each series gets a fitted trendline, and which model. Linear is fitted in the PLOTTED coordinates, so it follows Log X / Log Y; Langmuir is fitted in data units and Exponential to ln y, whatever the axes. Each reads the plot's points and changes no measurement.",
           "choice_docs": {
             "none": "No trendline — the points (and their error bars) only. The default, and what every saved graph from before trendlines draws.",
             "linear": "A least-squares straight line per series through the points it draws (the means when Error summarises rows), with its equation and R² in the legend: y = b·x + a on linear axes, a power law y = A·x^b when both axes are log. Needs two distinct x values; a series with fewer gets no line.",
-            "langmuir": "A one-site binding curve y = Bmax·x / (Kd + x) per series, least squares in data units on its x > 0 points (the curve passes through the origin, so a blank stays out of it), with Bmax, Kd and R² in the legend. For a saturating standard curve on linear axes; Kd is in x's units. Needs two distinct x > 0."
+            "langmuir": "A one-site binding curve y = Bmax·x / (Kd + x) per series, least squares in data units on its x > 0 points (the curve passes through the origin, so a blank stays out of it), with Bmax, Kd and R² in the legend. For a saturating standard curve on linear axes; Kd is in x's units. Needs two distinct x > 0.",
+            "exponential": "An exponential decay y = A·e^(-x/λ) per series — a gradient falling away from a source, x its distance — fitted as a line to ln y, so each point weighs by its relative miss and a few bright points do not decide it. A, the e-fold length λ (x's units; negative = rising) and R² of ln y in the legend. Points at y <= 0 are left out; needs two y > 0 at distinct x. Straight on Log Y.",
+            "point_source": "The Crank point-source profile a Point-Source Fit upstream fitted, per series at that timepoint's time — nothing is fitted here. Y must be the concentration it fitted, or the signal a Standard Curve converted into it (drawn back through that curve); X the distance it was fitted against; series by the fit's groups (Group by its Group column). The rate and R² join each legend entry, D a note."
+          }
+        },
+        {
+          "name": "fit_weight",
+          "label": "Trendline weighting",
+          "choices": [
+            "relative",
+            "absolute"
+          ],
+          "default": "relative",
+          "available_in": {
+            "fit": [
+              "exponential"
+            ]
+          },
+          "description": "How the exponential trendline weighs its points. Changes A, λ and R², never a point; only read with Trendline = exponential.",
+          "choice_docs": {
+            "relative": "Fit ln y: each point weighs by its RATIO to the curve, so a series spanning decades is fitted across all of them and λ is stable from series to series. On a linear y axis the curve can sit visibly under the brightest points. R² is of ln y.",
+            "absolute": "Least squares in data units, started from the ln y fit: each point weighs by its absolute miss, so the brightest few decide A and λ — the curve the eye expects on a linear y axis, but λ can swing between series that differ in a few bright points. Readings at or below zero enter unless Fit floor keeps them out. R² is in data units."
           }
         },
         {
@@ -19976,6 +20442,22 @@
           "description": "The standard deviation of each row's raw measurements — Measure's `std_intensity` (tick its `std` stat), the spread of a bead's own pixels; blank uses `std_intensity` when the table has it. It adds the spread WITHIN each row to the spread between rows, which is what makes the bar the SD of every pixel rather than of the bead means."
         },
         {
+          "name": "error_column",
+          "label": "Error column",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "error": [
+              "column"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "With Error = column, the column holding each row's error HALF-width, in y's units — Point-Source Fit's `q_ci_fg_s` (half its bootstrap 95 % interval). Drawn as ± that around the point; a missing value draws no bar. Required in that mode."
+        },
+        {
           "name": "color_by",
           "label": "Colour by",
           "type": "string",
@@ -20068,6 +20550,37 @@
           "column_in_mode": "domain",
           "column_from": "table",
           "description": "With Per = column, the column whose values each get a figure — a Table Concat's `condition` (one per input: three timepoints from two files), a well, a position group. Figures follow the order the values first appear and are titled by the value; all share their axes and one colour scale."
+        },
+        {
+          "name": "fit_span",
+          "label": "Trendline span",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "fit": [
+              "exponential",
+              "langmuir",
+              "linear",
+              "point_source"
+            ]
+          },
+          "description": "Where each trendline is DRAWN, as 'low, high' in X's unit: a number, or a column whose median is the value (`spheroid_edge_um,` carries a decay in to the spheroid's edge, past the nearest bead). Blank on a side keeps the series' own extent. Extrapolates the curve; moves no fitted parameter and no point."
+        },
+        {
+          "name": "fit_floor",
+          "label": "Fit floor",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "fit": [
+              "exponential"
+            ]
+          },
+          "description": "Rows whose y is below this stay on the plot but leave the exponential fit, in y's own units. A background-subtracted reading near zero is noise, and on ln y a 0.01 weighs like a real hundred-fold drop, shortening λ. RAISE it to the measurement's noise floor (about 1 count for a bead MFI); 0, the default, fits every y > 0. Changes A, λ and R², never a point."
         },
         {
           "name": "label_decimals",
@@ -20263,6 +20776,30 @@
             ]
           },
           "description": "Name each group in a legend. Only drawn when there are named groups (a Group by column is set)."
+        },
+        {
+          "name": "legend_loc",
+          "label": "Legend position",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "inside",
+          "available_in": {
+            "detail": [
+              "custom"
+            ]
+          },
+          "vocab": [
+            "inside",
+            "right",
+            "below"
+          ],
+          "choice_docs": {
+            "below": "Outside the axes, under them in two columns: never covers a point and keeps the plot's full width — for many or long entries (trendline equations).",
+            "inside": "Inside the axes, in the corner matplotlib finds covers the least data — the compact default; a long legend over a full plot can still hide points.",
+            "right": "Outside the axes, to their right: never covers a point, at the cost of narrowing the plot by the legend's width."
+          },
+          "description": "Where the legend is drawn: inside the axes, or outside them to the right or below so it never hides a point. Moves no data."
         }
       ],
       "outputs": [
@@ -20286,6 +20823,9 @@
         "color_label",
         "color_range",
         "dpi",
+        "error_column",
+        "fit_floor",
+        "fit_span",
         "font_pt",
         "grid",
         "group_by",
@@ -20293,6 +20833,7 @@
         "label_by",
         "label_decimals",
         "legend",
+        "legend_loc",
         "line_width",
         "log_x",
         "log_y",
@@ -21171,6 +21712,862 @@
         "name",
         "other_table",
         "prefix",
+        "table"
+      ]
+    },
+    "table.point_source_fit": {
+      "op": "table.point_source_fit",
+      "label": "Point-Source Fit (Crank)",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/point_source_fit.py",
+      "gui_only": false,
+      "summary": "Fit Crank's continuous point source (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — for its production rate per timepoint (or per interval) with bootstrap intervals, and the diffusivity if asked; adds the model's value per row and a rates table, and records the fit for Plot XY's and Gradient Map's trend.",
+      "overview": "Fit Crank's continuous point source to concentrations measured round a source. Resolved spec (2026-10-16, `build-node-v2`): * **Kind** table → ``table.point_source_fit``: one table in (``domain`` label / point / track), passed on with the model's value at every row added IN PLACE (``name``), and a new Label table ``<name>_rates`` (one row per rate). Tables only. * **Model** :mod:`nodegraph.catalog._shared.point_source`: ``C = q/(4πDr)·erfc(r/2√(Dt))`` (McGhee et al. 2022 Eq. 2, after Crank), ×2 under ``boundary = half_space`` (a source on an impermeable floor). ``rate = constant``: one ``q`` per group (each timepoint's average since the source started — the paper's per-timepoint fit); ``piecewise``: one per interval between successive group times, all groups fitted together by superposition. ``diffusivity = fit`` profiles ``D`` (one, shared) over 0.5–500 µm²/s; ``fixed`` uses ``D`` (default 20, the paper's IL-8 value). * **Columns** ``distance`` (µm to the source), ``value`` (concentration, pg/mL — the model's unit), ``group`` (one time each; blank = ``t``), ``time`` read by ``time_kind``: ``clock`` a Julian date (Table Concat's ``time_jd``, each row's own acquisition clock), the source started ``start_h`` hours before the EARLIEST row; ``hours`` / ``seconds`` elapsed, plus ``start_h``. Rows with a non-finite or non-positive distance or time, or a value under ``fit_floor`` (or ≤ 0 under ``relative``), are not fitted; every row with a distance and time still gets the model's value. * **Weight** ``relative`` fits ``ln C`` (every bead weighs by its relative miss), ``sqrt`` fits ``√C`` (between the two), ``absolute`` fits pg/mL. R² is in the space fitted. * **Background** ``uniform`` (2026-10-16) adds one non-negative level per group to the point source — the far field of a FINITE well, whose walls return what an unbounded Eq. 2 lets escape, so the profile levels off instead of falling to 0; reported as ``background_pg_ml`` and part of the model every reader draws. * **Uncertainty** ``bootstrap`` resamples (rows within each group, fixed seed) give each rate's 95 % interval, conditional on the fitted D. * **Provenance** the fit under ``point_source_fit`` in the metadata, keyed by the value column, with the standard curve that made that column (``standard_curve``), so Plot XY and Gradient Map can draw the model in the signal's units too. * **Footprint** WHOLE_SERIES, empty kernel_axes. Numpy + scipy.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ],
+            "track": [
+              "track"
+            ]
+          }
+        },
+        "adds": [
+          "label"
+        ]
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point",
+            "track"
+          ],
+          "default": "label",
+          "description": "Which kind of table is fitted.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+          }
+        },
+        {
+          "name": "rate",
+          "label": "Rate",
+          "choices": [
+            "piecewise",
+            "constant"
+          ],
+          "default": "constant",
+          "description": "How the production rate may change with time.",
+          "choice_docs": {
+            "constant": "One rate per timepoint, fitted to that timepoint alone: the source's AVERAGE rate from its start to that time (McGhee et al. 2022's Eq. 2, as published). Stable with few beads; a rising average means the rate itself rose.",
+            "piecewise": "One rate per interval between successive timepoints, every timepoint fitted together by superposition — the rate's history, each profile carrying all that was released before it. Needs well-sampled timepoints: with few beads per time, or the same beads re-imaged, the intervals trade off and swing between 0 and large values."
+          }
+        },
+        {
+          "name": "diffusivity",
+          "label": "Diffusivity",
+          "choices": [
+            "fixed",
+            "fit"
+          ],
+          "default": "fixed",
+          "description": "Where D comes from.",
+          "choice_docs": {
+            "fixed": "D as typed (default 20 µm²/s, the paper's IL-8 value) — rates comparable with the paper's.",
+            "fit": "One D for every timepoint, chosen by profile (0.5–500 µm²/s) with the rates refitted at each — what the data say, which also absorbs anything else that blurs the profile (depth, bleaching)."
+          }
+        },
+        {
+          "name": "boundary",
+          "label": "Boundary",
+          "choices": [
+            "infinite",
+            "half_space"
+          ],
+          "default": "infinite",
+          "description": "What surrounds the source.",
+          "choice_docs": {
+            "infinite": "An unbounded medium on every side of the source — the paper's Eq. 2 as published; the rates comparable with the paper's.",
+            "half_space": "The source on an impermeable floor (a spheroid on the well bottom): every concentration doubles, so the same data give HALF the rate. D is unaffected."
+          }
+        },
+        {
+          "name": "background",
+          "label": "Background",
+          "choices": [
+            "none",
+            "uniform"
+          ],
+          "default": "none",
+          "description": "Whether the profile may level off above zero far from the source.",
+          "choice_docs": {
+            "none": "The point source alone: far from it the model falls to 0 — the paper's Eq. 2, an unbounded medium.",
+            "uniform": "Plus one non-negative level per timepoint: what has spread through a FINITE well, whose walls return what an unbounded medium lets escape — the profile levels off where late timepoints read evenly far out. Lowers the near-field rate that alone had to explain the far beads."
+          }
+        },
+        {
+          "name": "weight",
+          "label": "Weighting",
+          "choices": [
+            "relative",
+            "sqrt",
+            "absolute"
+          ],
+          "default": "relative",
+          "description": "How each row's miss is counted.",
+          "choice_docs": {
+            "relative": "Fit ln C: every row weighs by its RELATIVE miss, so a profile spanning decades is not fitted to its brightest few beads (the exponential trendline's default). Rows ≤ 0 are left out.",
+            "sqrt": "Fit √C: each row weighs by its miss over the square root of its level (counting noise) — between relative and absolute, so dim beads still count but a few near-zero readings cannot pin the tail.",
+            "absolute": "Fit pg/mL: every row weighs by its absolute miss — the brightest beads decide, which is how the eye judges a linear plot."
+          }
+        },
+        {
+          "name": "time_kind",
+          "label": "Time kind",
+          "choices": [
+            "clock",
+            "hours",
+            "seconds"
+          ],
+          "default": "clock",
+          "description": "How the Time column is read.",
+          "choice_docs": {
+            "clock": "A Julian date (Table Concat's `time_jd`): times are measured from the earliest row, which is Source started hours after the source began.",
+            "hours": "Hours already elapsed since a reference; Source started is added.",
+            "seconds": "Seconds already elapsed since a reference; Source started (h) is added."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table holds the concentrations measured round the source (Standard Curve's output); passed on with the model's value per row and a rates table added."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "The table fitted. Blank uses the only one of its kind on the wire."
+        },
+        {
+          "name": "distance",
+          "label": "Distance",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "distance_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "Each row's distance from the source, in µm — the 3-D distance to a spheroid's centroid. The model is radial, so a 2-D distance on a sample with depth makes far-above beads look near and pulls D down."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The measured concentration, in pg/mL — the unit the model and the reported rates (fg/s) assume. Required."
+        },
+        {
+          "name": "group",
+          "label": "Group",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column naming each row's timepoint (Table Concat's `condition`): one time per group, and under Rate = constant one rate per group. Blank groups by frame `t`."
+        },
+        {
+          "name": "time",
+          "label": "Time",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "Each row's acquisition time, read as Time kind says. Blank uses Table Concat's `time_jd`, each row's own clock — so a bead imaged 20 min into a run is fitted at its own time."
+        },
+        {
+          "name": "start_h",
+          "label": "Source started",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "h",
+          "default": 0.0,
+          "description": "When the source began releasing. Time kind = clock: hours BEFORE the earliest row (a first timepoint 15 h after seeding: 15). hours / seconds: added to the column. Moves every rate: the same profile read as older needs a smaller rate, and the earliest timepoints move most."
+        },
+        {
+          "name": "D",
+          "label": "D",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um2/s",
+          "default": 20.0,
+          "available_in": {
+            "diffusivity": [
+              "fixed"
+            ]
+          },
+          "description": "The analyte's diffusivity in the gel. 20 µm²/s is McGhee et al. 2022's measured value for IL-8 with its capture pair (± 10). LARGER D spreads the same release farther, so the near beads need a larger rate and the far ones a smaller."
+        },
+        {
+          "name": "fit_floor",
+          "label": "Fit floor",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "description": "Values below this (in the value's units) are not fitted — readings at the noise floor, which on a log fit would weigh like a hundred-fold miss. They still get the model's value. 0 keeps every positive value."
+        },
+        {
+          "name": "bootstrap",
+          "label": "Bootstrap",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 200,
+          "description": "Resamples (beads within each timepoint) for each rate's 95 % interval, at the fitted D. 0 skips it; more steadies the interval and costs a refit each."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "crank",
+          "description": "The new column holding the model's concentration at each row; `<name>_rates` is the Label table of fitted rates (fg/s and pg/h, with intervals) a plot can read. A name the table has is refused."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_point_source_fit",
+      "meta_transform": null,
+      "extra_layers": "_psf_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "D",
+        "__modes__",
+        "bootstrap",
+        "distance",
+        "fit_floor",
+        "group",
+        "name",
+        "start_h",
+        "table",
+        "time",
+        "value"
+      ]
+    },
+    "table.register_positions": {
+      "op": "table.register_positions",
+      "label": "Register Positions",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/register_positions.py",
+      "gui_only": false,
+      "summary": "Move a table's stage positions into a reference table's frame, fitted on the objects both contain: the shift is voted from every row pair, the objects are paired within a tolerance, and a rigid turn + shift (or a shift) is fitted to them — a plate re-imaged after it was taken off the stage.",
+      "overview": "A table's positions moved into a REFERENCE table's stage frame, fitted on the objects both tables contain — the same beads re-imaged after the plate was lifted off the stage and put back, a little shifted and turned. Resolved spec (2026-10-15, `build-node-v2`): * reads ``table`` (``domain`` label / point) on ``data`` and ``ref_table`` (same domain) on ``reference``; ``x`` / ``y`` (default ``stage_x_um`` / ``stage_y_um``) place each row, in their own units; ``z`` (default ``stage_z_um``, blank = XY only) is shifted; * the coarse shift is VOTED, not assumed small: every row-to-reference-row vector no longer than ``search`` votes, and the shift most vectors agree on within ``tolerance`` wins — so a move larger than the objects' spacing still finds its pairs, and objects present in only one table cannot outvote the shared ones; * pairs are mutual nearest neighbours closer than ``tolerance`` once shifted; ``model`` ``rigid`` fits a rotation + shift to them (least squares, never a mirror; 2+ pairs), ``shift`` the median shift (1+ pair); pairs and fit are refined twice under the fit; Z moves by the pairs' median Z difference; * EVERY row is moved — paired or not (an object the reference never saw is where the transform puts it); a row with no finite x / y keeps its values; * the x / y / z columns are REPLACED, so everything downstream that reads `stage_x_um` reads the reference frame; ``reg_dx_um`` / ``reg_dy_um`` / ``reg_dz_um`` hold what was added to each row (subtract them to get the raw values back), ``reg_residual_um`` how far a paired row still is from its twin (NaN unpaired), ``reg_rotation_deg`` the turn; * **Landmarks** (2026-10-16, a third session that imaged NEW beads): with the ``landmarks`` input wired, the vote, pairs and fit run on ITS table (``landmark_table``, same domain and columns) against the reference — the same objects seen in both sessions, e.g. the beads of a whole-well scan taken in each — and the transform is then applied to every row of ``data``'s table, which need share no object with the reference. ``reg_residual_um`` is then NaN on every row (no row was a fitted twin) and the landmark pairs' residuals are on the rail; Z moves by the LANDMARK pairs' median difference (blank Z when a landmark scan's focus log cannot be trusted); * one transform for the whole table (every frame and batch member together); written in place (blank ``name``: the same rows of the same image, so a label table keeps its raster's name and the Viewer still draws it) or as a new table (a table node's copy, refused under a Voxel layer's name); WHOLE_SERIES, no axis or calibration change.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "description": "Which kind of table both inputs carry.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        },
+        {
+          "name": "model",
+          "label": "Model",
+          "choices": [
+            "rigid",
+            "shift"
+          ],
+          "default": "rigid",
+          "description": "How the plate may have moved between the two runs.",
+          "choice_docs": {
+            "rigid": "A turn about the paired objects' centre plus a shift, fitted by least squares — what lifting a plate off the stage and putting it back does (a fraction of a degree moves objects mm away by tens of µm). Needs two or more shared objects.",
+            "shift": "A shift only: the median of the pairs' differences, robust to a few mismatches. Right for one continuous session where the stage was re-zeroed; it leaves a turn's error growing with distance from the objects' centre. Works from one shared object."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table is moved into the reference frame — a later run of the same plate — passed on with the table's positions replaced."
+        },
+        {
+          "name": "reference",
+          "label": "Reference",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "The Dataset carrying the table that sets the frame — the run your other positions (a spheroid's centroid, a mosaic) were measured in. Required."
+        },
+        {
+          "name": "landmarks",
+          "label": "Landmarks",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "Optional: the Dataset whose table holds objects seen in BOTH sessions — the beads of a whole-well scan taken with this run — when this run's own objects are new. The transform is fitted on them against the Reference table and applied to this table. Unwired: fitted on this table's own rows."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "The table whose positions are moved. Blank uses the only one of its kind on the wire, and asks when there are several."
+        },
+        {
+          "name": "landmark_table",
+          "label": "Landmark table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "layer_from": "landmarks",
+          "description": "The table on the Landmarks wire the transform is fitted on (same X / Y / Z columns). Blank uses the only one of its kind there. Only read with Landmarks wired."
+        },
+        {
+          "name": "ref_table",
+          "label": "Reference table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "layer_from": "reference",
+          "description": "The table on the Reference wire holding the same objects. Blank uses the only one of its kind there."
+        },
+        {
+          "name": "x",
+          "label": "X",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_x_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column placing each row along x, in BOTH tables. The default `stage_x_um` (from Measure) is the stage position, the one coordinate two runs of one plate share; a per-field column like `x_um` would not register anything."
+        },
+        {
+          "name": "y",
+          "label": "Y",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_y_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column placing each row along y in both tables — `stage_y_um` by default, for the same reason as X."
+        },
+        {
+          "name": "z",
+          "label": "Z",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "stage_z_um",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The focus column, shifted by the pairs' median difference (a plate put back sits a little higher or lower). Blank leaves Z alone and registers X / Y only. Changes every height and 3D distance computed downstream."
+        },
+        {
+          "name": "search",
+          "label": "Search",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 500.0,
+          "description": "The largest move between the two runs to consider, in the X / Y columns' units. It must exceed how far the plate actually moved; LARGER also lets unrelated objects vote, which only matters when the two tables share few objects."
+        },
+        {
+          "name": "tolerance",
+          "label": "Tolerance",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 25.0,
+          "description": "How close a row must land to a reference row, once shifted, to count as the same object. LARGER pairs objects that re-centred less exactly but risks pairing neighbours; SMALLER pairs fewer, and below the stage's repeatability (10-20 µm after a re-mount) pairs almost none. Keep it under the objects' spacing."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Name of the table written. Blank (the default) replaces the positions in the table itself, so downstream nodes keep reading the same table; a name writes a registered copy beside it."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_register_positions",
+      "meta_transform": null,
+      "extra_layers": "_rp_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "landmark_table",
+        "name",
+        "ref_table",
+        "search",
+        "table",
+        "tolerance",
+        "x",
+        "y",
+        "z"
+      ]
+    },
+    "table.standard_curve": {
+      "op": "table.standard_curve",
+      "label": "Standard Curve",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/standard_curve.py",
+      "gui_only": false,
+      "summary": "Turn a measured signal (a bead's MFI) into a concentration through a standard curve — Langmuir or linear, fitted from standards measured the same way and wired in, or typed — with each row flagged in range, extrapolated, under the detection limit or past the curve.",
+      "overview": "A signal column (a bead's background-subtracted MFI) turned into a concentration by a standard curve — fitted here from standards measured the same way, or typed. Resolved spec (2026-10-15, `build-node-v2`): * **Kind** table → ``table.standard_curve``: one table in (``domain`` label / point / track, ``table``), the same table out with two columns added IN PLACE (``name`` and ``<name>_flag``), so its raster and overlays still match. A Name the table already has is refused — a conversion must never overwrite a measurement. * **Curve = fit** (default): the ``standards`` input's table (``std_domain``, ``std_table``) — one row per standard bead, its known concentration ``std_x`` and its signal ``std_y`` (blank = the converted column's own name; ``std_x`` blank = Table Concat's ``condition_value``), optionally weighted by ``std_weight`` (a pixel count: the weighted mean of bead means IS the mean of every pooled pixel, which is what the IL-8 report fitted) — filtered by ``std_where`` (``column=value`` clauses, all must hold: ``sighting=0`` keeps first imagings). One point per concentration > 0: the weighted mean. ``model`` langmuir fits ``Bmax·x / (Kd + x)`` through those points in data units (:func:`figure.xy_langmuir`, the fit Plot XY draws); linear fits ``a + b·x`` through them AND the blank. The blank rows (x <= 0) give the detection limit, mean + 3 SD of the blank rows' signal. * **Curve = typed**: ``bmax`` / ``kd`` or ``slope`` / ``intercept``, and an optional ``lod_signal``; no range is known, so no range flags. * **Inversion** Langmuir ``Kd·y/(Bmax − y)`` (NaN at or above Bmax); linear ``(y − a)/b``. **Flags** (text) ``no signal``, ``above Bmax``, ``below LOD``, ``below range`` / ``above range`` (extrapolated beyond the lowest / highest standard) or ``in range``. * **Provenance** the curve (points, blank, fit, range, LOD) under ``standard_curve`` in the metadata, keyed by the output column; the new column carries the standards' x unit. * **Footprint** WHOLE_SERIES, empty kernel_axes: tables only, no axis or calibration change.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ],
+            "track": [
+              "track"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point",
+            "track"
+          ],
+          "default": "label",
+          "description": "Which kind of table is converted.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent.",
+            "track": "Per temporal identity — one row per tracked object, running over time rather than at one instant. Where velocities, displacements and track lifetimes live."
+          }
+        },
+        {
+          "name": "model",
+          "label": "Model",
+          "choices": [
+            "langmuir",
+            "linear"
+          ],
+          "default": "langmuir",
+          "description": "The curve's shape.",
+          "choice_docs": {
+            "langmuir": "One-site binding, signal = Bmax·c / (Kd + c), through the origin — a capture assay that saturates. Fitted in data units on the standards above 0 (the blank only sets the detection limit); signals at or above Bmax have no concentration.",
+            "linear": "signal = a + b·c, fitted through the standards AND the blank — for a curve that has not begun to saturate over the range; it extrapolates without bound in both directions."
+          }
+        },
+        {
+          "name": "curve",
+          "label": "Curve",
+          "choices": [
+            "fit",
+            "typed"
+          ],
+          "default": "fit",
+          "description": "Where the curve's parameters come from.",
+          "choice_docs": {
+            "fit": "Fitted here from the standards wired into Standards, so the parameters follow the standards' data and their filter; the range and detection limit come with them.",
+            "typed": "Typed from a report (Bmax and Kd, or a slope and intercept): no standards needed, but no range is known — rows are only flagged against Bmax and a typed LOD."
+          }
+        },
+        {
+          "name": "std_domain",
+          "label": "Standards domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "description": "Which kind of table on the Standards wire holds the standards.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table is converted — the measured objects — passed on with two columns added to that table."
+        },
+        {
+          "name": "standards",
+          "label": "Standards",
+          "type": "dataset",
+          "role": "dataset",
+          "passes_domains": false,
+          "description": "The Dataset carrying the standards' table: each standard bead's signal at a known concentration, measured exactly as the objects were. Read only with Curve = fit."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "The table converted. Blank uses the only one of its kind on the wire."
+        },
+        {
+          "name": "signal",
+          "label": "Signal",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The column converted — the same quantity the standards were measured in (a bead's background-subtracted R-PE MFI). Required."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "concentration",
+          "description": "The new concentration column (`il8_pg_ml`, say — the unit in the name, since pg/mL is not one the units algebra knows); `<name>_flag` beside it says whether each row is in the standards' range, extrapolated, under the detection limit or past the curve. A name the table has is refused."
+        },
+        {
+          "name": "std_table",
+          "label": "Standards table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "layer_in_mode": "std_domain",
+          "layer_from": "standards",
+          "description": "The standards' table on the Standards wire. Blank uses the only one of its kind there."
+        },
+        {
+          "name": "std_x",
+          "label": "Standards X",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "column_in_mode": "std_domain",
+          "column_from": "std_table",
+          "description": "The standards' known concentration. Blank uses Table Concat's `condition_value` (its Names as numbers — the wells' concentrations). Rows at 0 are the blank: not fitted, they set the detection limit."
+        },
+        {
+          "name": "std_y",
+          "label": "Standards Y",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "column_in_mode": "std_domain",
+          "column_from": "std_table",
+          "description": "The standards' signal column. Blank uses the Signal column's own name — the same measurement on both tables."
+        },
+        {
+          "name": "std_weight",
+          "label": "Weight",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "column_in_mode": "std_domain",
+          "column_from": "std_table",
+          "description": "Weigh each standard row by this column when averaging a concentration — a bead's pixel count (`area`), so the point is the mean of every pooled pixel, as Plot XY's pooled SD draws it. Blank weighs every bead equally. Moves every fitted value."
+        },
+        {
+          "name": "std_where",
+          "label": "Standards filter",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "description": "Keep only the standard rows matching every `column=value` clause, comma-separated: `sighting=0` fits the first imaging only, so photobleaching does not lower the curve. Blank keeps every row."
+        },
+        {
+          "name": "bmax",
+          "label": "Bmax",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "curve": [
+              "typed"
+            ],
+            "model": [
+              "langmuir"
+            ]
+          },
+          "description": "The typed Langmuir plateau, in the signal's units. Signals at or above it have no concentration (NaN, flagged)."
+        },
+        {
+          "name": "kd",
+          "label": "Kd",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "curve": [
+              "typed"
+            ],
+            "model": [
+              "langmuir"
+            ]
+          },
+          "description": "The typed Langmuir half-saturation concentration, in the concentration's units; the curve is near-linear well below it."
+        },
+        {
+          "name": "slope",
+          "label": "Slope",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "curve": [
+              "typed"
+            ],
+            "model": [
+              "linear"
+            ]
+          },
+          "description": "The typed line's signal per unit concentration."
+        },
+        {
+          "name": "intercept",
+          "label": "Intercept",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "curve": [
+              "typed"
+            ],
+            "model": [
+              "linear"
+            ]
+          },
+          "description": "The typed line's signal at zero concentration (the blank)."
+        },
+        {
+          "name": "lod_signal",
+          "label": "LOD signal",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "curve": [
+              "typed"
+            ]
+          },
+          "description": "A typed detection limit in signal units: rows under it are flagged `below LOD`. 0 flags none. A fitted curve takes its own from the blank (mean + 3 SD)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_standard_curve",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "bmax",
+        "intercept",
+        "kd",
+        "lod_signal",
+        "name",
+        "signal",
+        "slope",
+        "std_table",
+        "std_weight",
+        "std_where",
+        "std_x",
+        "std_y",
         "table"
       ]
     },
@@ -23576,7 +24973,7 @@
       "module": "nodegraph/catalog/util/crop_to.py",
       "gui_only": false,
       "summary": "Crop to the field another file occupies in absolute stage coordinates; M collapses to the covering position, pixel size preserved.",
-      "overview": "Crop ``data`` to the field ``region`` occupies in absolute stage µm. Resolved spec (§0 grill, 2026-09-24) ------------------------------------ * **Kind** utility, axis-changing (Y/X shrink, M collapses to 1, Z shrinks in 3D) → ``op_key=\"util.crop_to\"``, category ``\"utility\"``. Sits beside ``util.crop``, which it deliberately does not absorb: that node takes a window you name in pixels, this one derives a window from a second file's placement, and folding a Dataset input into ``util.crop`` would put a live-looking socket on every graph that only wants ``y0:y1``. * **Data contract** image → image, lazily. Pixel size, ``dt_s``, ``z_step_um`` and ``bit_depth`` are untouched — nothing is resampled and no value is rewritten; ``origin_um`` moves to the cut corner and the per-position stage logs retire (:func:`~nodegraph.metadata.drop_position_keys`, ``util.stitch``'s rule, for ``util.stitch``'s reason: after this there is ONE field and its stage CENTRE is no longer the field centre). * **2D/3D** a real lever. 2D cuts Y/X only. 3D additionally keeps the planes whose absolute focus falls inside the reference's axial span, using the ZStackLoop anchoring (:func:`~nodegraph.placement.z_um_of_slice`) — and degrades to lateral-only, with a note, when either file carried no focus log. That is not an edge case: the WellA3 GFP tiles are exactly that state. * **Footprint** ``_DIM_GRAN`` / ``kernel_axes=frozenset()`` — byte-for-byte ``util.crop``'s declaration, and for the same reason: the compute reads no pixel at all, it builds a view, so the footprint it inherits is its base's. * **Backend** none. :mod:`nodegraph.placement` for the geometry (:func:`~nodegraph.placement.field_box`, :func:`~nodegraph.placement.overlap_fraction`, :func:`~nodegraph.placement.source_window`), then :class:`~nodegraph.provider.FrameSubsetProvider` + :class:`~nodegraph.streaming.WindowView`. * **Performance** no numba, no hot path: the whole compute is O(M) box arithmetic over at most a few dozen multipoints. Four questions the grill settled, all of which have a wrong answer that looks right --------------------------------------------------------------------------------- **The region may straddle several positions of ``data``.** A crop is ONE pixel window, so it can only come from one of them. The node takes the position with the largest overlap and writes a :data:`CROP_TO_KEY` note naming the coverage and the positions it therefore did not include, rather than refusing: a 68%/32% straddle is a correct answer to an ambiguous question, and the remedy (``util.stitch`` upstream) is a graph edit the user may not want. The note is how a partial crop stops being silent. **The reference may itself be multi-position.** ``extent=\"union\"`` takes the bounding box of every field it could place — which is also the right answer for the ordinary single-position file, so the default needs no thought — and ``extent=\"position\"`` takes one named multipoint of it. **The box will often hang off the edge.** It is clamped to the intersection and the shortfall is recorded; only a MISS (zero overlap) is refused, because a crop of nothing has no honest output. :func:`~nodegraph.placement.source_window` does the clamping, so this node cannot drift from what the overlay already does with a partly-covered field. **Handedness is derived, not defaulted.** ``flip_x``/``flip_y`` describe how the camera is mounted relative to the stage, and they are *inapplicable* to an already-stitched input whose pixels are already laid out in stage coordinates — applying them again mirrors the mosaic inside its own footprint (measured 784 µm out on the WellA3 pair). :func:`~nodegraph.catalog._shared.placement_entry.handedness_for` is the one place that decides, shared with ``util.merge``. Two deliberate asymmetries with the ``meta_transform`` ----------------------------------------------------- :func:`nodegraph.metadata.crop_to_field` is handed only input 0's envelope (``propagate_meta`` reads ``dataset_preds[0]``), so it can see neither the reference's placement nor which position won. It therefore marks Y/X — and Z in 3D — **UNKNOWN** and DROPS ``origin_um``, exactly as ``util.stitch`` marks its mosaic extent unknown rather than guessing. The payload carries the truth. This is the one place in this node where the envelope is a strictly weaker claim than the payload, and it is deliberate: \"unknown\" is checkable, a guess is not. Consequence worth knowing: a ``util.crop`` placed directly downstream resolves ``ctx.calib(\"origin_um\")`` to ``None`` and so leaves the inherited origin unshifted. Its own window is still correct; only the origin bookkeeping degrades, and it degrades the way it already does for any Dataset with no origin. Structure rows are narrowed on **M** (a Point/Label/Track row on a position this crop dropped is removed and the survivors renumbered) but their Y/X are left alone, which is exactly ``util.crop``'s spatial behaviour — the ``__sampling__`` stamp is what stops a downstream voxel-for-voxel consumer reading them against the cropped grid.",
+      "overview": "Crop ``data`` to the field ``region`` occupies in absolute stage µm. Resolved spec (§0 grill, 2026-09-24) ------------------------------------ * **Kind** utility, axis-changing (Y/X shrink, M collapses to 1, Z shrinks in 3D) → ``op_key=\"util.crop_to\"``, category ``\"utility\"``. Sits beside ``util.crop``, which it deliberately does not absorb: that node takes a window you name in pixels, this one derives a window from a second file's placement, and folding a Dataset input into ``util.crop`` would put a live-looking socket on every graph that only wants ``y0:y1``. * **Data contract** image → image, lazily. Pixel size, ``dt_s``, ``z_step_um`` and ``bit_depth`` are untouched — nothing is resampled and no value is rewritten; ``origin_um`` moves to the cut corner and the per-position stage logs retire (:func:`~nodegraph.metadata.drop_position_keys`, ``util.stitch``'s rule, for ``util.stitch``'s reason: after this there is ONE field and its stage CENTRE is no longer the field centre). * **2D/3D** a real lever. 2D cuts Y/X only. 3D additionally keeps the planes whose absolute focus falls inside the reference's axial span, using the ZStackLoop anchoring (:func:`~nodegraph.placement.z_um_of_slice`) — and degrades to lateral-only, with a note, when either file carried no focus log. That is not an edge case: the WellA3 GFP tiles are exactly that state. * **Footprint** ``_DIM_GRAN`` / ``kernel_axes=frozenset()`` — byte-for-byte ``util.crop``'s declaration, and for the same reason: the compute reads no pixel at all, it builds a view, so the footprint it inherits is its base's. * **Backend** none. :mod:`nodegraph.placement` for the geometry (:func:`~nodegraph.placement.field_box`, :func:`~nodegraph.placement.overlap_fraction`, :func:`~nodegraph.placement.source_window`), then :class:`~nodegraph.provider.FrameSubsetProvider` + :class:`~nodegraph.streaming.WindowView`. * **Performance** no numba, no hot path: the whole compute is O(M) box arithmetic over at most a few dozen multipoints. Four questions the grill settled, all of which have a wrong answer that looks right --------------------------------------------------------------------------------- **The region may straddle several positions of ``data``.** A crop is ONE pixel window, so it can only come from one of them. The node takes the position with the largest overlap and writes a :data:`CROP_TO_KEY` note naming the coverage and the positions it therefore did not include, rather than refusing: a 68%/32% straddle is a correct answer to an ambiguous question, and the remedy (``util.stitch`` upstream) is a graph edit the user may not want. The note is how a partial crop stops being silent. **The reference may itself be multi-position.** ``extent=\"union\"`` takes the bounding box of every field it could place — which is also the right answer for the ordinary single-position file, so the default needs no thought — and ``extent=\"position\"`` takes one named multipoint of it. **The box will often hang off the edge.** It is clamped to the intersection and the shortfall is recorded; only a MISS (zero overlap) is refused, because a crop of nothing has no honest output. :func:`~nodegraph.placement.source_window` does the clamping, so this node cannot drift from what the overlay already does with a partly-covered field. **Handedness applies to a stitched input too.** ``flip_x``/``flip_y`` describe how the camera is mounted relative to the stage, and a stage-Stitched mosaic keeps each tile's pixels as taken, so it runs the camera's way and takes the same flip as a raw field. Until 2026-10-16 the flip was forced off for a stitched input, on the theory that a mosaic is laid out in stage coordinates. That theory was wrong: it cropped the mirror of the requested window about the mosaic's centre. The 784 µm WellA3 measurement it rested on came from the Overlay compositor, which walked every non-canvas primary the wrong way (:func:`nodegraph.placement.frame_mapping`). Two deliberate asymmetries with the ``meta_transform`` ----------------------------------------------------- :func:`nodegraph.metadata.crop_to_field` is handed only input 0's envelope (``propagate_meta`` reads ``dataset_preds[0]``), so it can see neither the reference's placement nor which position won. It therefore marks Y/X — and Z in 3D — **UNKNOWN** and DROPS ``origin_um``, exactly as ``util.stitch`` marks its mosaic extent unknown rather than guessing. The payload carries the truth. This is the one place in this node where the envelope is a strictly weaker claim than the payload, and it is deliberate: \"unknown\" is checkable, a guess is not. Consequence worth knowing: a ``util.crop`` placed directly downstream resolves ``ctx.calib(\"origin_um\")`` to ``None`` and so leaves the inherited origin unshifted. Its own window is still correct; only the origin bookkeeping degrades, and it degrades the way it already does for any Dataset with no origin. Structure rows are narrowed on **M** (a Point/Label/Track row on a position this crop dropped is removed and the survivors renumbered) but their Y/X are left alone, which is exactly ``util.crop``'s spatial behaviour — the ``__sampling__`` stamp is what stops a downstream voxel-for-voxel consumer reading them against the cropped grid.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -23725,7 +25122,7 @@
           "role": "parameter",
           "is_field": false,
           "default": true,
-          "description": "Whether image +X runs OPPOSITE stage +X on this microscope — the camera's mounting handedness, which no file records, so it has to be a setting. It decides which end of the data's own pixel grid the region's µm box lands on, so getting it wrong does not shrink or grow the crop, it MIRRORS where the crop is taken from: the output looks like plausible data from the wrong place, which is the worst failure mode this node has. The tell is a crop that misses by roughly the width of one field, or a 'does not touch the data at all' refusal on two files you know overlap. Default on, matching Merge and Overlay. IGNORED, with a note, when the data is an already-stitched canvas: a stitch has already resolved handedness and its output is laid out in stage coordinates, so flipping again would mirror the mosaic inside its own footprint (measured 784 µm out on the WellA3 pair)."
+          "description": "Whether image +X runs OPPOSITE stage +X on this microscope — the camera's mounting handedness, which no file records, so it has to be a setting. It decides which end of the data's own pixel grid the region's µm box lands on, so getting it wrong does not shrink or grow the crop, it MIRRORS where the crop is taken from: the output looks like plausible data from the wrong place, which is the worst failure mode this node has. The tell is a crop that misses by roughly the width of one field, or a 'does not touch the data at all' refusal on two files you know overlap. Default on, matching Merge and Overlay. It applies to a stage-Stitched mosaic exactly as to a raw field: a mosaic keeps its tiles' pixels as taken, so it runs the camera's way."
         },
         {
           "name": "flip_y",
@@ -23734,7 +25131,7 @@
           "role": "parameter",
           "is_field": false,
           "default": false,
-          "description": "The Y twin of Flip X — whether image +Y runs opposite stage +Y. Default OFF, because the common mounting inverts X only; turn it on if the crop lands mirrored top-to-bottom rather than left-to-right. Same failure mode and the same tell, and it is ignored under the same condition (an already-stitched input)."
+          "description": "The Y twin of Flip X — whether image +Y runs opposite stage +Y. Default OFF, because the common mounting inverts X only; turn it on if the crop lands mirrored top-to-bottom rather than left-to-right. Same failure mode and the same tell, and it applies to a stitched mosaic too."
         }
       ],
       "outputs": [
@@ -23959,7 +25356,7 @@
               "C"
             ]
           },
-          "description": "Channel merge only. Whether a later input's image +x runs along stage −x. The file does not record how the camera is mounted, so for a RAW field this cannot be derived — the default matches Stitch's and Overlay's so the three can never disagree about which way is right. INERT when that input is an already-stitched canvas: the stitch answered this question to place its tiles, so flipping it again mirrors the mosaic inside its own footprint."
+          "description": "Channel merge only. Whether image +x runs along stage −x, for every input. The file does not record how the camera is mounted, so this cannot be derived — the default matches Stitch's and Overlay's so the three can never disagree about which way is right. It applies to a stage-Stitched mosaic exactly as to a raw field (a mosaic keeps its tiles' pixels as taken), and to the FIRST input's grid unless that is an Experiment Canvas. Wrong, a later input lands mirrored about the first's centre."
         },
         {
           "name": "flip_y",
@@ -23973,7 +25370,7 @@
               "C"
             ]
           },
-          "description": "Channel merge only. Whether a later input's image +y runs along stage −y. As Flip X — same default, same reason, and equally inert for an already-stitched input."
+          "description": "Channel merge only. Whether image +y runs along stage −y, for every input. As Flip X — same default, same reason, and it applies to a stitched mosaic too."
         }
       ],
       "outputs": [
@@ -24197,7 +25594,7 @@
       "module": "nodegraph/catalog/util/select_frame.py",
       "gui_only": false,
       "summary": "Keep ONE timepoint of a series, chosen on the Viewer (default: the first frame): T narrows to 1 and everything indexed by t follows — the per-frame clock, per-frame masks, the detections on that frame. The tap Split T's per-frame outputs materialize into, and usable on its own.",
-      "overview": "Keep exactly one timepoint of a series. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.select_frame\"``, category ``\"utility\"``, ``meta_transform=select_frame``. * **Data contract** ``Dataset → the same Dataset with t = 1``. The T half of ``util.crop``'s frames mode exactly: nothing spatial changes, the per-T lists (``frame_time_jd``, …) are subset with the axis (:func:`~nodegraph.metadata.time_subset`), ``dt_s`` survives (one frame keeps the source interval — :func:`respaced`), lattice layers follow and structure rows on other frames are dropped, the survivors re-addressed to ``t = 0`` — the shared helpers every frame subset uses. * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the corresponding input unit of the kept frame; the rest of the series is never read. * **Sockets** ``frame`` (0-based; default 0, the acquisition's first frame and the anchor Registration's ``first`` mode uses; ``pick_kind=\"frame\"`` adopts the timepoint the viewer is showing). No modes. * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider` with one timepoint. Resolution is shared with the edit-time transform (:func:`~nodegraph.metadata.frame_pick`) so the card and the pull agree. A value past the end is REFUSED with the series length — handing back some other frame's pixels under the index asked for is the failure a selector exists to prevent. A single-frame input is returned as is, whatever is asked.",
+      "overview": "Keep exactly one timepoint of a series. Resolved spec (build-node-v2 §0, 2026-10-07) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.select_frame\"``, category ``\"utility\"``, ``meta_transform=select_frame``. * **Data contract** ``Dataset → the same Dataset with t = 1``. The T half of ``util.crop``'s frames mode exactly: nothing spatial changes, the per-T lists (``frame_time_jd``, …) are subset with the axis and ``dt_s`` survives (one frame keeps the source interval) — :func:`~nodegraph.metadata.retime`, as every T subset does; lattice layers follow and structure rows on other frames are dropped, the survivors re-addressed to ``t = 0`` — the shared helpers every frame subset uses. * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the corresponding input unit of the kept frame; the rest of the series is never read. * **Sockets** ``frame`` (0-based; default 0, the acquisition's first frame and the anchor Registration's ``first`` mode uses; ``pick_kind=\"frame\"`` adopts the timepoint the viewer is showing). No modes. * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider` with one timepoint. Resolution is shared with the edit-time transform (:func:`~nodegraph.metadata.frame_pick`) so the card and the pull agree. A value past the end is REFUSED with the series length — handing back some other frame's pixels under the index asked for is the failure a selector exists to prevent. A single-frame input is returned as is, whatever is asked.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -24681,8 +26078,8 @@
       ],
       "module": "nodegraph/catalog/util/stack.py",
       "gui_only": false,
-      "summary": "Stack the Timepoint axis → one frame (SNR↑) with a robust combiner (mean/median/sigma-clip/trimmed); drops dt_s.",
-      "overview": "Fuse the Timepoint axis into a single frame (T→1), boosting SNR. ``method`` picks the combiner (mean/median + the robust ``sigma_clip``/``trimmed_mean`` fusion reducers, or max/sum). Drops ``dt_s`` in lockstep with the ``stack_time`` meta_transform.",
+      "summary": "Stack the Timepoint axis → one frame (SNR↑) with a robust combiner (mean/median/sigma-clip/trimmed); drops dt_s and the per-frame clock, since the fused frame is no single moment.",
+      "overview": "Fuse the Timepoint axis into a single frame (T→1), boosting SNR. ``method`` picks the combiner (mean/median + the robust ``sigma_clip``/``trimmed_mean`` fusion reducers, or max/sum). Drops ``dt_s`` and every per-frame time list (the clock, its text, a bundle's per-file clocks — :func:`~nodegraph.metadata.drop_time_lists`) in lockstep with the ``stack_time`` meta_transform: the fused frame is no single moment.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -25085,7 +26482,7 @@
           "default": "T",
           "description": "Which axis the wired files actually vary along. A loader can only put files on POSITIONS, because that is all it can know about them; this says what they really were, and re-addresses them with no resampling and no copy.",
           "choice_docs": {
-            "T": "Timepoints — the usual case: one file per frame (or per chunk) of a timelapse. 120 files become t=0..119, and util.stack, track.link and analysis.optical_flow start seeing a series instead of 120 unrelated fields. Files need NOT hold the same number of frames: a series exported in unequal chunks (5 then 3) becomes t=0..7. Every file contributes its own clock — a separately loaded card its frame_time_jd, a multi-file card each of its files' own (source_frame_time_jd) — so every frame of the result keeps its real acquisition time; a card that carries only its first file's clock has it DROPPED rather than repeated. dt_s is left alone and still describes spacing WITHIN a file, not the gap between two. The stage log is kept (first file's reading) wherever every file puts a position within a tenth of a field of the same place, so Stitch by stage still works on the result.",
+            "T": "Timepoints — the usual case: one file per frame (or per chunk) of a timelapse. 120 files become t=0..119, and util.stack, track.link and analysis.optical_flow start seeing a series instead of 120 unrelated fields. Files need NOT hold the same number of frames: a series exported in unequal chunks (5 then 3) becomes t=0..7. Every file contributes its own clock — a separately loaded card its frame_time_jd, a multi-file card each of its files' own (source_frame_time_jd) — so every frame of the result keeps its real acquisition time; a card that carries only its first file's clock has it DROPPED rather than repeated. dt_s is rebuilt from that clock: kept where every step, the gaps between files included, matches it, dropped where they differ (speeds then use each step's own gap); without a clock the gaps are unknowable and the files' agreed in-file interval is kept. The stage log is kept (first file's reading) wherever every file puts a position within a tenth of a field of the same place, so Stitch by stage still works on the result.",
             "M": "Positions — the files stay separate fields of one acquisition, laid end to end on M. For a single multi-file card already in filename order this is the identity (it is what the card did); for several wired cards it is what joins them; for a card in the wrong order it re-sorts the positions. Use it when the files are wells or dishes rather than frames — but prefer Batch if you want per-file statistics, since M pools a dataset-scoped threshold across every file.",
             "C": "Channels — one file per stain, acquired separately. Block i of the output is file i's channels, and the channel NAMES are tiled, which is exact rather than invented because the loader refuses to group files whose channel names differ. That also means the result has each name repeated once per file: use channel.select by index, not by name, downstream. Unlike util.merge's C branch nothing is placed or resampled here — grouped files already share a grid.",
             "Z": "Focal planes — one file per plane of a stack. z_step_um is left alone and still describes spacing within a file; the gap between the last plane of one file and the first of the next is not recorded anywhere, so a stack chained from irregularly spaced files will measure axial distances wrongly. Check the spacing yourself, or set it on the source card."
@@ -25222,6 +26619,140 @@
       "kernel_doc": "",
       "params_read": [
         "__modes__"
+      ]
+    },
+    "util.trim": {
+      "op": "util.trim",
+      "label": "Trim",
+      "category": "utility",
+      "role": "dataset_and_channel_organization",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "refine"
+      ],
+      "module": "nodegraph/catalog/util/trim.py",
+      "gui_only": false,
+      "summary": "Scale one axis down by keeping evenly spaced frames — 12 timepoints trimmed to a third are frames 0, 3, 7 and 11 (or a fixed number of frames). Time by default, or Z planes or positions. The per-frame clock, masks and detections follow, and it works before a Timeseries Builder (each file's frames are trimmed and still interleave by their real times) or after it (the built series is trimmed). A lazy view: dropped frames are never read.",
+      "overview": "Keep evenly spaced frames of one axis. Resolved spec (build-node-v2 §0, 2026-10-16) -------------------------------------------- * **Kind** utility, axis-changing → ``op_key=\"util.trim\"``, category ``\"utility\"``, ``meta_transform=_meta_trim`` (local, its maths shared with this compute through :func:`trim_picks` / :func:`trim_changes`). * **Data contract** ``Dataset → the same Dataset with one of m / t / z narrowed``. Nothing spatial changes and no pixel is copied. Lattice layers are subset with the image; Point / Label / Track rows on a dropped frame are dropped and the survivors renumbered. Per-axis metadata follows by Crop's frames-mode rules (:func:`trim_changes`). T is retimed by the rule every T subset shares (:func:`~nodegraph.metadata.retime`): the per-frame clock follows exactly, and ``dt_s`` is MULTIPLIED by a uniform step and DROPPED by an uneven one — ``span`` is uneven whenever ``(n−1)/(k−1)`` is not whole (12 → 4 steps 3, 4, 4). A rate downstream then divides each step by that step's own gap, from the clock (or, on a clockless series, from the per-frame ``frame_time_s`` the rule records). ``z_step_um`` has no per-plane twin, so an uneven Z trim leaves 3D measurements without an axial scale — ``stride`` keeps it. * **Before or after Timeseries Builder.** Before it, each file's own frames are trimmed (a bundle's per-file clocks follow, so the builder still interleaves by real time); after it, the BUILT series is trimmed, evenly in acquisition order. M before a builder thins the files themselves (a per-frame export is one file per position). * **2D/3D** no lever: index arithmetic only. * **Footprint** ``TILEABLE``, no kernel axes — one output unit reads exactly the input unit of the kept frame; dropped frames are never read. * **Sockets** ``fraction`` (``size_by=fraction``) and ``count`` (``size_by=count``), each gated to its branch. Modes ``axis`` (T/Z/M), ``size_by`` (fraction/count), ``spacing`` (span/stride). * **Backend** none — :class:`~nodegraph.provider.FrameSubsetProvider`. Keeping every frame (``k == n``, a 1-frame axis) returns the input untouched, so an unconfigured card costs and stamps nothing — the choice ``util.crop`` makes.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "tileable",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "axis",
+          "label": "Axis",
+          "choices": [
+            "T",
+            "Z",
+            "M"
+          ],
+          "default": "T",
+          "description": "Which axis to thin. Only that axis shrinks; every image, mask and table on the others is untouched, and nothing in a plane is resampled.",
+          "choice_docs": {
+            "T": "Timepoints — the usual case. The time axis is rebuilt for the kept frames: the per-frame clock (frame_time_jd, and each file's own clock inside a multi-file card) follows them, so Viewer timestamps and a Timeseries Builder downstream stay right; dt_s is multiplied by a uniform step and dropped by an uneven one, and speeds and velocities then use each step's own gap. Masks, detections and tracks on dropped frames are removed.",
+            "Z": "Focal planes — a coarser stack, e.g. to test a 3D pipeline fast. z_step_um is multiplied by a uniform step (so 3D volumes and distances stay in true µm) and DROPPED by an uneven one, which 3D measurements then report as unknown — use `stride` for a stack you will measure. The bottom plane is always kept, so the stack does not move.",
+            "M": "Positions (multipoints / tiles). Before a Timeseries Builder that is the files themselves when each file is one frame. Per-position stage coordinates and file names follow the kept positions; picks are spread over positions in order, so on a multi-file card they need not keep the same number of positions per file — and the builder refuses files that differ."
+          }
+        },
+        {
+          "name": "size_by",
+          "label": "Size by",
+          "choices": [
+            "fraction",
+            "count"
+          ],
+          "default": "fraction",
+          "description": "How the number of kept frames is given: as a share of the axis, or as a fixed count.",
+          "choice_docs": {
+            "fraction": "A share of the axis (Fraction): 0.33 of 12 frames keeps 4, of 120 keeps 40 — the trim scales with the series, so a graph built on a short test file thins the full run the same way.",
+            "count": "A fixed number of frames (Frames to keep), whatever the axis length — for a preview or a batch that must come out the same size from series of different lengths."
+          }
+        },
+        {
+          "name": "spacing",
+          "label": "Spacing",
+          "choices": [
+            "span",
+            "stride"
+          ],
+          "default": "span",
+          "description": "Where the kept frames fall. Both always keep frame 0, so a Registration anchored on the first frame sees the same reference.",
+          "choice_docs": {
+            "span": "From the FIRST frame to the LAST, as evenly as whole frames allow: 12 → 4 keeps 0, 3, 7, 11. The whole series is covered, but unless (n−1)/(k−1) is whole the steps differ by one frame (3, 4, 4), so dt_s is dropped rather than averaged: every kept frame keeps its own time (the clock, or frame_time_s on a series with none), and speeds, velocities and time axes downstream read each step's real gap. On Z there is no per-plane twin, so z_step_um is simply dropped and 3D measurements lose their axial scale.",
+            "stride": "ONE fixed step from frame 0, the largest that still fits the count: 12 → 4 keeps 0, 3, 6, 9. The spacing is exactly uniform, so dt_s / z_step_um is kept (multiplied by the step) — what a Z stack you will measure, or anything that needs one interval (a PIV ensemble, a time typed in seconds), wants — at the cost of the tail (here frames 10 and 11)."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        },
+        {
+          "name": "fraction",
+          "label": "Fraction",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.5,
+          "available_in": {
+            "size_by": [
+              "fraction"
+            ]
+          },
+          "description": "The SHARE of the axis to keep: 0.5 keeps every other frame, 0.33 a third (12 frames → 4), 0.1 one in ten. LOWER keeps fewer frames, so everything downstream runs proportionally faster and sees a coarser series — a track or a flow field then spans a bigger step per frame. Rounded half up and never below 1 frame; 1 keeps everything. Values above 1 or at/below 0 are refused, since Trim only scales down. Only read when Size by is `fraction`."
+        },
+        {
+          "name": "count",
+          "label": "Frames to keep",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 10,
+          "available_in": {
+            "size_by": [
+              "count"
+            ]
+          },
+          "description": "HOW MANY frames to keep, whatever the axis length: the same card then thins a short test series and the full run to the same number of frames. A count at or past the axis length keeps every frame; below 1 is refused. Only read when Size by is `count`."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_trim",
+      "meta_transform": "_meta_trim",
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "count",
+        "fraction"
       ]
     },
     "util.unbatch": {
@@ -25803,7 +27334,7 @@
           "role": "parameter",
           "is_field": false,
           "default": true,
-          "description": "Whether image +x runs along stage −x. The file does NOT record how the camera is mounted, so this cannot be derived — it is a property of the scope. The default matches Stitch's, so a mosaic and an overlay of the same file can never disagree about which way is right. If a stitched montage from this scope comes out mirrored, flip it here too. Under Canvas = union it ALSO sets the canvas's orientation (on the Overlay that starts the canvas): on (the default) runs stage +X to the right, tiles joining at their seams; toggling it mirrors the WHOLE picture — every file, tile position and tile's pixels together, seams intact. On later union Overlays it is that file's own handedness, as usual."
+          "description": "Whether image +x runs along stage −x. The file does NOT record how the camera is mounted, so this cannot be derived — it is a property of the scope. The default matches Stitch's, so a mosaic and an overlay of the same file can never disagree about which way is right. If a stitched montage from this scope comes out mirrored, flip it here too. It applies to BOTH files unless the primary is an Experiment Canvas: the secondary is sampled in this handedness, and the primary's own pixel grid is walked in it, so a feature lands where the primary shows it. A stage-Stitched mosaic keeps its tiles' pixels as taken, so it is camera-handed and takes the flip exactly like a raw field. Wrong, it mirrors the secondary about the primary's centre — the MEASURED channel under Output 'resample' too. Under Canvas = union it ALSO sets the canvas's orientation (on the Overlay that starts the canvas): on (the default) runs stage +X to the right, tiles joining at their seams; toggling it mirrors the WHOLE picture — every file, tile position and tile's pixels together, seams intact. On later union Overlays it is that file's own handedness, as usual."
         },
         {
           "name": "flip_y",
@@ -25812,7 +27343,7 @@
           "role": "parameter",
           "is_field": false,
           "default": false,
-          "description": "Whether image +y runs along stage −y. As Flip X, and defaulted to match Stitch for the same reason. Handedness affects only which way the secondary's pixels are sampled — never which tiles are chosen, since a mirrored field still occupies the same patch of stage. Under Canvas = union it also sets the canvas's top-to-bottom orientation, as Flip X does left-to-right."
+          "description": "Whether image +y runs along stage −y. As Flip X, and defaulted to match Stitch for the same reason, and like it applies to both files unless the primary is a canvas. Handedness changes where the secondary is drawn — never which tiles are chosen, since a mirrored field still occupies the same patch of stage. Under Canvas = union it also sets the canvas's top-to-bottom orientation, as Flip X does left-to-right."
         },
         {
           "name": "min_coverage",

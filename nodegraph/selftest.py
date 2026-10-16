@@ -16441,7 +16441,10 @@ def test_crop_frames() -> None:
     md = {"pixel_size_um": 0.5, "z_step_um": 0.4, "dt_s": 2.0, "bit_depth": 12,
           "origin_um": [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 200.0, 0.0]],
           "stage_xy_um": [[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]],
-          "frame_time_jd": [2461249.0 + i for i in range(5)],
+          # a clock that AGREES with dt_s (2 s a frame): a strided pick is checked against
+          # the kept frames' own times since `retime` (2026-10-16), and a clock a day apart
+          # under a 2 s interval would — correctly — win
+          "frame_time_jd": [2461249.0 + 2.0 * i / 86400.0 for i in range(5)],
           "z_home_index": 2}
     pts = StructureTable(D.POINT, {
         "id": np.arange(1, 7, dtype=np.int64),
@@ -16485,7 +16488,7 @@ def test_crop_frames() -> None:
                           img[2, 1, 0, 0]), "the view addresses the PICKED frames"
     assert out.metadata["origin_um"] == [[0.0, 0.0, 0.0], [0.0, 200.0, 0.0]]
     assert out.metadata["stage_xy_um"] == [[0.0, 0.0], [200.0, 0.0]]
-    assert out.metadata["frame_time_jd"] == [2461250.0, 2461252.0]
+    assert out.metadata["frame_time_jd"] == [md["frame_time_jd"][1], md["frame_time_jd"][3]]
     assert out.metadata["dt_s"] == env.metadata["dt_s"] == 4.0, "stride 2 re-spaces T"
     assert out.metadata["z_step_um"] == 0.4 and out.metadata["z_home_index"] == 2
     # lattice layers are SUBSET, not dropped for no longer fitting
@@ -19367,28 +19370,10 @@ def test_util_merge() -> None:
     assert np.allclose(_area_shrink(blk, 2, 2), [[2.5, 4.5], [10.5, 12.5]])
     assert _area_shrink(blk, 4, 4) is blk
 
-    # ── an already-STITCHED secondary must not be flipped again ──────────────────
-    #
-    # Reported 2026-08-05 via the live graph, which had `flip_x` set to False by hand — the clue.
-    # Flip X/Y say whether image +x runs along stage −x, which no file records; but `util.stitch`
-    # had to answer that to place its tiles, so its canvas is ALREADY in stage coordinates.
-    # Applying the flip again mirrors the mosaic inside its own footprint: measured on the WellA3
-    # pair, the stitched 640 secondary landed 784 µm — 456 px at the primary's 1.718 µm/px — out
-    # in x. Derived from the data, because a default the user has to find by eye is not a default.
-    from nodegraph.catalog._shared.placement_entry import already_stage_placed, handedness_for
-    raw = SimpleNamespace(metadata={})
-    assert already_stage_placed(raw) is False
-    assert handedness_for(raw, True, False) == (True, False, ())
-    stitched_sec = SimpleNamespace(metadata={SAMPLING_KEY: ("stitch[stage[49 tiles]]",)})
-    assert already_stage_placed(stitched_sec) is True
-    fx, fy, why = handedness_for(stitched_sec, True, False)
-    assert (fx, fy) == (False, False) and why and "mirror" in why[0], (fx, fy, why)
-    # …and it says nothing when there was no flip to ignore, so the card stays quiet
-    assert handedness_for(stitched_sec, False, False) == (False, False, ())
-    # a GRID-layout stitch is NOT stage-placed and must keep the camera handedness
-    grid_sec = SimpleNamespace(metadata={SAMPLING_KEY: ("stitch[grid[4x3]]",)})
-    assert already_stage_placed(grid_sec) is False, \
-        "a contact-sheet montage makes no stage claim, so the camera flip still applies"
+    # (Handedness — a stitched input takes the flip like a raw field, and a non-canvas primary
+    # is walked in it — is checked against a ground-truth stage image in
+    # `test_placement_handedness_ground_truth`, which replaced the 2026-08-05 "stitched =
+    # flip inert" assertions here.)
 
     # ── the merged note reports what it did ─────────────────────────────────────
     n = out.metadata["__merge__"]
@@ -19626,12 +19611,7 @@ def test_util_merge() -> None:
         "nearest-neighbour, since \"blocky is the honest rendering of real pixels stretched\" "
         "depends on exactly that; each covering tile is also read at ITS OWN nearest plane rather "
         "than the first hit's, because the secondary's fields are each focused at their own "
-        "height; and Flip X/Y are DERIVED inert for an already-stitched secondary — the stitch "
-        "answered the handedness question to place its tiles, so its canvas is in stage "
-        "coordinates and flipping it again mirrored the mosaic inside its own footprint, "
-        "measured 784 µm (456 px) out in x on the WellA3 pair, which is what had the live graph "
-        "carrying a hand-set flip_x=False; a GRID-layout stitch makes no stage claim and keeps "
-        "the camera flip. A SINGLE-timepoint secondary is HELD across the primary's whole T "
+        "height. A SINGLE-timepoint secondary is HELD across the primary's whole T "
         "rather than paired only with frame 0 (reported 2026-09-14 as \"overlay only appears on "
         "the first frame\") — here a snapshot merged into a 4-frame timelapse reads 200/210 on "
         "every frame instead of zeros after the first, while the primary's own channel still "
@@ -19645,6 +19625,183 @@ def test_util_merge() -> None:
         "grown axis unknown (not also z, unlike \"C\"); merge_axis folds into the recipe hash so "
         "T and M on the same wiring never collide; and a lone input refuses under every axis "
         "choice, not just the default C")
+
+
+def test_placement_handedness_ground_truth() -> None:
+    """Overlay, Merge and Crop To place by the camera's handedness on every primary (2026-10-16).
+
+    Tiles are cut from one analytic stage image the way this scope's camera takes them (image
+    +x along stage −x — Flip X on), so every placed result has a ground truth. Two faults are
+    pinned here:
+
+    * the compositor walked every NON-CANVAS primary toward stage +x, which on this scope is
+      the mirror of the primary's own pixels, so a secondary landed mirrored about the
+      primary's centre (r = 0.36 raw-on-raw against this ground truth);
+    * a stage-Stitched input had Flip X/Y forced off (the 2026-08-05 "already in stage
+      coordinates" rule). A mosaic keeps its tiles' pixels as taken, so it is camera-handed,
+      and forcing the flip off mirrored it — on an Experiment Canvas too, where the IL-8
+      spheroid bake came out mirrored about the mosaic's centre (IoU 0.73 against its own raw
+      tiles, 0.97 after this fix). The 784 µm WellA3 measurement behind that rule was the
+      first fault seen through two stitched files with nearly the same centre.
+
+    Each result must correlate with the ground truth rendered in the primary's own pixel
+    frame; the +x-right rendering of the same truth must not, so the check can tell the two
+    apart.
+    """
+    from nodegraph.nodes import COMPUTES, OVERLAY_KEY
+    from nodegraph.placement import (canvas_mapping, compose_secondary_plane, field_rect01,
+                                     frame_mapping, nudge_delta_um)
+    from nodegraph.provider import ArrayProvider
+
+    blobs = ((-150.0, -40.0, 18.0), (-60.0, 70.0, 12.0), (40.0, -90.0, 25.0),
+             (130.0, 20.0, 10.0), (90.0, 110.0, 15.0), (-110.0, 140.0, 9.0),
+             (10.0, 10.0, 6.0), (-20.0, -150.0, 14.0))
+
+    def stage(X, Y):
+        v = np.zeros_like(X)
+        for k, (bx, by, s) in enumerate(blobs):
+            v += (100.0 + 30.0 * k) * np.exp(-((X - bx) ** 2 + (Y - by) ** 2) / (2 * s * s))
+        return v
+
+    def acquire(centres, n, p):
+        """This scope's camera: pixel (r, c) of a field centred (cx, cy) images stage
+        (cx + W/2 − (c + ½)p, cy − H/2 + (r + ½)p)."""
+        arr = np.zeros((len(centres), 1, 1, 1, n, n), np.float32)
+        half = (np.arange(n) + 0.5) * p
+        for i, (cx, cy) in enumerate(centres):
+            X, Y = np.meshgrid(cx + n * p / 2 - half, cy - n * p / 2 + half)
+            arr[i, 0, 0, 0] = stage(X, Y)
+        md = {"pixel_size_um": p, "stage_xy_um": [list(c) for c in centres],
+              "stage_z_um": [0.0] * len(centres),
+              "origin_um": [[0.0, cy - n * p / 2, cx - n * p / 2] for cx, cy in centres]}
+        ax = AxisSizes(m=len(centres), t=1, z=1, c=1, y=n, x=n)
+        return Dataset(axes=ax, metadata=md).with_image(ArrayProvider(arr))
+
+    def truth(ds, camera):
+        """The ground truth on ``ds``'s own pixel grid: camera-handed, or +x right."""
+        _oz, oy, ox = ds.metadata["origin_um"][0]
+        p = float(ds.metadata["pixel_size_um"])
+        cols = (np.arange(ds.axes.x) + 0.5) * p
+        X, Y = np.meshgrid(ox + ds.axes.x * p - cols if camera else ox + cols,
+                           oy + (np.arange(ds.axes.y) + 0.5) * p)
+        return stage(X, Y)
+
+    def plane(ds, c):
+        a = ds.axes
+        return np.asarray(ds.image.read_region(0, 0, 0, 0, c, 0, a.y, 0, a.x), dtype=float)
+
+    def corr(img, ref):
+        ok = img > 0                    # where something was placed
+        a, b = img[ok] - img[ok].mean(), ref[ok] - ref[ok].mean()
+        return float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
+
+    def pull(nodes, edges, seeds, at):
+        g = Graph()
+        for nid, op, params, modes in nodes:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+        for a, b, sock in edges:
+            g.connect(a, b, dst_socket=sock)
+        metas = {k: MetaEnvelope(axes=v.axes, metadata=dict(v.metadata))
+                 for k, v in seeds.items()}
+        return Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas).pull(at)
+
+    pri = acquire([(-115.2 + 115.2 * i, -115.2 + 115.2 * j)
+                   for j in range(3) for i in range(3)], 64, 2.0)       # 3×3 at 2 µm/px
+    sec = acquire([(50.0 + 60.0 * i, -60.0 + 60.0 * j)
+                   for j in range(2) for i in range(2)], 128, 0.5)      # 2×2 at 0.5 µm/px
+    one = acquire([(30.0, 10.0)], 80, 2.0)                              # one raw field
+    stitch = ("util.stitch", {"flip_x": True, "flip_y": False},
+              {"layout": "stage", "blend": "max"})
+    bake = ("view.overlay", {}, {"output": "resample", "canvas": "primary"})
+    load = ("io.load", {}, {})
+
+    def check(what, img, ds):
+        good, mirror = corr(img, truth(ds, True)), corr(img, truth(ds, False))
+        assert good > 0.98 and mirror < 0.6, (what, round(good, 3), round(mirror, 3))
+        return good
+
+    # ── Overlay onto a raw field, a stitched mosaic and an Experiment Canvas ───────
+    out = pull([("A", *load), ("B", *load), ("O", *bake)],
+               [("A", "O", "data"), ("B", "O", "secondary")], {"A": one, "B": sec}, "O")
+    check("raw primary <- raw secondary", plane(out, 1), one)
+    raw_entry = out.metadata[OVERLAY_KEY][-1]
+    assert raw_entry["frame_flip"] == [True, False], raw_entry.get("frame_flip")
+    out = pull([("A", *load), ("B", *load), ("SA", *stitch), ("SB", *stitch), ("O", *bake)],
+               [("A", "SA", "data"), ("B", "SB", "data"), ("SA", "O", "data"),
+                ("SB", "O", "secondary")], {"A": pri, "B": sec}, "O")
+    check("stitched primary, own pixels", plane(out, 0), out)
+    check("stitched primary <- stitched secondary", plane(out, 1), out)
+    for label, via_stitch in (("stitched", True), ("raw", False)):
+        nodes = [("A", *load), ("B", *load),
+                 ("CV", "view.canvas", {"pixel_size_um": 2.0, "margin_um": 20.0}, {}),
+                 ("O", *bake)]
+        edges = [("A", "CV", "data"), ("CV", "O", "data")]
+        if via_stitch:
+            nodes.append(("SB", *stitch))
+            edges += [("B", "SB", "data"), ("SB", "O", "secondary")]
+        else:
+            edges.append(("B", "O", "secondary"))
+        out = pull(nodes, edges, {"A": pri, "B": sec}, "O")
+        # a canvas at the default flips is a +x-right map: the truth is NOT camera-handed
+        img, ref = plane(out, out.axes.c - 1), truth(out, False)
+        assert corr(img, ref) > 0.98, (label, corr(img, ref))
+        assert corr(img, truth(out, True)) < 0.6, label
+
+    # ── Merge (channel) and Crop To, through the same rule ────────────────────────
+    out = pull([("A", *load), ("B", *load), ("SA", *stitch),
+                ("M", "util.merge", {}, {})],
+               [("A", "SA", "data"), ("SA", "M", "data"), ("B", "M", "data")],
+               {"A": pri, "B": sec}, "M")
+    check("merge: stitched first input + raw", plane(out, 1), out)
+    out = pull([("A", *load), ("R", *load), ("SA", *stitch),
+                ("K", "util.crop_to", {}, {})],
+               [("A", "SA", "data"), ("SA", "K", "data"), ("R", "K", "region")],
+               {"A": pri, "R": one}, "K")
+    check("crop_to: stitched mosaic by a raw field's box", plane(out, 0), out)
+
+    # ── the frame rule itself, and the two display helpers that must follow it ────
+    canvas_md = {"canvas_flip": [True, False]}
+    assert frame_mapping(canvas_md, raw_entry) == canvas_mapping(canvas_md)
+    assert frame_mapping(one.metadata, raw_entry) == (True, False, False, False)
+    assert frame_mapping(one.metadata, {}) == (False, False, False, False), \
+        "an entry stamped before frame_flip keeps the old ascending walk"
+    # field_rect01 outlines each secondary field exactly where the compositor paints it
+    for j in range(sec.axes.m):
+        ent = {**raw_entry, "tiles": [[0, [[j, 1.0]]]]}
+        got = compose_secondary_plane(ent, (80, 80), one.metadata, one.axes, 0,
+                                      sec.metadata, sec.axes,
+                                      lambda _j, _w=None: np.ones((128, 128), np.float32))
+        rect = field_rect01(ent, one.metadata, one.axes, 0, sec.metadata, sec.axes, j)
+        if got is None or rect is None:
+            continue
+        rows, cols = np.flatnonzero(got.any(axis=1)), np.flatnonzero(got.any(axis=0))
+        fx0, fx1 = max(0.0, rect[2]), min(1.0, rect[3])
+        assert abs(cols[0] / 80 - fx0) <= 1.5 / 80 and abs((cols[-1] + 1) / 80 - fx1) <= 1.5 / 80, \
+            (j, cols[0], cols[-1], rect)
+        assert rows.size > 0
+    # a two-click nudge moves the drawn feature onto the click, on a camera-handed primary
+    dot = np.zeros((128, 128), np.float32)
+    dot[64, 40] = 1.0
+    ent = {**raw_entry, "tiles": [[0, [[0, 1.0]]]]}
+    at = compose_secondary_plane(ent, (80, 80), one.metadata, one.axes, 0, sec.metadata,
+                                 sec.axes, lambda _j, _w=None: dot)
+    r0, c0 = np.unravel_index(int(np.argmax(at)), at.shape)
+    dy, dx = nudge_delta_um(one.metadata, one.axes, (r0, c0 + 5), (r0, c0),
+                            frame_flip=(True, False))
+    moved = compose_secondary_plane({**ent, "offset_um": [0.0, dy, dx]}, (80, 80),
+                                    one.metadata, one.axes, 0, sec.metadata, sec.axes,
+                                    lambda _j, _w=None: dot)
+    r1, c1 = np.unravel_index(int(np.argmax(moved)), moved.shape)
+    assert (r1, c1) == (r0, c0 + 5), ((r0, c0), (r1, c1), dx)
+    _ok("placement handedness (2026-10-16): against a ground-truth stage image cut into "
+        "camera-handed tiles (image +x along stage −x), Overlay places a secondary correctly "
+        "on a raw field, on a stage-Stitched mosaic and on an Experiment Canvas, from raw "
+        "tiles or a stitched mosaic alike (r > 0.98 against the primary's own frame, < 0.6 "
+        "against its mirror); Merge and Crop To follow the same rule; a non-canvas primary is "
+        "walked in the entry's frame_flip, a canvas in its own orientation, and an old entry "
+        "without frame_flip in the old ascending walk; field_rect01 outlines each field where "
+        "the compositor paints it; and a two-click nudge on a camera-handed primary moves the "
+        "drawn feature onto the click")
 
 
 def test_display_resolution_policy() -> None:
@@ -25618,6 +25775,427 @@ def test_time_shift() -> None:
         "frame are the identity, Δ past the length holds the edge everywhere; the four mode "
         "states hash apart; a fraction is refused; FrameRemapProvider repeats, blanks and "
         "fingerprints its map")
+
+
+def test_trim() -> None:
+    """``util.trim`` (2026-10-16): scale an axis down to evenly spaced frames.
+
+    1. **The rule** (:func:`trim_picks`): 12 frames to a third is 0, 3, 7, 11 — the request's
+       own example — by fraction and by count alike; ``stride`` is 0, 3, 6, 9; half-up
+       rounding; never below one frame; a count past the end keeps all; a fraction outside
+       (0, 1] and a count below 1 are refused.
+    2. **The pull, on T**: pixels, the per-T clock, the Voxel mask and the Point rows follow;
+       ``span``'s uneven steps DROP ``dt_s`` and ``stride`` multiplies it; envelope ==
+       payload; the stamp is t-only; ``dt_s`` is a fenced read; the mode states hash apart;
+       keeping every frame is the identity; a bad fraction is refused while the envelope
+       holds.
+    3. **Z and M**: ``z_step_um`` re-spaced and ``z_home_index`` moved; per-M lists follow.
+    4. **Either side of a Timeseries Builder**: a trimmed multi-file card keeps each file's
+       own clock (``source_frame_time_jd``) in step, so the builder still interleaves the
+       survivors by real time; separately trimmed cards give the same series; trimming the
+       BUILT series picks evenly from acquisition order. Envelope == payload throughout.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import jd_to_datetime_text
+    from nodegraph.provider import ArrayProvider, MultiSourceProvider
+    from nodegraph.metadata import SOURCE_CLOCK_KEY, SOURCE_FILE_KEY
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    from nodegraph.catalog.util.trim import trim_picks
+
+    # 1. the rule
+    def picks(n, params=None, modes=None):
+        params = params or {}
+        keep, problem = trim_picks(n, modes or {}, params.get("fraction"), params.get("count"))
+        return keep if keep is not None else problem
+
+    assert picks(12, {"fraction": 1 / 3}) == (0, 3, 7, 11), picks(12, {"fraction": 1 / 3})
+    assert picks(12, {"fraction": 0.33}) == (0, 3, 7, 11)
+    assert picks(12, {"count": 4}, {"size_by": "count"}) == (0, 3, 7, 11)
+    assert picks(12, {"count": 4}, {"size_by": "count", "spacing": "stride"}) == (0, 3, 6, 9)
+    assert picks(12) == (0, 2, 4, 6, 8, 11), "the default keeps half, first to last"
+    assert picks(5, {"fraction": 0.5}) == (0, 2, 4), "2.5 frames rounds half UP to 3"
+    assert picks(12, {"fraction": 0.01}) == (0,) and picks(12, {"fraction": 1}) == tuple(range(12))
+    assert picks(12, {"count": 50}, {"size_by": "count"}) == tuple(range(12))
+    assert picks(1, {"fraction": 0.1}) == (0,) and picks(7, {"count": 2}, {"size_by": "count"}) == (0, 6)
+    for params, modes, word in (({"fraction": 3}, {}, "outside (0, 1]"),
+                                ({"fraction": 0}, {}, "outside (0, 1]"),
+                                ({"fraction": "x"}, {}, "between 0 and 1"),
+                                ({"count": 0}, {"size_by": "count"}, "keeps no frames"),
+                                ({"count": 2.5}, {"size_by": "count"}, "keeps no frames")):
+        got = picks(12, params, modes)
+        assert isinstance(got, str) and word in got, (params, got)
+
+    # 2. the pull on T
+    define_node("io.trimseed", "S", outputs=[OutDataset()])
+    M, T, Z, Y, X = 1, 12, 3, 4, 5
+    arr = np.zeros((M, T, Z, 1, Y, X), dtype=float)
+    for t in range(T):
+        for z in range(Z):
+            arr[:, t, z] = 100.0 * t + z
+    ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+    jd = [2460000.0 + 30.0 * t / 86400.0 for t in range(T)]     # a clock that agrees with dt_s
+    meta = {"pixel_size_um": 0.5, "dt_s": 30.0, "z_step_um": 0.5, "z_home_index": 2,
+            "frame_time_jd": jd, "frame_datetime": [jd_to_datetime_text(v) for v in jd]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, Z, 1, Y, X), dtype=np.int64)
+    for t in range(T):
+        mask[:, t, :, :, t % Y, t % X] = 1
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.POINT, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 0, 0]), "t": np.array([0, 3, 5]),
+        "c": np.array([0, 0, 0]), "z": np.array([0, 1, 0]),
+        "y": np.array([0.0, 1.0, 2.0]), "x": np.array([0.0, 1.0, 2.0])}, layer="spots"))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def engine(params=None, modes=None, seed=ds, env=env0):
+        g = Graph()
+        g.add(NodeInstance("S", "io.trimseed"))
+        g.add(NodeInstance("N", "util.trim", params=params or {}, modes=modes or {}))
+        g.connect("S", "N")
+        return Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": env})
+
+    def pull(params=None, modes=None, seed=ds, env=env0):
+        e = engine(params, modes, seed, env)
+        return e, e.pull("N")
+
+    def px(out, t=0, z=0, m=0):
+        return float(out.image.get_region(0, m, t, z, 0, 0, Y, 0, X)[0, 0])
+
+    e, out = pull({"fraction": 1 / 3})
+    keep = [0, 3, 7, 11]
+    assert out.axes == _replace(ax, t=4), out.axes
+    assert [px(out, t) for t in range(4)] == [100.0 * k for k in keep], [px(out, t) for t in range(4)]
+    assert out.metadata["frame_time_jd"] == [jd[k] for k in keep]
+    assert out.metadata["frame_datetime"] == [meta["frame_datetime"][k] for k in keep]
+    assert out.metadata.get("dt_s") is None, "span's steps (3, 4, 4) carry no single interval"
+    assert out.metadata["z_step_um"] == 0.5 and out.metadata["z_home_index"] == 2
+    lay = out.get(Domain.VOXEL, "mask").values
+    assert lay.shape[1] == 4 and all(lay[0, i, 0, 0, k % Y, k % X] == 1 for i, k in enumerate(keep))
+    assert lay.sum() == 4 * Z, lay.sum()
+    assert list(out.get(Domain.POINT, "id", layer="spots").values) == [1, 2]
+    assert list(out.get(Domain.POINT, "t", layer="spots").values) == [0, 1], "t=3 is kept frame 1"
+    env = e.env("N")
+    assert env.axes == out.axes and env.metadata.get("frame_time_jd") == out.metadata["frame_time_jd"]
+    assert env.metadata.get("dt_s") is None
+    assert "t:trim[0,3,7,11]" in str(out.metadata.get(SAMPLING_KEY, "")), out.metadata.get(SAMPLING_KEY)
+    assert "dt_s" in dict(e.entry("N").reads), dict(e.entry("N").reads)
+    hashes = {e.entry("N").recipe_hash}
+    # stride keeps a uniform step, so dt_s survives multiplied
+    e, out = pull({"count": 4}, {"size_by": "count", "spacing": "stride"})
+    assert [px(out, t) for t in range(4)] == [0.0, 300.0, 600.0, 900.0]
+    assert out.metadata["dt_s"] == 90.0 and e.env("N").metadata["dt_s"] == 90.0
+    hashes.add(e.entry("N").recipe_hash)
+    e, out = pull({"count": 4}, {"size_by": "count"})
+    assert [px(out, t) for t in range(4)] == [100.0 * k for k in keep], "count 4 == a third of 12"
+    hashes.add(e.entry("N").recipe_hash)
+    assert len(hashes) == 3, "fraction/count and span/stride fold into the recipe"
+    # the identity: keeping every frame returns the input untouched
+    for params, modes in (({"fraction": 1.0}, {}), ({"count": 99}, {"size_by": "count"})):
+        e, out = pull(params, modes)
+        assert out.axes == ax and SAMPLING_KEY not in out.metadata and out.metadata["dt_s"] == 30.0
+    # a refusal: the payload raises with the reason, the envelope holds
+    try:
+        pull({"fraction": 3})
+        raise AssertionError("a fraction above 1 must be refused")
+    except ValueError as exc:
+        assert "outside (0, 1]" in str(exc) and "count" in str(exc), str(exc)
+    assert engine({"fraction": 3}).env("N").axes == ax
+
+    # 3. Z and M
+    e, out = pull({"count": 2}, {"axis": "Z", "size_by": "count"})
+    assert out.axes == _replace(ax, z=2) and [px(out, 0, z) for z in range(2)] == [0.0, 2.0]
+    assert out.metadata["z_step_um"] == 1.0 and out.metadata["z_home_index"] == 1
+    assert out.metadata["frame_time_jd"] == jd and out.metadata["dt_s"] == 30.0
+    assert e.env("N").axes == out.axes and e.env("N").metadata["z_step_um"] == 1.0
+    assert list(out.get(Domain.POINT, "id", layer="spots").values) == [1, 3], "z=1 dropped"
+    m_arr = np.stack([arr[0] + 10000.0 * m for m in range(4)])
+    m_meta = {"pixel_size_um": 0.5, "stage_xy_um": [[float(m), 0.0] for m in range(4)],
+              SOURCE_FILE_KEY: [f"f{m}.nd2" for m in range(4)]}
+    m_ds = Dataset(axes=_replace(ax, m=4), metadata=m_meta).with_image(ArrayProvider(m_arr))
+    m_env = MetaEnvelope(axes=m_ds.axes, metadata=m_meta)
+    e, out = pull({"fraction": 0.5}, {"axis": "M"}, seed=m_ds, env=m_env)
+    assert out.axes.m == 2 and [px(out, 0, 0, m) for m in range(2)] == [0.0, 30000.0]
+    assert out.metadata["stage_xy_um"] == [[0.0, 0.0], [3.0, 0.0]]
+    assert out.metadata[SOURCE_FILE_KEY] == ["f0.nd2", "f3.nd2"]
+    assert e.env("N").axes == out.axes and e.env("N").metadata[SOURCE_FILE_KEY] == ["f0.nd2", "f3.nd2"]
+
+    # 4. before and after a Timeseries Builder: two files whose frames alternate in time
+    J, MIN = 2460000.0, 1.0 / 1440.0
+
+    def farr(fid):
+        a = np.zeros((1, 6, 1, 1, 4, 4))
+        for i in range(6):
+            a[0, i] = 10 * fid + i                      # value says (file, own frame)
+        return a
+
+    def card(fid, name, mins):
+        cj = [J + v * MIN for v in mins]
+        md = {"pixel_size_um": 0.5, SOURCE_FILE_KEY: [name], "frame_time_jd": cj}
+        return Dataset(axes=AxisSizes(m=1, t=6, z=1, c=1, y=4, x=4),
+                       metadata=md).with_image(ArrayProvider(farr(fid)))
+
+    a = card(1, "run_001.nd2", [0, 2, 4, 6, 8, 10])
+    b = card(2, "run_002.nd2", [1, 3, 5, 7, 9, 11])
+
+    def run(nodes, edges, seeds, tail):
+        g = Graph(nodes={nid: NodeInstance(nid, op, params=p, modes=md)
+                         for nid, (op, p, md) in nodes.items()},
+                  edges=[Edge(s, d, ss, ds_, "forward") for s, d, ss, ds_ in edges])
+        eng = Engine(g, computes=COMPUTES, seeds=seeds,
+                     meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                                 for k, v in seeds.items()})
+        out = eng.pull(tail)
+        assert eng.env(tail).axes == out.axes, (eng.env(tail).axes, out.axes)
+        assert eng.env(tail).metadata.get("frame_time_jd") == out.metadata.get("frame_time_jd")
+        return out
+
+    def frames(d):
+        return [int(d.image.get_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0])
+                for t in range(int(d.axes.t))]
+
+    builder = ("util.timeseries", {}, {"chain_axis": "T", "chain_order": "time"})
+    half = ("util.trim", {"fraction": 0.5}, {})
+    # (a) BEFORE, one multi-file card: each file keeps its frames 0, 2, 5, and its own clock
+    prov = MultiSourceProvider([ArrayProvider(farr(1)), ArrayProvider(farr(2))],
+                               labels=["run_001.nd2", "run_002.nd2"])
+    bundle = Dataset(axes=prov.axes, metadata={
+        "pixel_size_um": 0.5, SOURCE_FILE_KEY: ["run_001.nd2", "run_002.nd2"],
+        "frame_time_jd": a.metadata["frame_time_jd"],
+        SOURCE_CLOCK_KEY: [a.metadata["frame_time_jd"], b.metadata["frame_time_jd"]]}
+    ).with_image(prov)
+    out_b = run({"L": ("io.load", {}, {}), "R": half, "C": builder},
+                [("L", "R", "image", "data"), ("R", "C", "out", "data")], {"L": bundle}, "C")
+    assert frames(out_b) == [10, 20, 12, 22, 15, 25], frames(out_b)
+    assert out_b.metadata["frame_time_jd"] == [J + v * MIN for v in (0, 1, 4, 5, 10, 11)]
+    assert out_b.metadata["__chain__"]["interleaved"] is True, out_b.metadata["__chain__"]
+    # (b) BEFORE, two separate cards each through its own Trim: the same series
+    out_s = run({"L0": ("io.load", {}, {}), "L1": ("io.load", {}, {}),
+                 "R0": half, "R1": half, "C": builder},
+                [("L0", "R0", "image", "data"), ("L1", "R1", "image", "data"),
+                 ("R1", "C", "out", "data"), ("R0", "C", "out", "file_2")],
+                {"L0": a, "L1": b}, "C")
+    assert frames(out_s) == frames(out_b) and \
+        out_s.metadata["frame_time_jd"] == out_b.metadata["frame_time_jd"], frames(out_s)
+    # (c) AFTER: the built 12-frame series trimmed to a third is frames 0, 3, 7, 11 of it
+    out_a = run({"L0": ("io.load", {}, {}), "L1": ("io.load", {}, {}), "C": builder,
+                 "R": ("util.trim", {"fraction": 1 / 3}, {})},
+                [("L0", "C", "image", "data"), ("L1", "C", "image", "file_2"),
+                 ("C", "R", "out", "data")], {"L0": b, "L1": a}, "R")
+    assert frames(out_a) == [10, 21, 23, 25], frames(out_a)
+    assert out_a.metadata["frame_time_jd"] == [J + v * MIN for v in (0, 3, 7, 11)]
+    _ok("trim: 12 frames to a third keep 0, 3, 7, 11 (by fraction or count; `stride` 0, 3, "
+        "6, 9; half-up; ≥ 1 frame; a count past the end keeps all; fraction ∉ (0, 1] and "
+        "count < 1 refused); on T the pixels, clock, Voxel mask and Point rows follow, span "
+        "drops dt_s and stride multiplies it, envelope == payload, t-only stamp, dt_s fenced, "
+        "mode states hash apart, keep-all is the identity; Z re-spaces z_step_um and moves "
+        "z_home_index, M narrows the per-M lists; before a Timeseries Builder (one bundle or "
+        "separate cards) each file's clock follows and the survivors interleave by real time, "
+        "after it the built series is trimmed evenly in acquisition order")
+
+
+def test_time_metadata() -> None:
+    """The time axis is REBUILT by every node that changes T, and READ the same way by every
+    node that turns frames into time (2026-10-16).
+
+    1. **retime** (one rule for every subset): a contiguous run keeps ``dt_s``; an even stride
+       multiplies it when the clock bears it out and takes the clock's step when the source
+       paused; uneven kept times drop it; a clockless uneven pick keeps each frame's time as
+       ``frame_time_s`` (and a later subset of THAT is retimed from it); one frame keeps the
+       interval; an untimed series gains nothing.
+    2. **concat_interval**: a seam gap drops an agreed in-file ``dt_s``; files of one frame
+       each gain the clock's step; without a clock only an agreed interval survives.
+    3. **Rates read per-frame time**: a tracked object moving at 0.1 µm/s through an UNEVEN
+       Trim (frames 0, 3, 7, 11 — no ``dt_s``) reports exactly 0.1 µm/s on every step, with a
+       clock and without one; PIV's pair gap and the velocity helper agree.
+    4. **Reducers and slices**: Stack drops the clock with ``dt_s``; ``zone.frame`` subsets it
+       to its frame — envelope == payload for both.
+    5. **Concatenators**: a Timeseries Builder in block order with a gap between files drops
+       ``dt_s`` (and says so), one built from single-frame files gains it; Merge onto T with a
+       seam gap drops it; ``frame_time_s`` is never concatenated.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.metadata import (FRAME_TIME_S_KEY, SOURCE_FILE_KEY, concat_interval,
+                                    frame_times_s, retime, series_seconds, uniform_step_s)
+    from nodegraph.catalog._shared.objects import _object_velocity_nd
+    from nodegraph.catalog.analysis.piv import _pair_dt_s
+
+    J, DAY = 2460000.0, 86400.0
+    clock = [J + 30.0 * t / DAY for t in range(12)]               # 30 s a frame
+    timed = {"dt_s": 30.0, "frame_time_jd": clock}
+
+    def close(a, b, tol=1e-3):
+        # a Julian day near 2.46e6 resolves ~40 µs, so a step read off the clock is exact
+        # only to that
+        return a is not None and b is not None and abs(float(a) - float(b)) < tol
+
+    # 1. retime
+    ch = retime(timed, range(2, 6))
+    assert ch["dt_s"] == 30.0 and ch["frame_time_jd"] == clock[2:6], ch
+    ch = retime(timed, [0, 3, 6, 9])
+    assert ch["dt_s"] == 90.0, ch                                   # stride borne out by the clock
+    paused = {"dt_s": 30.0, "frame_time_jd": [J + s / DAY for s in
+                                              (0, 30, 60, 90, 600, 630, 660, 690)]}
+    ch = retime(paused, [0, 2, 4, 6])                               # times 0, 60, 600, 660
+    assert ch["dt_s"] is None, "the pause makes the stride uneven in TIME"
+    ch = retime(paused, [4, 6])
+    assert close(ch["dt_s"], 60.0), ch                              # a stride of 2 that is even
+    ch = retime(timed, [0, 3, 7, 11])
+    assert ch["dt_s"] is None and ch["frame_time_jd"] == [clock[i] for i in (0, 3, 7, 11)]
+    assert FRAME_TIME_S_KEY not in ch, "a clocked series needs no second per-frame list"
+    clockless = {"dt_s": 30.0}
+    ch = retime(clockless, [0, 3, 7, 11])
+    assert ch["dt_s"] is None and ch[FRAME_TIME_S_KEY] == [0.0, 90.0, 210.0, 330.0], ch
+    again = retime({**clockless, **ch}, [1, 3])                     # 90 s and 330 s
+    assert again[FRAME_TIME_S_KEY] == [90.0, 330.0] and close(again["dt_s"], 240.0), again
+    assert series_seconds({**clockless, **ch}, 4) == [0.0, 90.0, 210.0, 330.0]
+    assert retime(clockless, [0, 4, 8])["dt_s"] == 120.0
+    assert FRAME_TIME_S_KEY not in retime(clockless, [0, 4, 8])
+    assert retime(timed, [5])["dt_s"] == 30.0 and retime(timed, [5])["frame_time_jd"] == [clock[5]]
+    untimed = retime({}, [0, 3, 7])
+    assert untimed == {"dt_s": None}, untimed
+    no_dt = retime({"frame_time_jd": clock}, [0, 1, 2])
+    assert close(no_dt["dt_s"], 30.0), "a series without an interval gains the clock's"
+    assert frame_times_s({"dt_s": 2.0}, 3) == [0.0, 2.0, 4.0]
+    assert frame_times_s({}, 3) is None and uniform_step_s([0.0, 1.0, 1.5]) is None
+
+    # 2. concat_interval
+    assert concat_interval([60.0, 60.0], [0, 60, 120, 600, 660]) is None, "seam gap"
+    assert concat_interval([60.0, 60.0], [0, 60, 120, 180]) == 60.0
+    assert close(concat_interval([None, None, None], [0, 300, 600]), 300.0)
+    assert concat_interval([60.0, 60.0], None) == 60.0
+    assert concat_interval([60.0, 30.0], None) is None
+
+    # 3. rates read per-frame time, through an UNEVEN trim, clocked and clockless
+    define_node("io.timeseed", "S", outputs=[OutDataset()])
+    T, Y, X, PX, V = 12, 8, 64, 0.5, 0.1                            # V µm/s along x
+    ax = AxisSizes(m=1, t=T, z=1, c=1, y=Y, x=X)
+    img = np.zeros((1, T, 1, 1, Y, X), dtype=float)
+    tbl = StructureTable(Domain.LABEL, {
+        "id": np.arange(1, T + 1, dtype=np.int64), "m": np.zeros(T, np.int64),
+        "t": np.arange(T, dtype=np.int64), "c": np.zeros(T, np.int64), "z": np.zeros(T),
+        "y": np.full(T, 4.0), "x": 2.0 + V * 30.0 * np.arange(T) / PX,
+        "area": np.full(T, 4.0), "track_id": np.ones(T, np.int64)},
+        layer="labels", z_kind="plane_index")
+
+    def chain(md, nodes):
+        ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+              .with_layer(Domain.VOXEL, "labels", np.zeros((1, T, 1, 1, Y, X), np.int64))
+              .with_structure(tbl))
+        g = Graph()
+        g.add(NodeInstance("S", "io.timeseed"))
+        prev = "S"
+        for nid, op, params, modes in nodes:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+            g.connect(prev, nid)
+            prev = nid
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=md)})
+        return e, e.pull(prev)
+
+    third = ("R", "util.trim", {"fraction": 1 / 3}, {})
+    speed = ("O", "analysis.object_metrics", {"metrics": "speed"}, {})
+    for label, md in (("clocked", {"pixel_size_um": PX, **timed}),
+                      ("clockless", {"pixel_size_um": PX, "dt_s": 30.0})):
+        e, trimmed = chain(md, [third])
+        assert trimmed.axes.t == 4 and trimmed.metadata.get("dt_s") is None, (label, trimmed.metadata)
+        assert e.env("R").metadata.get("dt_s") is None
+        assert frame_times_s(trimmed.metadata, 4) == [0.0, 90.0, 210.0, 330.0] or label == "clocked"
+        if label == "clocked":
+            secs = frame_times_s(trimmed.metadata, 4)
+            assert all(close(a, b, 1e-3) for a, b in zip(secs, [0, 90, 210, 330])), secs
+        else:
+            assert trimmed.metadata[FRAME_TIME_S_KEY] == [0.0, 90.0, 210.0, 330.0]
+            assert e.env("R").metadata[FRAME_TIME_S_KEY] == [0.0, 90.0, 210.0, 330.0]
+        _e, out = chain(md, [third, speed])
+        sp = np.asarray(out.get(Domain.LABEL, "speed", layer="labels").values, dtype=float)
+        assert np.isnan(sp[0]) and np.allclose(sp[1:], V, rtol=1e-6), (label, sp)
+    # the interval path is unchanged: an even trim keeps dt_s and the same speed
+    _e, out = chain({"pixel_size_um": PX, **timed},
+                    [("R", "util.trim", {"count": 4}, {"size_by": "count", "spacing": "stride"}),
+                     speed])
+    sp = np.asarray(out.get(Domain.LABEL, "speed", layer="labels").values, dtype=float)
+    assert np.allclose(sp[1:], V, rtol=1e-9), sp
+    # the helpers directly: per-frame seconds vs one interval, and PIV's pair gap
+    tt = np.array([0, 1, 2], dtype=float)
+    xs = np.array([[0.0], [9.0], [21.0]])
+    v1 = _object_velocity_nd(np.ones(3, np.int64), tt, xs, np.array([0.0, 90.0, 210.0]))
+    assert np.isnan(v1[0, 0]) and np.allclose(v1[1:, 0], 0.1), v1
+    assert _pair_dt_s(30.0, 2, False) == 30.0
+    assert _pair_dt_s(np.array([0.0, 90.0, 210.0]), 2, False) == 120.0
+    assert _pair_dt_s(np.array([0.0, 90.0, 210.0]), 0, True) == 105.0
+    assert np.isnan(_pair_dt_s(np.array([0.0, 90.0]), 5, False))
+
+    # 4. a reducer drops the clock, a slice subsets it
+    e, out = chain({"pixel_size_um": PX, **timed}, [("K", "util.stack", {}, {})])
+    for md in (out.metadata, e.env("K").metadata):
+        assert md.get("frame_time_jd") is None and md.get("dt_s") is None, md
+    e, out = chain({"pixel_size_um": PX, **timed}, [("F", "zone.frame", {"__frame__": 5}, {})])
+    assert out.metadata["frame_time_jd"] == [clock[5]] and out.metadata["dt_s"] == 30.0
+    assert e.env("F").metadata["frame_time_jd"] == [clock[5]]
+
+    # 5. concatenators: Timeseries Builder and Merge onto T
+    MIN = 1.0 / 1440.0
+
+    def card(name, mins, dt=None):
+        md = {"pixel_size_um": 0.5, SOURCE_FILE_KEY: [name],
+              "frame_time_jd": [J + v * MIN for v in mins]}
+        if dt is not None:
+            md["dt_s"] = dt
+        n = len(mins)
+        return Dataset(axes=AxisSizes(m=1, t=n, z=1, c=1, y=4, x=4), metadata=md).with_image(
+            ArrayProvider(np.zeros((1, n, 1, 1, 4, 4))))
+
+    def build(cards, op="util.timeseries", modes=None):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(cards))}
+        nodes["C"] = NodeInstance("C", op, modes=modes or {"chain_axis": "T",
+                                                           "chain_order": "time"})
+        if op == "util.timeseries":
+            edges = [Edge(f"L{i}", "C", "image", "data" if i == 0 else f"file_{i + 1}",
+                          "forward") for i in range(len(cards))]
+        else:
+            edges = [Edge(f"L{i}", "C", "image", "data", "forward") for i in range(len(cards))]
+        eng = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES,
+                     seeds={f"L{i}": d for i, d in enumerate(cards)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(cards)})
+        return eng, eng.pull("C")
+
+    eng, gap = build([card("g_001.nd2", [0, 1, 2], 60.0), card("g_002.nd2", [30, 31], 60.0)])
+    assert gap.axes.t == 5 and gap.metadata.get("dt_s") is None, gap.metadata.get("dt_s")
+    assert eng.env("C").metadata.get("dt_s") is None, "envelope == payload"
+    assert "gaps between files" in gap.metadata["__chain__"]["note"], gap.metadata["__chain__"]
+    _e, even = build([card("e_001.nd2", [0, 1, 2], 60.0), card("e_002.nd2", [3, 4], 60.0)])
+    assert even.metadata["dt_s"] == 60.0, "a seam one interval long keeps the in-file interval"
+    _e, singles = build([card(f"s_{i:03d}.nd2", [5 * i]) for i in range(4)])
+    assert singles.axes.t == 4 and close(singles.metadata.get("dt_s"), 300.0, 1e-3), \
+        singles.metadata.get("dt_s")
+    fts = Dataset(axes=AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4),
+                  metadata={"pixel_size_um": 0.5, SOURCE_FILE_KEY: ["f_001.tif"],
+                            FRAME_TIME_S_KEY: [0.0, 90.0]}).with_image(
+        ArrayProvider(np.zeros((1, 2, 1, 1, 4, 4))))
+    fts2 = fts.with_metadata(**{SOURCE_FILE_KEY: ["f_002.tif"]})
+    _e, nofts = build([fts, fts2], "util.timeseries", {"chain_axis": "T", "chain_order": "loaded"})
+    assert nofts.axes.t == 4 and nofts.metadata.get(FRAME_TIME_S_KEY) is None, nofts.metadata
+    _e, merged = build([card("m_001.nd2", [0, 1], 60.0), card("m_002.nd2", [20, 21], 60.0)],
+                       "util.merge", {"merge_axis": "T"})
+    assert merged.axes.t == 4 and merged.metadata.get("dt_s") is None, merged.metadata.get("dt_s")
+    _e, merged_ok = build([card("n_001.nd2", [0, 1], 60.0), card("n_002.nd2", [2, 3], 60.0)],
+                          "util.merge", {"merge_axis": "T"})
+    assert merged_ok.metadata["dt_s"] == 60.0
+    _ok("time metadata: every T change rebuilds the time axis by one rule — retime keeps dt_s "
+        "on a contiguous run, multiplies it on a stride the clock bears out, takes the "
+        "clock's step or drops it where the source paused or the kept times are uneven, and "
+        "keeps a clockless uneven pick's per-frame seconds (frame_time_s, itself retimed by a "
+        "later subset); concat_interval drops an interval a seam gap contradicts and gains "
+        "one for single-frame files; a tracked object at 0.1 µm/s through an UNEVEN Trim "
+        "(no dt_s) reports 0.1 µm/s on every step, clocked and clockless, and an even trim "
+        "keeps the interval path; Stack drops the clock, zone.frame subsets it (envelope == "
+        "payload); a Timeseries Builder / Merge onto T with a gap between files drops dt_s "
+        "(and the builder says so), and frame_time_s is never concatenated")
 
 
 def test_split_groups() -> None:
@@ -34661,6 +35239,720 @@ def test_plot_per_column_and_lines() -> None:
         "to show them")
 
 
+def test_register_positions_exponential() -> None:
+    """A plate put back on the stage, and the gradient its beads read (2026-10-15).
+
+    1. ``table.register_positions`` moves a table's stage positions into a reference table's
+       frame by the objects both contain: a 0.3° turn + an (63, -52, +25) µm move larger than
+       two objects' spacing is recovered from a VOTED shift (two objects 40 µm apart do not
+       mis-pair), shared objects land on their twins, objects the reference never saw land
+       where the transform puts them, a row with no position keeps it, and the ``reg_*``
+       columns hold the move, the residual (NaN unpaired) and the turn. ``shift`` fits no
+       turn; a Name writes a copy and leaves the table; the edit-time columns announce the
+       ``reg_*`` ones; no Reference wire, a Search below the move and a Tolerance below the
+       jitter are refused with the numbers.
+    2. Plot XY ``fit = exponential`` recovers A and λ exactly from ``ln y`` with R² = 1,
+       leaves y <= 0 points out, reports a rising series with a negative λ, needs two x, puts
+       A / λ / R² in the legend, and draws the curve.
+    """
+    import math
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.registry import NODES
+
+    # 1. register positions ----------------------------------------------------------------
+    ref_xy = np.array([[0.0, 0.0], [3000.0, 200.0], [-2500.0, 900.0], [1200.0, -2600.0],
+                       [-1800.0, -2100.0], [2600.0, 2400.0], [-400.0, 3100.0],
+                       [500.0, 1500.0], [540.0, 1500.0], [-3100.0, -400.0],
+                       [1900.0, -900.0], [-900.0, 1900.0]])
+    ref_z = 5200.0 + 50.0 * np.arange(len(ref_xy))
+    th = math.radians(-0.3)
+    rot = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    move = np.array([63.0, -52.0])
+    # the moving run sees objects 0-9 (not 10, 11) plus two the reference never saw; its
+    # positions are the reference's turned by -th and moved by -move (it is the reference
+    # that the moving run must be turned/moved back onto), with a 1-2 um re-centring jitter
+    keep = list(range(10))
+    jitter = np.array([[1.0, -1.5], [-2.0, 0.5], [0.5, 1.0], [1.5, 1.5], [-1.0, -0.5],
+                       [0.0, 2.0], [-1.5, 0.0], [1.0, 0.0], [-0.5, -1.0], [2.0, -1.0]])
+    inv = np.linalg.inv(rot)
+    mov_xy = (ref_xy[keep] - move) @ inv.T + jitter
+    new_true = np.array([[-2900.0, 2800.0], [2200.0, -2900.0]])   # in the reference frame
+    mov_xy = np.vstack([mov_xy, (new_true - move) @ inv.T, [[np.nan, np.nan]]])
+    mov_z = np.concatenate([ref_z[keep] - 25.0, [5300.0, 5400.0], [np.nan]])
+    nm, nr = len(mov_xy), len(ref_xy)
+
+    def table(xy, z, n):
+        return {"id": np.arange(1, n + 1), "m": np.arange(n), "t": np.zeros(n, int),
+                "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+                "stage_x_um": xy[:, 0].copy(), "stage_y_um": xy[:, 1].copy(),
+                "stage_z_um": np.asarray(z, float).copy(), "mfi": np.arange(n, dtype=float)}
+
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+
+    def seed_of(cols, layer):
+        return Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+            ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+            StructureTable(Domain.LABEL, cols, layer=layer))
+    # the moving table shares its name with a label raster, as every Label table does, and
+    # the wire also carries a mask
+    s_mov = seed_of(table(mov_xy, mov_z, nm), "beads").with_layer(
+        Domain.VOXEL, "beads", np.zeros((1, 1, 1, 1, 4, 4), np.int32)).with_layer(
+        Domain.VOXEL, "mask", np.zeros((1, 1, 1, 1, 4, 4), np.uint8))
+    s_ref = seed_of(table(ref_xy, ref_z, nr), "t1")
+
+    def reg(params, modes=None, wire_ref=True):
+        edges = [Edge("S", "P", "image", "data")]
+        if wire_ref:
+            edges.append(Edge("R", "P", "image", "reference"))
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"), "R": NodeInstance("R", "io.load"),
+                         "P": NodeInstance("P", "table.register_positions",
+                                           params=dict({"table": "beads"}, **params),
+                                           modes=dict(modes or {}))},
+                  edges=edges)
+        env = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 1.0})
+        return Engine(g, computes=COMPUTES, seeds={"S": s_mov, "R": s_ref},
+                      meta_seeds={"S": env, "R": env})
+
+    def cols_of(ds, layer):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.LABEL)
+                if a.layer == layer}
+
+    import nodegraph.catalog._shared.table_ops as TBL
+    in_place = reg({}).pull("P")
+    assert "beads" not in TBL.synthesized(in_place.metadata, Domain.LABEL), \
+        "in place: still the image's own table, drawn by the Viewer"
+    got = cols_of(in_place, "beads")
+    out_xy = np.stack([got["stage_x_um"], got["stage_y_um"]], axis=1)
+    err_shared = np.hypot(*(out_xy[:10] - ref_xy[keep]).T)
+    assert err_shared.max() < 3.5, err_shared                    # jitter <= 2.2 um
+    err_new = np.hypot(*(out_xy[10:12] - new_true).T)
+    assert err_new.max() < 3.0, ("an object the reference never saw lands where the "
+                                 "transform puts it", err_new)
+    assert np.isnan(out_xy[12]).all() and np.isnan(got["stage_z_um"][12]), "no position stays"
+    # the 1-2 um jitter over a +/-3 mm spread moves the fitted turn by ~0.01-0.02 deg
+    assert abs(got["reg_rotation_deg"][0] + 0.3) < 0.03, got["reg_rotation_deg"][0]
+    assert np.allclose(got["reg_dz_um"][:12], 25.0), got["reg_dz_um"]
+    assert np.allclose(got["stage_z_um"][:10], ref_z[keep]), "Z by the pairs' median"
+    assert np.isfinite(got["reg_residual_um"][:10]).all(), "the shared objects are paired"
+    assert np.isnan(got["reg_residual_um"][10:]).all(), "unpaired: NaN residual"
+    assert np.allclose(got["stage_x_um"][:12] - got["reg_dx_um"][:12], mov_xy[:12, 0]), \
+        "reg_dx_um is what was added"
+    sh = cols_of(reg({}, {"model": "shift"}).pull("P"), "beads")
+    assert sh["reg_rotation_deg"][0] == 0.0, "shift fits no turn"
+    sh_err = np.hypot(sh["stage_x_um"][:10] - ref_xy[keep, 0],
+                      sh["stage_y_um"][:10] - ref_xy[keep, 1])
+    assert sh_err.max() > 10.0 > err_shared.max(), ("a turn's error grows with distance "
+                                                    "under shift", sh_err)
+    named = reg({"name": "beads_t1frame", "z": ""}).pull("P")
+    keepme = cols_of(named, "beads")
+    copy = cols_of(named, "beads_t1frame")
+    assert "beads_t1frame" in TBL.synthesized(named.metadata, Domain.LABEL), "a copy is marked"
+    # Landmarks (2026-10-16): a run of NEW objects is moved by the transform fitted on
+    # landmarks both sessions saw (here the shared-object table) — its own rows pair nothing
+    new_ref = np.array([[100.0, -3000.0], [2900.0, -1500.0], [-2000.0, 2500.0]])
+    new_mov = (new_ref - move) @ inv.T
+    s_new = seed_of(table(new_mov, np.full(3, 5250.0), 3), "beads")
+
+    def reg_lm(params, landmarks=True):
+        nodes_ = {"S": NodeInstance("S", "io.load"), "R": NodeInstance("R", "io.load"),
+                  "L": NodeInstance("L", "io.load"),
+                  "P": NodeInstance("P", "table.register_positions",
+                                    params=dict({"table": "beads", "z": ""}, **params))}
+        edges_ = [Edge("S", "P", "image", "data"), Edge("R", "P", "image", "reference")]
+        if landmarks:
+            edges_.append(Edge("L", "P", "image", "landmarks"))
+        env_ = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 1.0})
+        return Engine(Graph(nodes=nodes_, edges=edges_), computes=COMPUTES,
+                      seeds={"S": s_new, "R": s_ref, "L": s_mov},
+                      meta_seeds={"S": env_, "R": env_, "L": env_}).pull("P")
+    lm = cols_of(reg_lm({"landmark_table": "beads"}), "beads")
+    lm_err = np.hypot(lm["stage_x_um"] - new_ref[:, 0], lm["stage_y_um"] - new_ref[:, 1])
+    assert lm_err.max() < 3.5, ("moved by the landmarks' transform", lm_err)
+    assert abs(lm["reg_rotation_deg"][0] + 0.3) < 0.03 and np.isnan(lm["reg_residual_um"]).all()
+    assert np.allclose(lm["stage_z_um"], 5250.0), "blank Z: the focus is left alone"
+    try:
+        reg_lm({}, landmarks=False)
+        raise AssertionError("new objects alone share nothing with the reference")
+    except ValueError as exc:
+        assert "pair" in str(exc) or "Search" in str(exc), exc
+    assert np.allclose(keepme["stage_x_um"][:12], mov_xy[:12, 0]), "a Name leaves the table"
+    assert np.allclose(copy["stage_z_um"][:12], mov_z[:12]) and \
+        np.allclose(copy["reg_dz_um"], 0.0), "Z blank: X / Y only"
+    for params, wire, frag in (({}, False, "Reference"),
+                               ({"search": 20.0}, True, "Search"),
+                               ({"tolerance": 0.2}, True, "Tolerance"),
+                               ({"name": "mask"}, True, "Voxel layer")):
+        try:
+            reg(params, wire_ref=wire).pull("P")
+        except Exception as ex:                        # noqa: BLE001 — the refusal itself
+            assert frag in str(ex), ex
+        else:
+            raise AssertionError(f"Register Positions accepted {params} (reference {wire})")
+    declared = {(lyr, c) for _d, lyr, c in NODES.get("table.register_positions").adds_columns(
+        {"table": "beads"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "stage_x_um"), (Domain.LABEL, "beads", "mfi")))}
+    assert {("beads", "reg_dx_um"), ("beads", "reg_rotation_deg"),
+            ("beads", "mfi")} <= declared, declared
+
+    # 2. exponential trendline -------------------------------------------------------------
+    xs = np.array([900.0, 1800.0, 2400.0, 3500.0, 5000.0])
+    ys = 900.0 * np.exp(-xs / 800.0)
+    f = FIG.xy_exponential(np.append(xs, [4000.0, 4500.0]), np.append(ys, [0.0, -3.0]))
+    assert abs(f["a"] - 900.0) < 1e-6 and abs(f["lam"] - 800.0) < 1e-6, f
+    assert abs(f["r2"] - 1.0) < 1e-12 and f["n"] == 5, "y <= 0 points stay out"
+    assert "λ = 800" in f["text"] and "A = 900" in f["text"], f["text"]
+    assert "λ = 800 µm," in FIG.xy_exponential(xs, ys, unit="µm")["text"], "λ carries x's unit"
+    up = FIG.xy_exponential(xs, 2.0 * np.exp(xs / 1000.0))
+    assert abs(up["lam"] + 1000.0) < 1e-6, "a rising series: negative λ"
+    assert FIG.xy_exponential([100.0, 100.0], [5.0, 6.0]) is None, "one x fixes no curve"
+    noisy = FIG.xy_exponential(np.append(xs, 4200.0), np.append(ys, 0.01))
+    floored = FIG.xy_exponential(np.append(xs, 4200.0), np.append(ys, 0.01), min_y=1.0)
+    assert noisy["lam"] < 700.0 and abs(floored["lam"] - 800.0) < 1e-6, (noisy, floored)
+    ser = FIG.xy_series(xs, ys, None, "none")
+    FIG.decorate_xy(ser, xs, ys, None, fit="exponential", log_y=True)
+    assert ser[0]["fit"]["model"] == "exponential" and "λ = 800" in ser[0]["legend"], ser[0]
+    assert "exponential" in next(m for m in NODES.get("plot.xy").modes
+                                 if m.name == "fit").choices
+    pcols = {"id": np.arange(1, 7), "m": np.zeros(6, int), "t": np.zeros(6, int),
+             "c": np.zeros(6, int), "z": np.zeros(6), "y": np.zeros(6), "x": np.zeros(6),
+             "d_um": np.append(xs, 4200.0), "mfi": np.append(ys, 0.01)}
+    pseed = seed_of(pcols, "b")
+    g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                     "P": NodeInstance("P", "plot.xy",
+                                       params={"table": "b", "x": "d_um", "y": "mfi",
+                                               "log_y": True, "fit_floor": 1.0},
+                                       modes={"kind": "scatter", "fit": "exponential"})},
+              edges=[Edge("S", "P", "image", "data")])
+    spec = Engine(g, computes=COMPUTES, seeds={"S": pseed},
+                  meta_seeds={"S": MetaEnvelope(axes=ax, metadata=pseed.metadata)}
+                  ).pull("P").metadata["figure_spec"]
+    sfit = spec["series"][0]["fit"]
+    assert abs(sfit["lam"] - 800.0) < 1e-6 and sfit["n"] == 5, ("the Fit floor keeps the "
+                                                                "0.01 out of the fit", sfit)
+    assert len(spec["series"][0]["x"]) == 6, "...and on the figure"
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(spec)
+        drawn = [ln for ln in fig.axes[0].lines if len(ln.get_xdata()) == 200]
+    assert drawn, "the decay curve is drawn"
+    _ok("register positions + exponential (2026-10-15): Landmarks move new objects by a transform fitted on shared ones; a 0.3° turn and an 82 um move "
+        "recovered from a voted shift, shared objects on their twins within the jitter, "
+        "unseen objects transformed, no-position rows kept, reg_* columns (move, residual, "
+        "turn), shift fits no turn, Name copies, Z blank = XY only, columns announced, "
+        "missing Reference / small Search / small Tolerance refused; exponential recovers A "
+        "and λ from ln y with R² = 1, drops y <= 0, a Fit floor keeps noise-floor rows out of "
+        "the fit but on the figure, negative λ for a rise, legend + curve")
+
+
+def test_gradient_map_standard_curve() -> None:
+    """A gradient round a point source, its conversion to concentration, and its figure
+    (2026-10-15, IL-8 capture beads round a spheroid).
+
+    1. ``analysis.gradient_map`` on a canvas (+x right, pixel i over [i, i+1]): objects whose
+       values follow ``A·e^(-d/λ)`` exactly give that trend back (A, λ, R² = 1) and a map equal
+       to it at every node; an object sitting ON a node at twice its trend makes that node
+       twice the trend under ``trend_idw`` (exact interpolation) and leaves ``trend`` alone;
+       ``per_by`` makes one frame per group in first-seen order, T unknown at edit time,
+       ``frame_names`` set and the clock dropped; ``exclude`` blanks the source's disc; the
+       objects land on this image's pixels; with a Z column an object 300 µm above the plane
+       no longer pins the node under it, without one it does; ``idw`` runs with no source;
+       the trend methods refuse a missing source, a multi-field image and a blank value; the
+       method keys the memo.
+    2. ``table.standard_curve`` fits Langmuir to the weighted standards (filtered by
+       ``std_where``), inverts it exactly, flags below LOD / below range / in range / above
+       Bmax / no signal, records the curve, and agrees with a typed curve; linear fits
+       through the blank; a Name the table has, a missing Standards wire and a malformed
+       filter are refused; ``standard_points`` weighs by the weight column.
+    3. Plot Field draws the objects as marks with their labels, on a log colour scale, with
+       the colour bar's label typed and an arrow where the values pass the range; frame titles
+       come from ``frame_names``. Plot XY's ``fit_weight`` reaches the fit (absolute =
+       data units) and is gated on the exponential. Measure ignores the camera flip on a
+       stage-Stitched mosaic.
+    """
+    import math
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.catalog.table.standard_curve import standard_points
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import NODES
+    from nodegraph.structure import StructureTable
+
+    # 1. gradient map ------------------------------------------------------------------------
+    W, H, PX = 50, 40, 10.0                          # a 500 x 400 um canvas at 10 um/px
+    cax = AxisSizes(m=1, t=1, z=1, c=1, y=H, x=W)
+    cmd = {"pixel_size_um": PX, "origin_um": [[100.0, 0.0, 0.0]],
+           "stage_layout_source": "canvas", "canvas_flip": [True, False], "dt_s": 60.0}
+    canvas = Dataset(axes=cax, metadata=cmd).with_image(ArrayProvider(np.zeros((1, 1, 1, 1, H, W))))
+    SX, SY, SZ, LAM = 250.0, 200.0, 100.0, 150.0
+    pts_xy = [(330.0, 210.0), (100.0, 100.0), (420.0, 350.0), (60.0, 330.0), (250.0, 30.0),
+              (400.0, 90.0)]
+    rows = []
+    for grp, A in (("early", 900.0), ("late", 1800.0)):
+        for x, y in pts_xy:
+            d = math.hypot(x - SX, y - SY)
+            rows.append((grp, x, y, SZ, A * math.exp(-d / LAM)))
+    n = len(rows)
+
+    def objects(values=None, z=None):
+        v = np.array([r[4] for r in rows]) if values is None else np.asarray(values, float)
+        zz = np.array([r[3] for r in rows]) if z is None else np.asarray(z, float)
+        cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.zeros(n, int),
+                "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+                "stage_x_um": np.array([r[1] for r in rows]),
+                "stage_y_um": np.array([r[2] for r in rows]), "stage_z_um": zz,
+                "mfi": v, "cond": np.array([r[0] for r in rows])}
+        ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+        return Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+            ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+            StructureTable(Domain.LABEL, cols, layer="beads"))
+    sax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    src = Dataset(axes=sax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(StructureTable(
+            Domain.LABEL, {"id": np.array([1]), "m": np.array([0]), "t": np.array([0]),
+                           "c": np.array([0]), "z": np.array([0.0]), "y": np.array([0.0]),
+                           "x": np.array([0.0]), "stage_x_um": np.array([SX]),
+                           "stage_y_um": np.array([SY]), "stage_z_um": np.array([SZ])},
+            layer="src"))
+
+    def gm(params, modes=None, pts=None, source=True, data=canvas, tail=None):
+        nodes = {"C": NodeInstance("C", "io.load"), "B": NodeInstance("B", "io.load"),
+                 "G": NodeInstance("G", "analysis.gradient_map", params=dict(
+                     {"table": "beads", "value": "mfi", "spacing": 20.0}, **params),
+                     modes=dict(modes or {}))}
+        edges = [Edge("C", "G", "image", "data"), Edge("B", "G", "image", "points")]
+        seeds = {"C": data, "B": pts or objects()}
+        if source:
+            nodes["S"] = NodeInstance("S", "io.load")
+            edges.append(Edge("S", "G", "image", "source"))
+            seeds["S"] = src
+        last = "G"
+        if tail is not None:
+            nodes["P"] = NodeInstance("P", tail[0], params=tail[1], modes=tail[2])
+            edges.append(Edge("G", "P", "out", "data"))
+            last = "P"
+        e = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds=seeds,
+                   meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                               for k, v in seeds.items()})
+        return e, e.pull(last)
+
+    def tab(ds, layer, dom=Domain.POINT):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(dom) if a.layer == layer}
+
+    e, out = gm({"per_by": "cond"})
+    assert out.axes.t == 2 and out.metadata.get("frame_names") == ["early", "late"], \
+        (out.axes, out.metadata.get("frame_names"))
+    assert out.metadata.get("dt_s") is None, "a map of groups has no frame interval"
+    assert "t" in set(e.env("G").unknown_axes), "how many groups is in the data: T unknown"
+    # EVERY per-frame time list goes, payload and envelope alike: the seconds list and a
+    # bundle's per-file clocks too, or a map of groups keeps a stale clock (2026-10-16)
+    timed = canvas.with_metadata(frame_time_s=[0.0], source_frame_time_jd=[[2461000.0]],
+                                 frame_time_jd=[2461000.0])
+    e2, out2 = gm({"per_by": "cond"}, data=timed)
+    for k in ("frame_time_s", "source_frame_time_jd", "frame_time_jd", "dt_s"):
+        assert out2.metadata.get(k) is None, (k, out2.metadata.get(k))
+        assert (e2.env("G").metadata or {}).get(k) is None, k
+    lat, obj = tab(out, "gradient"), tab(out, "gradient_objects")
+    nodes_per = 25 * 20                              # 20 um nodes on a 500 x 400 um canvas
+    assert len(lat["id"]) == 2 * nodes_per and set(lat["t"].tolist()) == {0, 1}
+    for k, A in ((0, 900.0), (1, 1800.0)):
+        mo = obj["t"] == k
+        assert abs(obj["trend_a"][mo][0] - A) < 1e-6 * A, obj["trend_a"][mo]
+        assert abs(obj["trend_lambda_um"][mo][0] - LAM) < 1e-6 and \
+            abs(obj["trend_r2"][mo][0] - 1.0) < 1e-9
+        ml = lat["t"] == k
+        d = np.hypot(lat["stage_x_um"][ml] - SX, lat["stage_y_um"][ml] - SY)
+        want = A * np.exp(-d / LAM)
+        assert np.allclose(lat["mfi"][ml], want, rtol=1e-6), "exact trend: the map IS it"
+        assert np.allclose(lat["trend"][ml], want, rtol=1e-6)
+    # pixel convention: stage x 330 is column 23.0 of a canvas whose origin x is 0
+    assert np.allclose(obj["x"][:len(pts_xy)], [p[0] / PX for p in pts_xy])
+    assert np.allclose(obj["y"][:len(pts_xy)], [p[1] / PX for p in pts_xy])
+    assert np.allclose(lat["stage_x_um"][:3], [10.0, 30.0, 50.0]), lat["stage_x_um"][:3]
+    # an object ON a node (330, 210) at twice its trend: exact under trend_idw only
+    vals = np.array([r[4] for r in rows])
+    vals[0] *= 2.0
+    node = (np.abs(lat["stage_x_um"] - 330.0) < 1e-9) & (np.abs(lat["stage_y_um"] - 210.0) < 1e-9) \
+        & (lat["t"] == 0)
+    assert node.sum() == 1
+    _e, ti = gm({"per_by": "cond"}, pts=objects(vals))
+    lt = tab(ti, "gradient")
+    # the refit trend moves with the outlier; the node under it takes its value exactly
+    assert abs(lt["mfi"][node][0] - vals[0]) < 1e-6 * vals[0], (lt["mfi"][node], vals[0])
+    _e, tr = gm({"per_by": "cond"}, {"method": "trend"}, pts=objects(vals))
+    ltr = tab(tr, "gradient")
+    assert abs(ltr["mfi"][node][0] - ltr["trend"][node][0]) < 1e-9 * ltr["mfi"][node][0]
+    # 3-D: the same object 300 um above the plane no longer pins the node; in XY it does
+    zz = np.array([r[3] for r in rows])
+    zz[0] = SZ + 300.0
+    _e, up = gm({"per_by": "cond"}, pts=objects(vals, zz))
+    lu = tab(up, "gradient")
+    assert lu["mfi"][node][0] < 0.9 * vals[0], "an object 300 um off the plane weighs as far"
+    _e, flat = gm({"per_by": "cond", "z": ""}, pts=objects(vals, zz))
+    lf = tab(flat, "gradient")
+    assert abs(lf["mfi"][node][0] - vals[0]) < 1e-6 * vals[0], "in XY it is ON the node"
+    # exclude blanks the source's disc
+    _e, ex = gm({"per_by": "cond", "exclude": "60"})
+    le = tab(ex, "gradient")
+    inner = np.hypot(le["stage_x_um"] - SX, le["stage_y_um"] - SY) < 60.0
+    assert inner.any() and np.isnan(le["mfi"][inner]).all() and \
+        np.isfinite(le["mfi"][~inner]).all()
+    # blank Per column: one map per frame of `data`, from the rows of that t
+    _e, one = gm({})
+    assert one.axes.t == 1 and "frame_names" not in one.metadata
+    assert one.metadata.get("dt_s") == 60.0, "a per-frame map keeps the clock"
+    # idw needs no source; the trend methods do
+    _e, iw = gm({"per_by": "cond"}, {"method": "idw"}, source=False)
+    li = tab(iw, "gradient")
+    assert np.isfinite(li["mfi"]).all() and np.isnan(li["trend"]).all()
+    for bad, frag, kw in (({}, "SOURCE", {"source": False}),
+                          ({"value": ""}, "Value", {}),
+                          ({}, "ONE field", {"data": Dataset(
+                              axes=AxisSizes(m=2, t=1, z=1, c=1, y=H, x=W), metadata=cmd)
+                              .with_image(ArrayProvider(np.zeros((2, 1, 1, 1, H, W))))})):
+        try:
+            gm(bad, **kw)
+        except Exception as exc:                       # noqa: BLE001 — the refusal itself
+            assert frag in str(exc), exc
+        else:
+            raise AssertionError(f"Gradient Map accepted {bad} {list(kw)}")
+    e1, _ = gm({"per_by": "cond"})
+    e2, _ = gm({"per_by": "cond"}, {"method": "trend"})
+    assert e1.entry("G").recipe_hash != e2.entry("G").recipe_hash, "method keys the memo"
+    cols_decl = {(lyr, c) for _d, lyr, c in NODES.get("analysis.gradient_map").adds_columns(
+        {"value": "mfi"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "stage_x_um"), (Domain.LABEL, "beads", "cond")))}
+    assert {("gradient", "mfi"), ("gradient", "trend"), ("gradient_objects", "cond"),
+            ("gradient_objects", "trend_lambda_um")} <= cols_decl, cols_decl
+
+    # 2. standard curve ----------------------------------------------------------------------
+    BM, KD = 5000.0, 5000.0
+    lang = lambda c: BM * c / (KD + c)                    # noqa: E731
+    std_rows = []                                          # (conc, signal, area, sighting)
+    for c in (500.0, 1000.0, 2500.0, 5000.0):
+        std_rows += [(c, lang(c), 80.0, 0), (c, lang(c), 40.0, 0), (c, 0.5 * lang(c), 80.0, 1)]
+    std_rows += [(0.0, b, 80.0, 0) for b in (4.0, 6.0, 5.0, 7.0)]
+    ns = len(std_rows)
+    stab = {"id": np.arange(1, ns + 1), "m": np.zeros(ns, int), "t": np.zeros(ns, int),
+            "c": np.zeros(ns, int), "z": np.zeros(ns), "y": np.zeros(ns), "x": np.zeros(ns),
+            "condition_value": np.array([r[0] for r in std_rows]),
+            "rpe_bgsub": np.array([r[1] for r in std_rows]),
+            "area": np.array([r[2] for r in std_rows]),
+            "sighting": np.array([r[3] for r in std_rows])}
+    stds = Dataset(axes=sax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, stab, layer="standard_curve"))
+    conc = np.array([100.0, 800.0, 3000.0])
+    sig = np.concatenate([lang(conc), [BM + 10.0, 1.0, np.nan]])
+    nd = len(sig)
+    dtab = {"id": np.arange(1, nd + 1), "m": np.zeros(nd, int), "t": np.zeros(nd, int),
+            "c": np.zeros(nd, int), "z": np.zeros(nd), "y": np.zeros(nd), "x": np.zeros(nd),
+            "rpe_bgsub": sig}
+    dat = Dataset(axes=sax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, dtab, layer="beads"))
+
+    def sc(params, modes=None, standards=True):
+        nodes = {"D": NodeInstance("D", "io.load"),
+                 "K": NodeInstance("K", "table.standard_curve", params=dict(
+                     {"table": "beads", "signal": "rpe_bgsub", "name": "il8_pg_ml"}, **params),
+                     modes=dict(modes or {}))}
+        edges = [Edge("D", "K", "image", "data")]
+        seeds = {"D": dat}
+        if standards:
+            nodes["S"] = NodeInstance("S", "io.load")
+            edges.append(Edge("S", "K", "image", "standards"))
+            seeds["S"] = stds
+        e = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds=seeds,
+                   meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                               for k, v in seeds.items()})
+        return e.pull("K")
+
+    fit = sc({"std_weight": "area", "std_where": "sighting=0"})
+    t = tab(fit, "beads", Domain.LABEL)
+    cur = fit.metadata["standard_curve"]["il8_pg_ml"]
+    assert abs(cur["bmax"] - BM) < 1e-3 and abs(cur["kd"] - KD) < 1e-3 and cur["r2"] > 1 - 1e-12
+    assert cur["range"] == [500.0, 5000.0]
+    bl = np.array([4.0, 6.0, 5.0, 7.0])
+    assert abs(cur["lod_signal"] - (bl.mean() + 3 * bl.std(ddof=1))) < 1e-9
+    assert np.allclose(t["il8_pg_ml"][:3], conc, rtol=1e-6), t["il8_pg_ml"]
+    assert np.isnan(t["il8_pg_ml"][3]) and np.isnan(t["il8_pg_ml"][5])
+    assert [str(f) for f in t["il8_pg_ml_flag"]] == \
+        ["below range", "in range", "in range", "above Bmax", "below LOD", "no signal"], \
+        t["il8_pg_ml_flag"]
+    assert "il8_pg_ml" not in tab(dat, "beads", Domain.LABEL), "the input is untouched"
+    unfiltered = sc({"std_weight": "area"}).metadata["standard_curve"]["il8_pg_ml"]
+    assert unfiltered["bmax"] < 0.8 * BM, "the half-signal second imagings pull the curve down"
+    typed = tab(sc({"bmax": BM, "kd": KD}, {"curve": "typed"}, standards=False), "beads",
+                Domain.LABEL)
+    assert np.allclose(typed["il8_pg_ml"][:3], conc, rtol=1e-9)
+    assert str(typed["il8_pg_ml_flag"][0]) == "in range", "a typed curve knows no range"
+    lin = sc({"std_where": "sighting=0"}, {"model": "linear"})
+    lc = lin.metadata["standard_curve"]["il8_pg_ml"]
+    assert lc["model"] == "linear" and lc["slope"] > 0
+    pts, blank = standard_points(np.array([1.0, 1.0, 0.0]), np.array([10.0, 20.0, 3.0]),
+                                 np.array([3.0, 1.0, 1.0]))
+    assert pts == [(1.0, 12.5, 2)] and blank["mean"] == 3.0 and blank["n"] == 1
+    for bad, frag, kw in (({"name": "rpe_bgsub"}, "already has", {}),
+                          ({}, "Standards", {"standards": False}),
+                          ({"std_where": "sighting"}, "column=value", {}),
+                          ({"std_where": "nope=1"}, "nope", {})):
+        try:
+            sc(bad, **kw)
+        except Exception as exc:                       # noqa: BLE001 — the refusal itself
+            assert frag in str(exc), exc
+        else:
+            raise AssertionError(f"Standard Curve accepted {bad}")
+
+    # 3. the figure: marks, log scale, colour-bar label, titles; Plot XY weighting -----------
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is not None:
+        _e, fig = gm({"per_by": "cond"}, tail=(
+            "plot.field", {"table": "gradient", "value": "mfi", "marks": "gradient_objects",
+                           "mark_label": "mfi", "color_label": "MFI (counts)",
+                           "color_range": ", 500"},
+            {"color_scale": "log"}))
+        v = fig.image.spec_for(0, 1, 0)
+        assert v["draw"]["scale"] == "log" and v["draw"]["value_label"] == "MFI (counts)"
+        # top typed under the map's peak; blank low end = 1st percentile of the positives
+        assert v["draw"]["extend"] == "both", v["draw"]["extend"]
+        assert v["draw"]["range"][0] > 0, "a blank low end on a log scale is positive"
+        mk = v["frames"][0]["marks"]
+        assert len(mk) == len(pts_xy) and abs(mk[0][1] - 33.0) < 1e-9 and \
+            mk[0][2] == f"{2 * 900.0 * math.exp(-math.hypot(80.0, 10.0) / LAM):.0f}", mk[0]
+        assert v["axes"]["title"].endswith("late"), v["axes"]["title"]
+        with FIG._RENDER_LOCK:
+            f_, _hw = FIG.draw(v)
+            words = [tx.get_text() for tx in f_.axes[0].texts]
+        assert mk[0][2] in words, words
+    assert FIG.frame_clock({"frame_names": ["a", "b"], "dt_s": 5.0}, 2)[1] == ["a", "b"]
+    xs = np.array([500.0, 1000.0, 1500.0, 2000.0, 3000.0])
+    ys = 900.0 * np.exp(-xs / 800.0)
+    ys_out = ys.copy()
+    ys_out[0] *= 1.5
+    fa = FIG.xy_exponential(xs, ys_out, weight="absolute")
+    fr = FIG.xy_exponential(xs, ys_out)
+    assert fa["weight"] == "absolute" and fr["weight"] == "relative" and \
+        abs(fa["lam"] - fr["lam"]) > 1.0, (fa, fr)
+    assert abs(FIG.xy_exponential(xs, ys, weight="absolute")["lam"] - 800.0) < 1e-3
+    ser = FIG.xy_series(xs, ys_out, None, "none")
+    FIG.decorate_xy(ser, xs, ys_out, None, fit="exponential", fit_weight="absolute")
+    assert ser[0]["fit"]["weight"] == "absolute"
+    # Trendline span: the curve is DRAWN from the span's low end; the fit does not move
+    sp = FIG.xy_series(xs, ys, None, "none")
+    FIG.decorate_xy(sp, xs, ys, None, fit="exponential", fit_span=(100.0, None))
+    assert sp[0]["fit"]["x0"] == 100.0 and sp[0]["fit"]["x1"] == 3000.0, sp[0]["fit"]
+    assert abs(sp[0]["fit"]["lam"] - 800.0) < 1e-6
+    if importlib.util.find_spec("matplotlib") is not None:
+        for span, lo, hi in (("trend_lambda_um,", LAM, None), ("50, 400", 50.0, 400.0)):
+            _e, pxy = gm({"per_by": "cond"}, tail=(
+                "plot.xy", {"table": "gradient_objects", "x": "distance_um", "y": "mfi",
+                            "group_by": "cond", "fit_span": span},
+                {"domain": "point", "kind": "scatter", "fit": "exponential"}))
+            psp = pxy.metadata["figure_spec"]
+            for ser_ in psp["series"]:
+                assert abs(ser_["fit"]["x0"] - lo) < 1e-9, (span, ser_["fit"]["x0"])
+                if hi is not None:
+                    assert abs(ser_["fit"]["x1"] - hi) < 1e-9
+                assert abs(ser_["fit"]["lam"] - LAM) < 1e-6, "the span moves no parameter"
+    fw = next(m for m in NODES.get("plot.xy").modes if m.name == "fit_weight")
+    assert dict(fw.available_in or {}).get("fit") == frozenset({"exponential"})
+    # Measure on a stage-Stitched mosaic: the camera flip applies there too (a mosaic keeps
+    # the camera's handedness — 2026-10-16, a whole-well bead mosaic vs the bead runs)
+    from nodegraph.catalog.analysis.measure import _flip
+
+    class _Ctx:
+        params = {"flip_x": True, "flip_y": False}
+    mos = Dataset(axes=sax, metadata={"__sampling__": ["stitch[stage[4 tiles]]"]})
+    cam = Dataset(axes=sax, metadata={})
+    assert _flip(_Ctx(), mos) == (True, False) and _flip(_Ctx(), cam) == (True, False)
+    _ok("gradient map + standard curve (2026-10-15): an exact exponential comes back (A, λ, "
+        "R² = 1) and IS the map; an object on a node pins it under trend_idw, not under "
+        "trend; one frame per group (T unknown at edit time, names, no clock); exclude "
+        "blanks the source; 3-D distances let a far object weigh as far; idw needs no "
+        "source, the trend methods refuse without one; Standard Curve recovers Bmax/Kd from "
+        "weighted, filtered standards, inverts exactly and flags LOD / range / Bmax; typed and "
+        "linear curves; Plot Field marks, log scale, colour-bar label, extend arrow and group "
+        "titles; Plot XY's absolute weighting and trendline span (a number or a column's "
+        "median, drawn only); Measure flips a mosaic like a camera field")
+
+
+def test_point_source_fit() -> None:
+    """Crank's point source round a secreting spheroid (2026-10-16, IL-8 capture beads).
+
+    1. ``table.point_source_fit`` on beads made by the model itself: Rate = constant gives
+       each timepoint's rate back and, with Diffusivity = fit, D; piecewise gives a rate
+       history back; half_space halves the rates; Background = uniform gives each timepoint's
+       well level back beside its rate (square-root weighting); a row's time is its clock less
+       the earliest
+       row's plus Source started; the model column equals the input; the rates table has a
+       row per timepoint whose bootstrap interval holds the rate; the record carries the
+       standard curve's signal and curve; a blank Value and a taken Name are refused.
+    2. Plot XY's ``point_source`` trendline draws that model per timepoint, in pg/mL and back
+       through the curve in the signal's units, through each timepoint's own beads; it refuses
+       an X that is not the fitted distance; Error = column draws a column's half-widths.
+    3. Gradient Map's point-source trend refits only the profile's amplitude, exactly, on the
+       concentration and through the curve; If/Else splits a Label table with no raster.
+    """
+    import math
+    import nodegraph.catalog._shared.point_source as PS
+    from nodegraph.catalog.analysis.gradient_map import point_source_trend
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    D_TRUE, JD0, H = 25.0, 2461000.0, 3600.0
+    r = np.array([800.0, 1100.0, 1500.0, 1900.0, 2300.0, 2800.0, 3300.0, 3900.0])
+    t = np.array([15.0, 25.0]) * H                     # T1 15 h after the source started
+    curve = {"model": "langmuir", "bmax": 5000.0, "kd": 5000.0, "signal": "mfi"}
+
+    def beads(conc_of):
+        """Two timepoints of the same eight distances, concentrations from ``conc_of``."""
+        rr = np.concatenate([r, r])
+        tt = np.concatenate([np.full(r.size, t[0]), np.full(r.size, t[1])])
+        conc = conc_of(rr, tt)
+        n = rr.size
+        cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.zeros(n, int),
+                "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+                "dist": rr, "conc": conc, "mfi": PS.to_signal(conc, curve),
+                "jd": JD0 + (tt - t[0]) / 86400.0,
+                "cond": np.array(["T1"] * r.size + ["T2"] * r.size)}
+        ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+        return Dataset(axes=ax, metadata={"pixel_size_um": 1.0,
+                                          "standard_curve": {"conc": curve}}).with_image(
+            ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+            StructureTable(Domain.LABEL, cols, layer="beads"))
+
+    def pull(ds, params, modes=None, tail=None):
+        nodes = {"B": NodeInstance("B", "io.load"),
+                 "F": NodeInstance("F", "table.point_source_fit", params=dict(
+                     {"table": "beads", "distance": "dist", "value": "conc", "group": "cond",
+                      "time": "jd", "start_h": 15.0, "bootstrap": 20}, **params),
+                     modes=dict(modes or {}))}
+        edges = [Edge("B", "F", "image", "data")]
+        last = "F"
+        if tail is not None:
+            nodes["P"] = NodeInstance("P", tail[0], params=tail[1], modes=tail[2])
+            edges.append(Edge("F", "P", "out", "data"))
+            last = "P"
+        e = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds={"B": ds},
+                   meta_seeds={"B": MetaEnvelope(axes=ds.axes, metadata=ds.metadata)})
+        return e.pull(last)
+
+    def tab(ds, layer):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.LABEL)
+                if a.layer == layer}
+
+    # 1. constant rates, D fitted ------------------------------------------------------------
+    q_true = {"T1": 0.4, "T2": 0.7}
+    const = beads(lambda rr, tt: np.where(tt == t[0], q_true["T1"], q_true["T2"])
+                  * PS.unit_response(rr, tt, D_TRUE))
+    out = pull(const, {}, {"rate": "constant", "diffusivity": "fit"})
+    rec = out.metadata["point_source_fit"]["conc"]
+    assert abs(rec["D"] - D_TRUE) / D_TRUE < 0.02, rec["D"]
+    rates = tab(out, "crank_rates")
+    assert list(rates["label"]) == ["T1", "T2"], rates["label"]
+    for k, lab in enumerate(("T1", "T2")):
+        assert abs(rates["q_fg_s"][k] - q_true[lab]) / q_true[lab] < 0.02, rates["q_fg_s"]
+        assert rates["q_lo_fg_s"][k] <= rates["q_fg_s"][k] * (1 + 1e-6) and \
+            rates["q_hi_fg_s"][k] >= rates["q_fg_s"][k] * (1 - 1e-6), rates
+    assert np.allclose(rates["t_h"], [15.0, 25.0]), rates["t_h"]
+    assert rec["signal"] == "mfi" and rec["curve"]["model"] == "langmuir"
+    # at the true D the model column IS the data
+    exact = pull(const, {"D": D_TRUE}, {"rate": "constant"})
+    bt = tab(exact, "beads")
+    assert np.allclose(bt["crank"], bt["conc"], rtol=1e-6), (bt["crank"], bt["conc"])
+    # a source on an impermeable floor doubles every concentration: half the rate
+    half = tab(pull(const, {"D": D_TRUE}, {"rate": "constant", "boundary": "half_space"}),
+               "crank_rates")
+    assert np.allclose(half["q_fg_s"], [0.2, 0.35], rtol=1e-4), half["q_fg_s"]
+    # a finite well's far field: a uniform level per timepoint comes back beside the rate,
+    # under square-root weighting, and the model column carries it
+    level = {"T1": 30.0, "T2": 400.0}
+    walled = beads(lambda rr, tt: np.where(tt == t[0], q_true["T1"], q_true["T2"])
+                   * PS.unit_response(rr, tt, D_TRUE)
+                   + np.where(tt == t[0], level["T1"], level["T2"]))
+    wout = pull(walled, {"D": D_TRUE}, {"rate": "constant", "background": "uniform",
+                                        "weight": "sqrt"})
+    wr = tab(wout, "crank_rates")
+    assert np.allclose(wr["q_fg_s"], [0.4, 0.7], rtol=1e-3), wr["q_fg_s"]
+    assert np.allclose(wr["background_pg_ml"], [30.0, 400.0], rtol=1e-3), wr
+    wb = tab(wout, "beads")
+    assert np.allclose(wb["crank"], wb["conc"], rtol=1e-4)
+    # piecewise: a rate history comes back from both timepoints at once
+    hist = {"rate": "piecewise", "D": D_TRUE, "breaks_s": [0.0, t[0], t[1]],
+            "q_fg_s": [0.3, 0.9]}
+    pw = tab(pull(beads(lambda rr, tt: PS.predict(rr, tt, hist)), {"D": D_TRUE},
+                  {"rate": "piecewise"}), "crank_rates")
+    assert np.allclose(pw["q_fg_s"], [0.3, 0.9], rtol=1e-3), pw["q_fg_s"]
+    assert np.allclose(pw["t_mid_h"], [7.5, 20.0]), pw["t_mid_h"]
+    for bad, why in (({"value": ""}, "Value"), ({"name": "conc"}, "already has")):
+        try:
+            pull(const, bad)
+            raise AssertionError(f"Point-Source Fit must refuse {bad}")
+        except ValueError as exc:
+            assert why in str(exc), str(exc)
+
+    # 2. Plot XY draws the fitted model, in pg/mL and back through the curve ------------------
+    plot = {"table": "beads", "x": "dist", "group_by": "cond"}
+    pmodes = {"domain": "label", "kind": "scatter", "fit": "point_source"}
+    for y in ("conc", "mfi"):
+        fig = pull(const, {"D": D_TRUE}, {"rate": "constant"},
+                   tail=("plot.xy", dict(plot, y=y), pmodes))
+        series = fig.metadata["figure_spec"]["series"]
+        assert [s["label"] for s in series] == ["T1", "T2"], series
+        for s in series:
+            f = s["fit"]
+            assert f["model"] == "curve" and "D = 25" in f["note"], f
+            # the curve starts at the series' nearest bead and passes through it
+            assert abs(f["x"][0] - s["x"][0]) < 1e-9 and \
+                abs(f["y"][0] - s["y"][0]) / s["y"][0] < 1e-6, (y, f["y"][0], s["y"][0])
+            assert "q = " in s["legend"], s["legend"]
+    try:
+        pull(const, {"D": D_TRUE}, {"rate": "constant"},
+             tail=("plot.xy", dict(plot, y="conc", x="jd"), pmodes))
+        raise AssertionError("a point-source curve on another X must be refused")
+    except ValueError as exc:
+        assert "fitted against" in str(exc), str(exc)
+    fig = pull(const, {}, {"rate": "constant"},
+               tail=("plot.xy", {"table": "crank_rates", "x": "t_h", "y": "q_fg_s",
+                                 "error_column": "q_ci_fg_s"},
+                     {"domain": "label", "error": "column"}))
+    s = fig.metadata["figure_spec"]["series"][0]
+    assert s["err"] is not None and len(s["err"]) == 2, s
+
+    # 3. Gradient Map's trend: the profile's amplitude, refitted exactly --------------------
+    prof = lambda d: 2.0 * PS.unit_response(d, t[1], D_TRUE)        # noqa: E731
+    use = np.ones(r.size, bool)
+    got = point_source_trend(r, 3.0 * prof(r), use, prof, None, "relative")
+    assert abs(got["scale"] - 3.0) < 1e-9 and abs(got["r2"] - 1.0) < 1e-9, got
+    sig = PS.to_signal(3.0 * prof(r), curve)
+    got = point_source_trend(r, sig, use, prof, curve, "relative")
+    assert abs(got["scale"] - 3.0) < 1e-4, got
+    assert np.allclose(got["fn"](r), sig, rtol=1e-4)
+    # If/Else on a Label table with no raster splits the table alone
+    nodes = {"B": NodeInstance("B", "io.load"),
+             "I": NodeInstance("I", "analysis.if_else", params={
+                 "labels": "beads", "column1": "dist", "op1": "<=", "value1": 2000.0,
+                 "pass_name": "near", "fail_name": "far"},
+                 modes={"target": "label", "terms": "1"})}
+    e = Engine(Graph(nodes=nodes, edges=[Edge("B", "I", "image", "data")]),
+               computes=COMPUTES, seeds={"B": const},
+               meta_seeds={"B": MetaEnvelope(axes=const.axes, metadata=const.metadata)})
+    split = e.pull("I")
+    assert len(tab(split, "near")["id"]) == 8 and len(tab(split, "far")["id"]) == 8
+    _ok("point-source fit (2026-10-16): Crank's continuous point source (McGhee et al. 2022, "
+        "Eq. 2) gives each timepoint's rate and D back from beads it made, a piecewise rate "
+        "history back by superposition, half the rate on an impermeable floor, a finite "
+        "well's uniform level back beside each rate under square-root weighting; times from "
+        "each row's clock plus Source started; a rates table with bootstrap intervals; the "
+        "fit's record carries the standard curve, so Plot XY draws the model through each "
+        "timepoint's beads in pg/mL and in MFI, and refuses another X; Error = column draws "
+        "a column's half-widths; Gradient Map refits only the profile's amplitude, exactly; "
+        "If/Else splits a raster-less Label table")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -34761,6 +36053,8 @@ def main() -> int:
     test_select_plane_split_z()
     test_select_frame_split_t()
     test_time_shift()
+    test_trim()
+    test_time_metadata()
     test_split_groups()
     test_split_pick_group()
     test_shift_node()
@@ -34829,6 +36123,7 @@ def main() -> int:
     test_overlay_frozen_in_z()
     test_overlay_after_geometry_change()
     test_util_merge()
+    test_placement_handedness_ground_truth()
     test_display_resolution_policy()
     test_held_views()
     test_overlay_zoom_detail()
@@ -34894,6 +36189,9 @@ def main() -> int:
     test_bead_distance_plot()
     test_overlay_union_axes()
     test_plot_per_column_and_lines()
+    test_register_positions_exponential()
+    test_gradient_map_standard_curve()
+    test_point_source_fit()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

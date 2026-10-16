@@ -109,11 +109,21 @@ def series_time_rows(md: Any, n_t: int) -> Rows:
             rows.append(["Time zone", f"{zone} (from {src})" if src != "file" else
                          f"{zone} (read from the file's own local date)"])
     else:
+        from nodegraph.metadata import series_seconds
+        # a clockless series an uneven subset (Trim, Crop) left with per-frame seconds
+        own = series_seconds(md, n_t) if n_t > 1 else None
         try:
             dt = float(md.get("dt_s") or 0.0)
         except (TypeError, ValueError):
             dt = 0.0
-        if dt > 0:
+        if own is not None:
+            steps = [b - a for a, b in zip(own, own[1:])]
+            rows.append(["Span", _dur(own[-1] - own[0])])
+            rows.append(["Interval", f"uneven — {_dur(min(steps))} to {_dur(max(steps))}, "
+                                     f"mean {_dur((own[-1] - own[0]) / (n_t - 1))}"])
+            rows.append(["Clock", "none — each frame's time kept from the source interval "
+                                  "(frame_time_s)"])
+        elif dt > 0:
             rows.append(["Interval", f"{_dur(dt)} (dt_s — no per-frame clock)"])
         elif n_t > 1:
             rows.append(["Clock", "none — frames are numbered, not timed"])

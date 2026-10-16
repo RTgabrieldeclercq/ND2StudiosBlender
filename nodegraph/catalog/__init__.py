@@ -188,6 +188,16 @@ MODULES: Tuple[str, ...] = (
     "table.join",
     "table.aggregate",
     "table.unique_objects",
+    # 2026-10-15: slotted beside Unique Objects, its sibling for a plate re-imaged after it
+    # was put back on the stage (the IL-8 beads' fourth and fifth timepoints)
+    "table.register_positions",
+    # 2026-10-15: a signal turned into a concentration through a standard curve, and a value
+    # measured at scattered objects drawn as a map round a point source (the IL-8 beads)
+    "table.standard_curve",
+    "analysis.gradient_map",
+    # 2026-10-16: Crank's point source fitted to those concentrations — the source's
+    # production rate, and the trend Plot XY and Gradient Map draw
+    "table.point_source_fit",
     # Appended last, like everything since V2.20 (the list's order is the link-drag search
     # menu's order). V4.00 step 12: arithmetic with units — on masks, on images, on the numbers
     # a Dataset carries — and the region crop that consumes the masks.
@@ -223,6 +233,9 @@ MODULES: Tuple[str, ...] = (
     "field.stress",
     # 2026-10-09: a field drawn on its image as a figure, appended for the same reason
     "plot.field",
+    # 2026-10-16: thin an axis to evenly spaced frames (Crop's frames mode by a rule rather
+    # than a list), appended for the same reason
+    "util.trim",
 )
 
 

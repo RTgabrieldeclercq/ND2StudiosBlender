@@ -58,7 +58,7 @@ __all__ = [
     "UTC_OFFSET_KEY", "utc_offset_of", "jd_to_datetime_text",
     "snap_rate", "parse_pins", "pins_json", "nudge_delta_um", "RATE_SNAP_TOL",
     "SUB_TICK_CAP", "union_canvas", "CANVAS_MAX_PX", "CANVAS_MAX_Z", "canvas_flip",
-    "canvas_mapping",
+    "canvas_mapping", "frame_mapping",
     "PositionGroup", "GroupPlan", "position_groups", "group_key", "GROUP_GAP_FACTOR",
 ]
 
@@ -816,7 +816,7 @@ def field_rect01(entry: Dict[str, Any], pri_md: Dict[str, Any], pri_axes: Any, p
                  ) -> Optional[Tuple[float, float, float, float]]:
     """Where secondary field ``sec_m`` lands on primary field ``pri_m``'s image, as a
     fractional ``(fy0, fy1, fx0, fx1)`` of that image — the rect :func:`compose_secondary_plane`
-    paints it into, by the same µm boxes, nudge and canvas mirroring (2026-10-14: the Viewer
+    paints it into, by the same µm boxes, nudge and frame mirroring (2026-10-14: the Viewer
     outlines a union canvas source's PICKED field, which on an 8.8 mm canvas is otherwise a
     pixel). ``None`` for an index placement (no boxes to map) or an unplaceable field."""
     placed_by = str(entry.get("placed_by", "stage"))
@@ -835,7 +835,7 @@ def field_rect01(entry: Dict[str, Any], pri_md: Dict[str, Any], pri_axes: Any, p
     _dz, dy, dx = (float(v) for v in (entry.get("offset_um") or (0.0, 0.0, 0.0)))
     fy0, fy1 = (sec_box.y0 + dy - pri_box.y0) / hy, (sec_box.y1 + dy - pri_box.y0) / hy
     fx0, fx1 = (sec_box.x0 + dx - pri_box.x0) / wx, (sec_box.x1 + dx - pri_box.x0) / wx
-    cfx, cfy, _ix, _iy = canvas_mapping(pri_md)
+    cfx, cfy, _ix, _iy = frame_mapping(pri_md, entry)
     if cfy:
         fy0, fy1 = 1.0 - fy1, 1.0 - fy0
     if cfx:
@@ -902,12 +902,12 @@ def compose_secondary_plane(entry: Dict[str, Any],
         pri_box = field_box(pri_md, pri_axes, pri_m)
     if pri_box is None:
         return None
-    # A FLIPPED CANVAS (`canvas_flip`) runs its own pixel grid toward stage −x / −y. Its
-    # zoomed sub-rect is a fraction of that mirrored grid, so it is mirrored back into µm
-    # here; the output axes are then walked from the far edge (`ox`/`oy` below). Each SOURCE
-    # tile still samples by its own handedness (`flip_x`/`flip_y`), so a canvas flip mirrors
-    # the whole layout and leaves every tile reading exactly as its camera recorded it.
-    cfx, cfy, inv_x, inv_y = canvas_mapping(pri_md)
+    # A primary whose pixel grid runs toward stage −x / −y — a FLIPPED CANVAS (`canvas_flip`),
+    # or any camera field or stitched mosaic from this scope (`frame_flip`, see
+    # `frame_mapping`). Its zoomed sub-rect is a fraction of that mirrored grid, so it is
+    # mirrored back into µm here; the output axes are then walked from the far edge (`ox`/`oy`
+    # below). Each SOURCE tile still samples by its own handedness (`flip_x`/`flip_y`).
+    cfx, cfy, inv_x, inv_y = frame_mapping(pri_md, entry)
     if region is not None and (cfx or cfy):
         fy0, fy1, fx0, fx1 = (float(v) for v in region)
         if cfy:
@@ -1408,15 +1408,18 @@ def plan_time(dst_md: Mapping[str, Any], n_dst_t: int,
 
 def nudge_delta_um(pri_md: Mapping[str, Any], pri_axes: Any,
                    p_pri: Tuple[float, float], p_sec: Tuple[float, float],
-                   *, placed_by: str = "stage") -> Optional[Tuple[float, float]]:
+                   *, placed_by: str = "stage",
+                   frame_flip: Optional[Tuple[bool, bool]] = None
+                   ) -> Optional[Tuple[float, float]]:
     """The ``(dy, dx)`` µm nudge that moves a feature drawn at ``p_sec`` onto ``p_pri``.
 
     Both points are ``(row, col)`` in the PRIMARY's native image pixels: where a feature sits
     in the primary, and where the same feature is currently drawn in the overlaid secondary.
-    The compositor lays the primary's image out along increasing µm on both axes and moves the
-    secondary by adding the nudge to its box, so the answer is the pixel delta times the
-    primary's pixel size — and it is **flip-independent**: a flip mirrors which source pixel
-    a box samples, never where the box sits, so the sign cannot depend on handedness.
+    The compositor moves the secondary by adding the nudge to its box, so the answer is the
+    pixel delta times the primary's pixel size, signed by which way the primary's grid runs
+    over the stage (:func:`frame_mapping`): a canvas says so itself, any other primary by the
+    Overlay's ``frame_flip`` (its Flip X/Y). The SECONDARY's flip never enters — it mirrors
+    which source pixel a box samples, not where the box sits.
 
     An INDEX placement lays the fields out on the primary's own extent too
     (:func:`compose_secondary_plane` scales the nudge by it), so the same rule holds there.
@@ -1429,9 +1432,11 @@ def nudge_delta_um(pri_md: Mapping[str, Any], pri_axes: Any,
         return None
     if not (ps > 0):
         return None
-    # ...except on a FLIPPED canvas (`canvas_flip`), whose pixel grid runs toward stage −x /
-    # −y: there, moving the box +1 µm moves its picture one way and the pointer reads the other
-    rev_x, rev_y, _ix, _iy = canvas_mapping(pri_md)
+    # A primary whose pixel grid runs toward stage −x / −y (a flipped canvas, or this scope's
+    # camera frame): moving the box +1 µm moves its picture one way and the pointer reads the
+    # other
+    rev_x, rev_y, _ix, _iy = frame_mapping(
+        pri_md, None if frame_flip is None else {"frame_flip": list(frame_flip)})
     return ((float(p_pri[0]) - float(p_sec[0])) * ps * (-1.0 if rev_y else 1.0),
             (float(p_pri[1]) - float(p_sec[1])) * ps * (-1.0 if rev_x else 1.0))
 
@@ -1484,6 +1489,31 @@ def canvas_mapping(md: Mapping[str, Any]) -> Tuple[bool, bool, bool, bool]:
     rx = bool(v[0]) != DEFAULT_FLIP[0]
     ry = bool(v[1]) != DEFAULT_FLIP[1]
     return (rx, ry, rx, ry)
+
+
+def frame_mapping(pri_md: Mapping[str, Any], entry: Optional[Mapping[str, Any]] = None
+                  ) -> Tuple[bool, bool, bool, bool]:
+    """``(reverse_x, reverse_y, invert_x, invert_y)`` — how the compositor walks THIS primary.
+
+    An Experiment Canvas states its own orientation (:func:`canvas_mapping`). Any other
+    primary is a camera field or a stage-Stitched mosaic of camera fields, and its pixel grid
+    runs the way the camera's did (a mosaic keeps each tile's pixels as taken). No file
+    records which way that is, so the placement entry carries it as ``frame_flip`` — the
+    node's Flip X/Y, since both files came off one scope. Walking the output in that
+    handedness makes each output pixel the stage point the primary's own pixel shows; the
+    secondary is still sampled by its own flip, so it lands where the primary saw the same
+    feature.
+
+    Before 2026-10-16 every non-canvas primary was walked toward stage +x. On this scope that
+    is the mirror of the primary's own pixels, so a secondary landed mirrored about the
+    primary's centre (synthetic ground truth: r = 0.36 raw-on-raw, 0.05 stitched-on-stitched,
+    against 0.998 on a canvas). An entry without ``frame_flip`` still gets that old walk."""
+    if isinstance((pri_md or {}).get("canvas_flip"), (list, tuple)):
+        return canvas_mapping(pri_md)
+    v = (entry or {}).get("frame_flip")
+    if not isinstance(v, (list, tuple)) or len(v) != 2:
+        return (False, False, False, False)
+    return (bool(v[0]), bool(v[1]), False, False)
 
 
 #: The camera handedness the Flip X / Flip Y sockets default to (Stitch and Overlay alike) —

@@ -9,8 +9,7 @@ from typing import Any, Dict
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.metadata import (frame_pick, respaced, select_frame as _meta_select_frame,
-                                time_subset)
+from nodegraph.metadata import frame_pick, retime, select_frame as _meta_select_frame
 from nodegraph.provider import FrameSubsetProvider
 from nodegraph.registry import Granularity, InDataset, InInt, OutDataset
 
@@ -26,9 +25,9 @@ from nodegraph.catalog._shared.sampling import _sampled
 # and now ``util.split_t`` → this node. The engine is one-payload-per-node, so K distinct
 # per-frame payloads come from K real tap nodes; the split card is a pass-through.
 #
-# It keeps Crop's frames-mode rules for the metadata indexed by T — the per-T lists through
-# ``time_subset`` and ``dt_s`` through ``respaced`` (a single index keeps the source interval)
-# — rather than ``util.stack``'s "drop dt_s": Stack MERGES frames, so there is no interval
+# It keeps Crop's frames-mode rules for the metadata indexed by T — every time key through
+# ``retime`` (a single index keeps the source interval) — rather than ``util.stack``'s "drop
+# the clock and dt_s": Stack MERGES frames, so there is no moment or interval
 # left to describe; this keeps one real frame, and a Split T RANGE group materializes into
 # Crop (``t0-9``), so the two ways of picking frame 3 must agree on what they stamp.
 
@@ -42,8 +41,8 @@ def _compute_select_frame(ctx: EvalContext) -> Dataset:
       ``"utility"``, ``meta_transform=select_frame``.
     * **Data contract** ``Dataset → the same Dataset with t = 1``. The T half of
       ``util.crop``'s frames mode exactly: nothing spatial changes, the per-T lists
-      (``frame_time_jd``, …) are subset with the axis (:func:`~nodegraph.metadata.time_subset`),
-      ``dt_s`` survives (one frame keeps the source interval — :func:`respaced`), lattice
+      (``frame_time_jd``, …) are subset with the axis and ``dt_s`` survives (one frame keeps
+      the source interval) — :func:`~nodegraph.metadata.retime`, as every T subset does; lattice
       layers follow and structure rows on other frames are dropped, the survivors re-addressed
       to ``t = 0`` — the shared helpers every frame subset uses.
     * **2D/3D** no lever: index arithmetic only.
@@ -75,9 +74,8 @@ def _compute_select_frame(ctx: EvalContext) -> Dataset:
     picks = {"m": None, "t": (k,), "z": None}
     out = subset_lattice_layers(ds.with_image(view), new_axes, picks)
     out = subset_structure_rows(out, picks)
-    md = ds.metadata
-    changes: Dict[str, Any] = dict(time_subset(md, (k,)))
-    changes["dt_s"] = respaced(md.get("dt_s"), (k,))
+    # every time key through the one rule each T subset shares (the transform applies it too)
+    changes: Dict[str, Any] = dict(retime(ds.metadata, (k,)))
     out = out.with_metadata(**changes)
     # the envelope wins for the calibration key, so it stays the single source of truth and
     # the read stays memo-fenced (the same arithmetic on the same value, so no disagreement)

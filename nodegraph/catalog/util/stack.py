@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
-from nodegraph.metadata import stack_time as _meta_stack_time
+from nodegraph.metadata import drop_time_lists, stack_time as _meta_stack_time
 from nodegraph.provider import ArrayProvider
 from nodegraph.reducers import reduce as _reduce, reducer_docs
 from nodegraph.registry import Granularity, InDataset, Mode, OutDataset
@@ -22,8 +22,9 @@ from nodegraph.catalog._shared.sampling import _sampled
 def _compute_stack(ctx: EvalContext) -> Dataset:
     """Fuse the Timepoint axis into a single frame (T→1), boosting SNR. ``method`` picks
     the combiner (mean/median + the robust ``sigma_clip``/``trimmed_mean`` fusion
-    reducers, or max/sum). Drops ``dt_s`` in lockstep with the ``stack_time``
-    meta_transform."""
+    reducers, or max/sum). Drops ``dt_s`` and every per-frame time list (the clock, its
+    text, a bundle's per-file clocks — :func:`~nodegraph.metadata.drop_time_lists`) in
+    lockstep with the ``stack_time`` meta_transform: the fused frame is no single moment."""
     ds = ctx.inputs[0]
     prov = ds.image
     if prov is None:
@@ -44,7 +45,7 @@ def _compute_stack(ctx: EvalContext) -> Dataset:
                     out[m, 0, z, c] = _reduce(series, (0,), method)  # reduce over T
         stacked = _sampled(ds.with_image(ArrayProvider(out)).reshaped_axes(new_axes),
                            f"stack[{method}]")
-        return stacked.with_metadata(dt_s=None, bit_depth=bd_out)
+        return stacked.with_metadata(**drop_time_lists(ds.metadata), bit_depth=bd_out)
     # C1 (V2.04 §6b sliver): engine-driven tree-reduce over T — the mirror of Z-Project's
     # ZReduceProvider. Monoid combiners (mean/sum/max/min) fold the T series incrementally
     # per tile (memory O(window)); median/sigma_clip/trimmed_mean stack the t-column. No
@@ -54,7 +55,7 @@ def _compute_stack(ctx: EvalContext) -> Dataset:
     stacked = ds.with_image(
         TReduceProvider(prov, method, fp=fp, cache=cache)).reshaped_axes(new_axes)
     stacked = _sampled(stacked, f"stack[{method}]")
-    return stacked.with_metadata(dt_s=None, bit_depth=bd_out)
+    return stacked.with_metadata(**drop_time_lists(ds.metadata), bit_depth=bd_out)
 register_node(
     _compute_stack, op_key="util.stack", label="Stack (T→1)", category="utility",
     inputs=[InDataset()], outputs=[OutDataset()],
@@ -71,4 +72,5 @@ register_node(
     granularity=Granularity.WHOLE_SERIES, kernel_axes=frozenset({"t"}),
     meta_transform=_meta_stack_time,
     description="Stack the Timepoint axis → one frame (SNR↑) with a robust combiner "
-                "(mean/median/sigma-clip/trimmed); drops dt_s.")
+                "(mean/median/sigma-clip/trimmed); drops dt_s and the per-frame clock, "
+                "since the fused frame is no single moment.")

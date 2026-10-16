@@ -16,31 +16,7 @@ it, which registers that node early and welds the two fingerprints together).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
-
-
-def already_stage_placed(ds: Any) -> bool:
-    """Whether this Dataset's pixels have ALREADY been laid out in stage coordinates.
-
-    ``flip_x``/``flip_y`` describe how the camera is mounted — whether image ``+x`` runs along
-    stage ``+x`` — and they exist because no file records it. But ``util.stitch`` has to answer
-    that same question to place its tiles, and once it has, its canvas IS in stage space:
-    applying the flip again mirrors the whole mosaic inside its own footprint. Measured on the
-    WellA3 pair, a stitched 640 secondary lands **784 µm** (456 px at the primary's 1.718 µm/px)
-    out in x with the flip on, against 17 µm with it off.
-
-    So the flip is not a preference for such an input, it is inapplicable — which is why this is
-    derived from the data rather than left to a default the user has to discover by eye
-    (`wire-node-v2` §7b). Read off the sampling provenance, which is where ``util.stitch``
-    records itself (``stitch[stage[49 tiles]]``); a ``grid`` layout is not stage-placed and is
-    deliberately not matched.
-    """
-    try:
-        from nodegraph.catalog._shared.sampling import SAMPLING_KEY
-        stamps: Tuple[str, ...] = tuple(ds.metadata.get(SAMPLING_KEY, ()))
-    except Exception:  # noqa: BLE001 — a placement hint, never a failure
-        return False
-    return any(str(s).startswith("stitch[stage") for s in stamps)
+from typing import Any, Dict
 
 
 def overlay_settings(src: Any, modes: Dict[str, Any]) -> Dict[str, Any]:
@@ -130,6 +106,11 @@ def _base_entry(node_id: str, plan: Any, settings: Dict[str, Any],
         # have. The GUI reads them live from the document.
         "flip_x": bool(settings.get("flip_x", True)),
         "flip_y": bool(settings.get("flip_y", False)),
+        # The PRIMARY's handedness, read by `placement.frame_mapping` when the primary is not an
+        # Experiment Canvas (a canvas states its own). The same Flip X/Y as the secondary's:
+        # both files came off one scope, and a stage-Stitched mosaic is as camera-handed as
+        # the fields it was stitched from (2026-10-16).
+        "frame_flip": [bool(settings.get("flip_x", True)), bool(settings.get("flip_y", False))],
         "scale": plan.scale,
         "t_shift": int(settings.get("t_shift", 0)),
         "offset_um": [float(v) for v in settings.get("offset_um", (0.0, 0.0, 0.0))],
@@ -154,20 +135,6 @@ def _base_entry(node_id: str, plan: Any, settings: Dict[str, Any],
     }
 
 
-def handedness_for(sec: Any, flip_x: bool, flip_y: bool) -> Tuple[bool, bool, Tuple[str, ...]]:
-    """``(flip_x, flip_y, warnings)`` for this secondary — both forced off, with a reason, when
-    it is already stage-placed (:func:`already_stage_placed`)."""
-    if not already_stage_placed(sec):
-        return bool(flip_x), bool(flip_y), ()
-    if not (flip_x or flip_y):
-        return False, False, ()
-    return False, False, (
-        "the secondary is an already-stitched canvas, which is laid out in stage coordinates "
-        "— so Flip X/Y are inapplicable here and were NOT applied. Applying them again would "
-        "mirror the mosaic inside its own footprint (measured 784 µm out on the WellA3 pair). "
-        "The stitch itself is where that handedness belongs.",)
-
-
 def z_pick(entry: Dict[str, Any], sec_md: Any, sec_axes: Any, sec_m: int,
            pri_md: Any, pri_axes: Any, pri_k: int, z_um: Any) -> Any:
     """``[(secondary slice, weight)]`` for primary plane ``pri_k`` under this entry's Z
@@ -182,5 +149,4 @@ def z_pick(entry: Dict[str, Any], sec_md: Any, sec_axes: Any, sec_m: int,
         pri_k=int(pri_k), pri_step_um=_z_step(pri_md, pri_axes))
 
 
-__all__ = ["overlay_entry", "already_stage_placed", "handedness_for", "overlay_settings",
-           "plan_kwargs", "z_pick"]
+__all__ = ["overlay_entry", "overlay_settings", "plan_kwargs", "z_pick"]

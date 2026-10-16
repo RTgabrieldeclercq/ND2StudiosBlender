@@ -3669,8 +3669,7 @@ class EngineRunner(QObject):
         record cannot drift. Falls back to the stamped entry if anything is missing, which
         is the pre-existing behaviour and correct whenever nothing downstream moved."""
         try:
-            from nodegraph.catalog._shared.placement_entry import (
-                handedness_for, overlay_settings, plan_kwargs)
+            from nodegraph.catalog._shared.placement_entry import overlay_settings, plan_kwargs
             from nodegraph.catalog.view.overlay import overlay_entry
             from nodegraph.placement import plan_placement
             from nodegraph.nodes import SAMPLING_KEY
@@ -3695,16 +3694,11 @@ class EngineRunner(QObject):
                 **plan_kwargs(s))
             if not plan.ok:
                 return stamped        # keep the record; the pull itself already refused
-            # The SAME handedness derivation the compute makes — an already-stitched secondary
-            # is in stage coordinates, and a display path that flipped it while the compute did
-            # not would draw the overlay 456 px from where a bake put it.
-            fx, fy, _w = handedness_for(sec, s["flip_x"], s["flip_y"])
             # `context` is carried over from the stamped entry: the context boxes are the
             # compute's to build (they need the canvas mode against the stamped geometry),
             # and a re-plan that dropped them silently narrowed a context canvas back to the
             # primary's field.
-            return overlay_entry(ovl_id, plan, {**s, "flip_x": fx, "flip_y": fy},
-                                 context=stamped.get("context") or [])
+            return overlay_entry(ovl_id, plan, s, context=stamped.get("context") or [])
         except Exception:      # noqa: BLE001 — a re-plan failure must not cost the image
             return stamped
 

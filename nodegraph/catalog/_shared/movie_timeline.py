@@ -410,10 +410,13 @@ class MovieSource:
         # the ACQUISITION clock, seconds since the first frame (2026-10-12): display
         # metadata like the names, so the Dataset's own dict is the fallback. What the burned-in
         # time reads first — a Timeseries Builder's interleaved series is unevenly spaced, so
-        # `t × interval` would print a time the frame was not taken at.
-        from nodegraph.placement import frame_seconds
-        self.frame_s = frame_seconds(meta("frame_time_jd") or own.get("frame_time_jd"),
-                                     int(self.ax.t)) or []
+        # `t × interval` would print a time the frame was not taken at. A clockless series an
+        # uneven subset left with per-frame seconds (`frame_time_s`, 2026-10-16) reads those.
+        from nodegraph.metadata import FRAME_TIME_S_KEY, series_seconds
+        self.frame_s = series_seconds(
+            {"frame_time_jd": meta("frame_time_jd") or own.get("frame_time_jd"),
+             FRAME_TIME_S_KEY: meta(FRAME_TIME_S_KEY) or own.get(FRAME_TIME_S_KEY)},
+            int(self.ax.t)) or []
         self._vox: Dict[str, np.ndarray] = {}
 
     def channel_name(self, c: int) -> str:

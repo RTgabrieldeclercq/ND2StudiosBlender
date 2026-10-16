@@ -10,7 +10,7 @@ from nodegraph.dataset import AxisSizes, Dataset
 from nodegraph.domains import axes_of, is_lattice
 from nodegraph.engine import EvalContext
 from nodegraph.memo import digest as _digest
-from nodegraph.metadata import frame_slice as _meta_frame_slice
+from nodegraph.metadata import frame_slice as _meta_frame_slice, retime
 from nodegraph.provider import TileProvider
 from nodegraph.registry import Granularity, InDataset, OutDataset
 
@@ -56,6 +56,9 @@ def _compute_zone_frame(ctx: EvalContext) -> Dataset:
         raise ValueError(f"zone.frame: frame {t} out of range [0, {ax.t}) — set the "
                          f"zone's iterations to the input's T")
     out = Dataset(axes=replace(ax, t=1), metadata=dict(ds.metadata))
+    # the per-frame lists narrow to this frame (the `frame_slice` transform applies the same
+    # rule): left full length, the slice of frame t read frame 0's clock
+    out = out.with_metadata(**retime(ds.metadata, [t]))
     out = _sampled(out, f"zone.frame[t={t}]")   # t collapses to a single chosen frame
     if ds.image is not None:
         out = out.with_image(_FrameView(ds.image, t))

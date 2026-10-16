@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 from nodegraph.dataset import Dataset
 from nodegraph.engine import EvalContext
 from nodegraph.metadata import (crop as _meta_crop, format_indices, frame_spec_picks,
-                                position_subset, respaced, scope_stamp_subset,
-                                shift_origin_um, time_subset, z_home_after)
+                                position_subset, respaced, retime, scope_stamp_subset,
+                                shift_origin_um, z_home_after)
 from nodegraph.provider import FrameSubsetProvider
 from nodegraph.registry import (DimMode, InDataset, InInt, InString, Mode, OutDataset)
 from nodegraph.streaming import WindowView
@@ -152,8 +152,7 @@ def _crop_frames(ctx: EvalContext, ds: Dataset, prov: Any, raw: Any) -> Dataset:
     if ms is not None:
         changes.update(position_subset(md, keep_m))
     if ts is not None:
-        changes.update(time_subset(md, keep_t))
-        changes["dt_s"] = respaced(md.get("dt_s"), keep_t)
+        changes.update(retime(md, keep_t))
     if zs is not None:
         changes["z_step_um"] = respaced(md.get("z_step_um"), keep_z)
         changes.update(z_home_after(md, keep_z))

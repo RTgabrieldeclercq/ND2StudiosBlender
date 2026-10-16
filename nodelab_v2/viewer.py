@@ -3213,6 +3213,12 @@ class ViewerPanel(QWidget):
                     return elapsed_text(secs, span)
                 except (TypeError, ValueError):
                     pass
+            # a clockless series an uneven subset left with per-frame seconds (2026-10-16):
+            # `dt_s × t` no longer describes it, and dt_s was dropped for exactly that reason
+            from nodegraph.metadata import series_seconds
+            own = series_seconds(md, total)
+            if own is not None:
+                return elapsed_text(own[t], own[-1])
             try:
                 dt = float(md.get("dt_s") or 0.0)
             except (TypeError, ValueError):
@@ -3705,11 +3711,12 @@ class ViewerPanel(QWidget):
         needs because its gaps are uneven. After :meth:`_apply_cursor_ranges`, like the M
         groups: the strip refuses a clock that does not cover its axis, so under the
         troubleshooting scope (a payload holding only the picked frames) it shows none
-        rather than another frame's time."""
-        from nodegraph.placement import frame_seconds
+        rather than another frame's time. A clockless series an uneven subset left with
+        per-frame seconds (``frame_time_s``, 2026-10-16) shows those."""
+        from nodegraph.metadata import series_seconds
         md = getattr(dataset, "metadata", {}) or {}
         strip = self._sliders["t"]
-        strip.setFrameTimes(frame_seconds(md.get("frame_time_jd"), strip.count()))
+        strip.setFrameTimes(series_seconds(md, strip.count()))
 
     def _apply_position_groups(self, dataset) -> None:
         """Band the M strip by specimen, from the payload's per-position group list.

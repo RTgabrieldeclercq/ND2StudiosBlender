@@ -24,7 +24,7 @@ from nodegraph.structure import StructureTable, point_table
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import dvc_field_columns, on_layer
 from nodegraph.catalog._shared.dvc import _dvc_rows
-from nodegraph.catalog._shared.objects import _frame_interval_s
+from nodegraph.catalog._shared.objects import _frame_timebase
 from nodegraph.catalog._shared.analysis_units import (concat_tables, describe_seconds,
                                                       finish_trial, full_run_estimate,
                                                       open_node_trial, quality_layers,
@@ -103,8 +103,9 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
     with an external reference wired it averages (ref → t) pairs instead (static
     deformation, e.g. a TFM bead series). ``velocity`` (step 3) divides the µm
     displacement by the frame interval — the ``frame_interval`` socket if set, else the
-    file's ``dt_s`` via the shared :func:`_frame_interval_s` resolver, which REFUSES
-    when neither exists rather than mislabel µm/frame as µm/s — and emits ``vy``/``vx``/
+    file's ``dt_s``, else (an unevenly spaced series) each pair's own gap from the per-frame
+    times, via the shared :func:`_frame_timebase` resolver, which REFUSES when none exists
+    rather than mislabel µm/frame as µm/s — and emits ``vy``/``vx``/
     ``speed`` columns (µm/s, names matching ``analysis.object_metrics``). Velocity is
     refused for ``fixed_frame`` or an external reference (cumulative displacement has no
     per-row rate). ``uncertainty`` (step 5) emits per-vector ``unc_y``/``unc_x`` (µm) via
@@ -186,8 +187,10 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
             "that pair's own field) — it is not defined for the ensemble-averaged field. "
             "Use previous_frame/fixed_frame, or turn Uncertainty off for ensemble runs")
     try:
-        dt_s = _frame_interval_s(ctx, needed=want_vel, wanted=("velocity",),
-                                 node="analysis.piv")
+        # one interval, or — an unevenly spaced series — each frame's own time, so a pair's
+        # velocity divides by THAT pair's gap (`_pair_dt_s`)
+        dt_s = _frame_timebase(ctx, int(ax.t), needed=want_vel, wanted=("velocity",),
+                               node="analysis.piv", metadata=ds.metadata)
     except ValueError:
         raise ValueError(
             "analysis.piv: velocity columns (vy/vx/speed) are µm/s RATES, and this "
@@ -263,8 +266,8 @@ def _compute_piv(ctx: EvalContext) -> Dataset:
                                       ref_mode == "ensemble" else "fixed_frame"),
                "piv_reference_frame": ref_frame, "piv_correlation": corr,
                "piv_invalid_points": n_dropped, "piv_window": window}
-    if want_vel:
-        prov_md["piv_dt_s"] = float(dt_s)
+    if want_vel and np.ndim(dt_s) == 0:
+        prov_md["piv_dt_s"] = float(dt_s)        # per-frame times have no one interval
     kept = int(len(merged.get("m", ())))
     replaced = int(np.sum(merged["replaced"])) if "replaced" in merged else 0
     q = np.asarray(merged.get("qfactor", ()), dtype=float)
@@ -312,6 +315,24 @@ class _PIVArraySeq:
         return np.asarray(self._a[i])
 
 
+def _pair_dt_s(dt_s, t: int, ensemble: bool) -> float:
+    """The seconds a velocity row divides its displacement by: the one interval, or — given
+    each frame's own time (an unevenly spaced series, :func:`_frame_timebase`) — the gap of
+    THIS row's pair, frame ``t − 1`` → ``t`` (previous-frame pairing, the only per-step one).
+    The ensemble average pools every consecutive pair, so its displacement is the mean step's
+    and it divides by the mean gap. A gap that is not forward gives NaN, never a sign flip."""
+    if np.ndim(dt_s) == 0:
+        return float(dt_s)
+    secs = np.asarray(dt_s, dtype=float)
+    if ensemble:
+        gap = (secs[-1] - secs[0]) / max(1, secs.size - 1)
+    elif 1 <= int(t) < secs.size:
+        gap = secs[int(t)] - secs[int(t) - 1]
+    else:
+        gap = float("nan")
+    return float(gap) if np.isfinite(gap) and gap > 0 else float("nan")
+
+
 def _piv_unit(payload: dict, progress_cb=None) -> dict:
     """One (m, z) line through OpenPIV: the unit worker. Module-level (a worker process
     imports it by name) and pure — everything arrives in ``payload``, read on the pull
@@ -331,9 +352,10 @@ def _piv_unit(payload: dict, progress_cb=None) -> dict:
         row = _dvc_rows(res, vox, m=m, t=t, c=c, z_plane=z)
         row["replaced"] = res.flags.reshape(-1).astype(np.int64)
         if payload["velocity"]:                           # µm / s — one frame step per pair
-            row["vy"] = row["disp_y"] / dt_s
-            row["vx"] = row["disp_x"] / dt_s
-            row["speed"] = row["disp_mag_um"] / dt_s
+            gap = _pair_dt_s(dt_s, t, payload["ensemble"])
+            row["vy"] = row["disp_y"] / gap
+            row["vx"] = row["disp_x"] / gap
+            row["speed"] = row["disp_mag_um"] / gap
         if unc is not None:                               # px → µm, [y, x] components
             row["unc_y"] = unc[..., 0].reshape(-1) * vox[0]
             row["unc_x"] = unc[..., 1].reshape(-1) * vox[1]

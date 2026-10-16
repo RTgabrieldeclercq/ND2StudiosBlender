@@ -9,11 +9,12 @@ from nodegraph.catalog._shared.labels import _resolve_layer, _structure_layers
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain, domain_docs
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, InInt, InString, Mode, OutDataset
+from nodegraph.registry import (Granularity, InDataset, InFloat, InInt, InString, Mode,
+                                OutDataset)
 from nodegraph.units import format_unit, unit_of
 
 _XY_DOMAINS = ("label", "point", "track")
-_XY_ERRORS = ("none", "sd", "sem", "ci95", "pooled_sd")
+_XY_ERRORS = ("none", "sd", "sem", "ci95", "pooled_sd", "column")
 #: the sockets and modes that read one value per point: per-point plots only
 _PER_POINT = {"error": frozenset({"none"})}
 
@@ -52,6 +53,20 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
     linear x axis therefore draws its blank as a line where it drew points; ``drop`` on a
     linear axis is unchanged (those rows are ordinary points).
 
+    **Exponential** (2026-10-15, capture-bead MFI against distance from a secreting
+    spheroid). ``fit = exponential`` fits each series ``y = A·e^(-x/λ)`` as a straight line
+    to ``ln y`` whatever the axes (:func:`~nodegraph.catalog._shared.figure.xy_exponential`)
+    on its y > 0 points; A, λ (the e-fold length, in x's units) and R² of ln y join the
+    legend. Fitting the logarithm weighs each point by its relative miss, so three decades
+    of MFI are not fitted to the brightest beads alone; the curve is straight on Log Y.
+    ``fit_weight`` (2026-10-15, the same decay on LINEAR axes) picks how the exponential
+    weighs its points: ``relative`` fits ln y as above, ``absolute`` fits in data units, where
+    the brightest points decide the curve as the eye does on a linear y axis.
+    ``fit_span`` (any trendline) is where the curves are DRAWN, 'low, high', each a number or
+    a column's median — a decay extrapolated in to a spheroid's edge; the fit is unchanged.
+    ``fit_floor`` (only read with ``exponential``) keeps rows below it out of the fit but on
+    the figure: a background-subtracted reading at the noise floor would otherwise pull λ.
+
     **Colour by and Label by** (2026-10-14, for IL-8 capture beads around a spheroid: x the
     distance from it, y the height, each bead lit by its MFI and labelled with its true 3-D
     distance). Both read one value per POINT, so both live under ``error = none`` only
@@ -89,8 +104,23 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
     log_x = bool(ctx.params.get("log_x", False))
     log_y = bool(ctx.params.get("log_y", False))
     fit = str(modes.get("fit", "none"))
+    fit_floor = float(ctx.params.get("fit_floor", 0.0) or 0.0) \
+        if fit == "exponential" else 0.0
+    x_unit = format_unit(unit_of(ds, domain, xname, layer), pretty=True) \
+        if fit == "exponential" else ""
+    fit_weight = str(modes.get("fit_weight", "relative")) if fit == "exponential" \
+        else "relative"
+    fit_span = _fit_span(ctx, cols, layer) if fit != "none" else [None, None]
+    ps = _point_source(ds, xname, yname) if fit == "point_source" else None
     zero_x = str(modes.get("zero_x", "drop"))
-    pn = psd = None
+    pn = psd = ecol = None
+    if error == "column":
+        ename = str(ctx.params.get("error_column", "") or "")
+        if not ename:
+            raise ValueError("plot xy: Error = column needs Error column — the column holding "
+                             "each row's error half-width (a fitted rate's interval, say).")
+        ecol = np.asarray(FIG.column(cols, ename, node="plot xy", socket="error_column",
+                                     layer=layer, numeric=True), dtype=float)
     if error == "pooled_sd":
         pn = FIG.column(cols, str(ctx.params.get("pool_n", "area") or "area"),
                         node="plot xy", socket="pool_n", layer=layer, numeric=True)
@@ -133,10 +163,14 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
             texts = FIG.point_text(raw, decimals=int(ctx.params.get("label_decimals", 0) or 0),
                                    unit=lunit)
     series = FIG.xy_series(x, y, g, error, log_x=log_x, log_y=log_y, pool_n=pn, pool_sd=psd,
-                           color=cvals, text=texts)
+                           color=cvals, text=texts, err=ecol)
     FIG.decorate_xy(series, x, y, g, fit=fit, zero_x=zero_x, log_x=log_x, log_y=log_y,
-                    pool_n=pn)
+                    pool_n=pn, fit_floor=fit_floor, x_unit=x_unit, fit_weight=fit_weight,
+                    fit_span=fit_span, point_source=ps)
     style = FIG.style_from_ctx(ctx)
+    if str(modes.get("detail", "preset")) == "custom":
+        loc = str(ctx.params.get("legend_loc", "inside") or "inside")
+        style["legend_loc"] = loc if loc in FIG.LEGEND_LOCS else "inside"
     per = str(modes.get("per", "all"))
     x_range = FIG.parse_range(ctx.params.get("x_range", ""), socket="x_range")
     y_range = FIG.parse_range(ctx.params.get("y_range", ""), socket="y_range")
@@ -145,7 +179,9 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
         "series": series,
         "draw": {"mode": str(modes.get("kind", "line_markers")),
                  "error_style": str(modes.get("error_style", "bars")),
-                 "fit": fit, "zero_x": zero_x},
+                 "fit": fit, "fit_floor": fit_floor, "x_unit": x_unit,
+                 "fit_weight": fit_weight, "fit_span": fit_span, "zero_x": zero_x,
+                 "point_source": ps},
         "axes": {"title": str(ctx.params.get("title", "") or ""),
                  "x_label": str(ctx.params.get("x_label", "") or "") or xname,
                  "y_label": str(ctx.params.get("y_label", "") or "") or yname,
@@ -215,6 +251,8 @@ def _compute_plot_xy(ctx: EvalContext) -> Dataset:
                                   else [FIG.json_value(v) for v in psd]),
                           "c": (None if cvals is None
                                 else [FIG.json_value(v) for v in cvals]),
+                          "e": (None if ecol is None
+                                else [FIG.json_value(v) for v in ecol]),
                           "lab": texts})
         spec["series"] = []
         h, w = FIG.figure_pixels(style["width_mm"], style["height_mm"], style["dpi"])
@@ -252,6 +290,60 @@ def _x_lines(ctx: EvalContext, ds: Dataset, domain: Domain, layer: str, cols, xn
             continue
         lab = labels[i] if i < len(labels) and labels[i] else name
         out.append({"x": v, "label": lab, "unit": unit})
+    return out
+
+
+def _point_source(ds: Dataset, xname: str, yname: str):
+    """``{"rec", "space"}`` for Trendline = point_source: the Point-Source Fit record of the
+    plotted y — the concentration it fitted (``value``), or the signal a standard curve
+    converted into it (``signal``, drawn through that curve) — refused when there is none,
+    or when x is not the distance it was fitted against."""
+    fits = (ds.metadata or {}).get("point_source_fit") or {}
+    if not isinstance(fits, dict) or not fits:
+        raise ValueError("plot xy: Trendline = point_source draws the model a Point-Source "
+                         "Fit (table.point_source_fit) fitted upstream — wire one between the "
+                         "table and this plot.")
+    rec, space = fits.get(yname), "value"
+    if rec is None:
+        rec = next((r for r in fits.values() if isinstance(r, dict)
+                    and r.get("signal") == yname and r.get("curve")), None)
+        space = "signal"
+    if rec is None:
+        raise ValueError(f"plot xy: no Point-Source Fit upstream fitted {yname!r} or a "
+                         f"concentration converted from it (fitted: {sorted(fits)}). Plot one "
+                         f"of those as Y.")
+    if rec.get("distance") and rec["distance"] != xname:
+        raise ValueError(f"plot xy: the point source was fitted against {rec['distance']!r}; "
+                         f"its curve is a function of that distance, so plot it as X (not "
+                         f"{xname!r}).")
+    return {"rec": rec, "space": space}
+
+
+def _fit_span(ctx: EvalContext, cols, layer: str):
+    """``[low, high]`` of ``fit_span`` (2026-10-15): each comma side a number in X's unit, a
+    column whose MEDIAN is the value (a spheroid's `spheroid_edge_um` beside every bead), or
+    blank (``None``: the series' own extent). Only the low side is needed to carry a decay in
+    to a source's edge."""
+    spec = str(ctx.params.get("fit_span", "") or "")
+    if not spec.strip():
+        return [None, None]
+    parts = [t.strip() for t in spec.split(",")]
+    if len(parts) > 2:
+        raise ValueError(f"plot xy: Trendline span takes 'low, high', got {spec!r}.")
+    out: list = []
+    for tok in (parts + ["", ""])[:2]:
+        if not tok:
+            out.append(None)
+            continue
+        try:
+            out.append(float(tok))
+            continue
+        except ValueError:
+            pass
+        col = np.asarray(FIG.column(cols, tok, node="plot xy", socket="fit_span",
+                                    layer=layer, numeric=True), dtype=float)
+        fin = col[np.isfinite(col)]
+        out.append(float(np.median(fin)) if fin.size else None)
     return out
 
 
@@ -314,6 +406,13 @@ register_node(
                              "has it. It adds the spread WITHIN each row to the spread "
                              "between rows, which is what makes the bar the SD of every "
                              "pixel rather than of the bead means."),
+        InString("error_column", "Error column", field=False, default="",
+                 column_in_mode="domain", column_from="table",
+                 available_in={"error": frozenset({"column"})},
+                 description="With Error = column, the column holding each row's error "
+                             "HALF-width, in y's units — Point-Source Fit's `q_ci_fg_s` (half "
+                             "its bootstrap 95 % interval). Drawn as ± that around the point; "
+                             "a missing value draws no bar. Required in that mode."),
         InString("color_by", "Colour by", field=False, default="", column_in_mode="domain",
                  column_from="table", available_in=_PER_POINT,
                  description="A numeric column that colours every point on a continuous "
@@ -358,12 +457,30 @@ register_node(
                              "from two files), a well, a position group. Figures follow the "
                              "order the values first appear and are titled by the value; all "
                              "share their axes and one colour scale."),
+        InString("fit_span", "Trendline span", field=False, default="",
+                 available_in={"fit": frozenset({"linear", "langmuir", "exponential",
+                                                 "point_source"})},
+                 description="Where each trendline is DRAWN, as 'low, high' in X's unit: a "
+                             "number, or a column whose median is the value "
+                             "(`spheroid_edge_um,` carries a decay in to the spheroid's edge, "
+                             "past the nearest bead). Blank on a side keeps the series' own "
+                             "extent. Extrapolates the curve; moves no fitted parameter and "
+                             "no point."),
+        InFloat("fit_floor", "Fit floor", unit="", field=False, default=0.0,
+                available_in={"fit": frozenset({"exponential"})},
+                description="Rows whose y is below this stay on the plot but leave the "
+                            "exponential fit, in y's own units. A background-subtracted "
+                            "reading near zero is noise, and on ln y a 0.01 weighs like a "
+                            "real hundred-fold drop, shortening λ. RAISE it to the "
+                            "measurement's noise floor (about 1 count for a bead MFI); 0, "
+                            "the default, fits every y > 0. Changes A, λ and R², never a "
+                            "point."),
         InInt("label_decimals", "Label decimals", unit="", field=False, default=0,
               available_in=_PER_POINT,
               description="How many decimal places a numeric label keeps: 0 prints 1234 µm, "
                           "1 prints 1234.5 µm. Rounding only — the table keeps every digit. "
                           "Only read with Label by set to a numeric column."),
-        *FIG.style_sockets(),
+        *FIG.style_sockets(legend_loc=True),
     ],
     outputs=[OutDataset(label="Figure")],
     modes=[
@@ -402,9 +519,13 @@ register_node(
                               "exactly what listing every pixel would give. Wider than sd "
                               "over the row means, because the spread inside each object "
                               "counts too. Needs Measure's count and std stats.",
+                 "column": "Draw every row as its own point with ± the half-width a column "
+                           "holds — an interval computed upstream (a fitted rate's bootstrap "
+                           "95 % interval). Nothing is averaged; Error column names it.",
              }),
         Mode("error_style", ["bars", "band"], default="bars", label="Error style",
-             available_in={"error": frozenset({"sd", "sem", "ci95", "pooled_sd"})},
+             available_in={"error": frozenset({"sd", "sem", "ci95", "pooled_sd",
+                                                "column"})},
              description="How the spread is drawn around each mean.",
              choice_docs={
                  "bars": "An error bar with caps at every x — reads best with few x "
@@ -415,8 +536,9 @@ register_node(
         Mode("fit", list(FIG.XY_FITS), default="none", label="Trendline",
              description="Whether each series gets a fitted trendline, and which model. "
                          "Linear is fitted in the PLOTTED coordinates, so it follows Log X / "
-                         "Log Y; Langmuir is fitted in data units whatever the axes. Either "
-                         "reads the plot's points and changes no measurement.",
+                         "Log Y; Langmuir is fitted in data units and Exponential to ln y, "
+                         "whatever the axes. Each reads the plot's points and changes no "
+                         "measurement.",
              choice_docs={
                  "none": "No trendline — the points (and their error bars) only. The "
                          "default, and what every saved graph from before trendlines draws.",
@@ -430,6 +552,36 @@ register_node(
                              "passes through the origin, so a blank stays out of it), with "
                              "Bmax, Kd and R² in the legend. For a saturating standard curve "
                              "on linear axes; Kd is in x's units. Needs two distinct x > 0.",
+                 "exponential": "An exponential decay y = A·e^(-x/λ) per series — a "
+                                "gradient falling away from a source, x its distance — "
+                                "fitted as a line to ln y, so each point weighs by its "
+                                "relative miss and a few bright points do not decide it. "
+                                "A, the e-fold length λ (x's units; negative = rising) "
+                                "and R² of ln y in the legend. Points at y <= 0 are left "
+                                "out; needs two y > 0 at distinct x. Straight on Log Y.",
+                 "point_source": "The Crank point-source profile a Point-Source Fit upstream "
+                                 "fitted, per series at that timepoint's time — nothing is "
+                                 "fitted here. Y must be the concentration it fitted, or the "
+                                 "signal a Standard Curve converted into it (drawn back "
+                                 "through that curve); X the distance it was fitted against; "
+                                 "series by the fit's groups (Group by its Group column). "
+                                 "The rate and R² join each legend entry, D a note.",
+             }),
+        Mode("fit_weight", list(FIG.XY_EXP_WEIGHTS), default="relative",
+             label="Trendline weighting", available_in={"fit": frozenset({"exponential"})},
+             description="How the exponential trendline weighs its points. Changes A, λ and "
+                         "R², never a point; only read with Trendline = exponential.",
+             choice_docs={
+                 "relative": "Fit ln y: each point weighs by its RATIO to the curve, so a "
+                             "series spanning decades is fitted across all of them and λ is "
+                             "stable from series to series. On a linear y axis the curve "
+                             "can sit visibly under the brightest points. R² is of ln y.",
+                 "absolute": "Least squares in data units, started from the ln y fit: each "
+                             "point weighs by its absolute miss, so the brightest few decide "
+                             "A and λ — the curve the eye expects on a linear y axis, but λ "
+                             "can swing between series that differ in a few bright points. "
+                             "Readings at or below zero enter unless Fit floor keeps them "
+                             "out. R² is in data units.",
              }),
         Mode("zero_x", list(FIG.XY_ZERO_X), default="drop", label="x ≤ 0 rows",
              description="What happens to rows at x of zero or below — a blank or a zero "

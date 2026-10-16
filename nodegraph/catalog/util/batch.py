@@ -74,7 +74,7 @@ def _aligned(members: Tuple[Dataset, ...]) -> Tuple[Tuple[Dataset, ...], str]:
     count quietly incomparable — and the count is usually the answer.
     """
     from nodegraph.provider import FrameSubsetProvider
-    from nodegraph.metadata import position_subset, time_subset
+    from nodegraph.metadata import position_subset, retime
     from nodegraph.catalog._shared.frame_subset import (
         subset_lattice_layers, subset_structure_rows)
 
@@ -98,7 +98,7 @@ def _aligned(members: Tuple[Dataset, ...]) -> Tuple[Tuple[Dataset, ...], str]:
                                     {"m": ms, "t": ts, "z": None})
         cut = subset_structure_rows(cut, {"m": ms, "t": ts, "z": None})
         cut = cut.with_metadata(**position_subset(ds.metadata, list(ms)))
-        cut = cut.with_metadata(**time_subset(ds.metadata, list(ts)))
+        cut = cut.with_metadata(**retime(ds.metadata, list(ts)))
         out.append(cut)
 
     parts = [f"{a}: kept {keep[a]}, dropped {d}" for a, d in dropped.items() if any(d)]

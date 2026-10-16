@@ -267,6 +267,10 @@ def _compute_timeseries(ctx: EvalContext) -> Dataset:
         note = (f"{k} files in acquisition-clock order"
                 + (f", {first_local[0]} → {first_local[-1]}"
                    if clocks and clocks[0] is not None and clocks[-1] is not None else ""))
+        # the seams between files are steps like any other (`concat_interval`)
+        if "dt_s" in changes and changes["dt_s"] is None:
+            note += (" · the gaps between files differ from the frame interval, so dt_s is "
+                     "dropped — each frame's own time is in its clock")
     else:
         frame_file = None
         note = (_seq_describe(names) if used == "sequence" else
@@ -323,8 +327,11 @@ register_node(
                       "its frame_time_jd, a multi-file card each of its files' own "
                       "(source_frame_time_jd) — so every frame of the result keeps its "
                       "real acquisition time; a card that carries only its first file's "
-                      "clock has it DROPPED rather than repeated. dt_s is left alone and still "
-                      "describes spacing WITHIN a file, not the gap between two. The stage "
+                      "clock has it DROPPED rather than repeated. dt_s is rebuilt from that "
+                      "clock: kept where every step, the gaps between files included, "
+                      "matches it, dropped where they differ (speeds then use each step's "
+                      "own gap); without a clock the gaps are unknowable and the files' "
+                      "agreed in-file interval is kept. The stage "
                       "log is kept (first file's reading) wherever every file puts a "
                       "position within a tenth of a field of the same place, so Stitch by "
                       "stage still works on the result.",

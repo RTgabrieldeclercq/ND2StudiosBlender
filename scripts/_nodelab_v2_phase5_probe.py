@@ -7797,14 +7797,24 @@ def main(argv) -> int:
         (_ti.width(), _INSW, _ti.minimumSizeHint().width())
     assert _wt.shell.docks["console:0"].isHidden() and _wt.shell.docks["movie:0"].isHidden()
     assert not _wt._layout_restored and _wt._first_show_done
+    # Properties FILLS its tab column (2026-10-14): the panel was FIXED at 376, so a column
+    # dragged wider — or held wide by a tab beside it — left a blank strip down its right
+    _ti_def = _ti.width()
+    _ti.raise_()
+    _wt.resizeDocks([_ti], [_INSW + 200], _Qt.Horizontal)
+    app.processEvents()
+    assert _ti.width() >= _INSW + 190, (_ti.width(), _INSW + 200)
+    assert _wt.inspector.width() >= _ti.width() - 2, (_wt.inspector.width(), _ti.width())
+    _ti_wide = _ti.width()
     _wt.close()
     app.processEvents()
     _ok(f"SH1b default layout: the Viewer is on screen from launch, above the canvas, at "
         f"{_VSHARE:.2f} of the canvas column when that is reachable (a fresh 1920×1400 "
         f"window: {_tv.height() / _tcol:.2f}) and at its minimum height otherwise (this "
         f"window: {_v0d.height()} px, minimum {_floor}, column {_col}); Nodes left at "
-        f"{_tp.width()} px; Properties right at {_ti.width()} px with Spreadsheet and LabLink "
-        f"tabbed behind it; Console and Movie Editor hidden")
+        f"{_tp.width()} px; Properties right at {_ti_def} px with Spreadsheet and LabLink "
+        f"tabbed behind it, and filling its column when it is widened ({_ti_wide} px); "
+        f"Console and Movie Editor hidden")
 
     # CH1 dock chrome (V4.00 step 11a): a floating panel is framed and filled from the theme,
     # not from Qt's default light palette (#efefef showed in the frame gutter and through the

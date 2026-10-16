@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from nodegraph.bridges import voxel_to_label
 from nodegraph.dataset import Dataset
@@ -229,9 +229,20 @@ def _label_position_columns(ds: Dataset, layer: str, row_ids: np.ndarray, *,
     out = {"z_um": z_px * zs, "y_um": y_px * px, "x_um": x_px * px}
     out.update(_stage_position_columns(ds, m, out["x_um"], out["y_um"], z_px, flip=flip))
     return out
-def _flip(ctx: EvalContext) -> Tuple[bool, bool]:
+def _flip(ctx: EvalContext, ds: Optional[Dataset] = None) -> Tuple[bool, bool]:
     """The ``flip_x`` / ``flip_y`` handedness for the stage columns (defaults
-    :data:`nodegraph.placement.DEFAULT_FLIP`, the same as Stitch's and Overlay's)."""
+    :data:`nodegraph.placement.DEFAULT_FLIP`, the same as Stitch's and Overlay's) — applied to
+    a stage-Stitched mosaic exactly as to a camera field. ``ds`` is accepted and not read.
+
+    **A mosaic is camera-handed** (2026-10-16): with Flip X on, ``util.stitch`` puts the
+    highest-x tile on the LEFT (``u = xs.max() - xs``) and keeps every tile's pixels as the
+    camera took them, so the mosaic's +x runs along stage −x like each field's. Verified on
+    the IL-8 well: the beads of a 12 × 12 whole-well Cy5 mosaic land on the 20 beads the
+    bead runs placed (median 5 µm) only when flipped; unflipped, none is within 30 µm. A
+    15 Oct change that switched the flip off on a mosaic (following Overlay's "already
+    stage-placed" rule) mirrored every mosaic row about the mosaic's centre — a spheroid
+    centroid 46 µm off — and was reverted here. Overlay's rule went the same day
+    (:func:`nodegraph.placement.frame_mapping`)."""
     from nodegraph.placement import DEFAULT_FLIP
     return (bool(ctx.params.get("flip_x", DEFAULT_FLIP[0])),
             bool(ctx.params.get("flip_y", DEFAULT_FLIP[1])))
@@ -401,7 +412,7 @@ def _measure_points(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
         "mean_intensity": vals,
     }
     out.update(_stage_position_columns(ds, mm, out["x_um"], out["y_um"], zf,
-                                       flip=_flip(ctx)))
+                                       flip=_flip(ctx, ds)))
     # Re-emits the SAME Point layer with the new columns, so its z_kind provenance (§7b)
     # must be carried forward rather than clobbered with the StructureTable default
     # ("subpixel"), which would tell every downstream node this 2D cloud was volumetric.
@@ -502,7 +513,7 @@ def _measure_labels(ctx: EvalContext, ds: Dataset, prov, *, on_raw: bool) -> Dat
     px = ctx.calib("pixel_size_um") or 0.1
     zs = (ctx.calib("z_step_um") or 0.5) if ax.z > 1 else 0.0
     cols.update(_label_position_columns(ds, layer, cols["id"], px=px, zs=zs,
-                                        flip=_flip(ctx)))
+                                        flip=_flip(ctx, ds)))
     return ds.with_structure(StructureTable(Domain.LABEL, cols, layer=layer, z_kind=zk))
 
 def _columns_measure(params, modes, incoming):
@@ -585,8 +596,10 @@ register_node(
                                "`stage_x_um` column places each row on the microscope. ON "
                                "(the default) is this scope's handedness and Stitch's, "
                                "Overlay's and Merge's default — so one object seen from two "
-                               "overlapping fields gets ONE stage position. Changes only "
-                               "`stage_x_um`; every local and intensity column is unaffected."),
+                               "overlapping fields gets ONE stage position. It applies to a "
+                               "stage-Stitched mosaic too, which keeps the camera's "
+                               "handedness. Changes only `stage_x_um`; every local and "
+                               "intensity column is unaffected."),
             InBool("flip_y", "Flip Y", field=False, default=False,
                    description="Whether the image's +y runs along stage −y for `stage_y_um`. "
                                "OFF (the default) matches Stitch and Overlay. Changes only "

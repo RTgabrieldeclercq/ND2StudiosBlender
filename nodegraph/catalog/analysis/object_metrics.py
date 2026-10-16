@@ -16,7 +16,7 @@ from nodegraph.catalog._shared.batch import batch_aware
 from nodegraph.catalog._shared.columns import member_layer, on_layer
 from nodegraph.catalog._shared.objects import (
     _InFrameInterval,
-    _frame_interval_s,
+    _frame_timebase,
     _object_table,
     _object_velocity,
 )
@@ -191,10 +191,11 @@ def _compute_object_metrics(ctx: EvalContext) -> Dataset:
     need_track = bool(set(names) & _OBJECT_METRICS_TRACKED)
     need_inten = bool(set(names) & _OBJECT_METRICS_INTENSITY)
     # dt_s only matters once a velocity is involved (R1: don't fence a pull on a key it
-    # cannot use) — and when it IS involved an absent interval is refused, not defaulted.
-    dt_s = _frame_interval_s(ctx, needed=need_track,
-                             wanted=set(names) & _OBJECT_METRICS_TRACKED,
-                             node="object metrics")
+    # cannot use) — and when it IS involved an absent interval falls to each frame's own
+    # time (an unevenly spaced series), and only a series with neither is refused.
+    dt_s = _frame_timebase(ctx, int(ds.axes.t), needed=need_track,
+                           wanted=set(names) & _OBJECT_METRICS_TRACKED,
+                           node="object metrics", metadata=ds.metadata)
 
     track = cols.get("track_id")
     if need_track and track is None:

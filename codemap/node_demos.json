@@ -1037,6 +1037,105 @@
         "Shown: nuclei of a 2×2 overlapping stage raster (built with +x = stage +x, hence Measure's Flip X off); keep_first 1 keeps each nucleus once."
       ]
     },
+    "table.register_positions": {
+      "kind": "table",
+      "phantom": "plate_mosaic",
+      "prelude": [
+        "labels2d",
+        {
+          "op": "analysis.measure",
+          "params": {
+            "flip_x": false
+          }
+        }
+      ],
+      "extra_inputs": {
+        "reference": {
+          "pre": 2
+        }
+      },
+      "features": [
+        "Moves a table's stage positions into a reference table's frame, fitted on the objects both contain: a plate imaged again after it was taken off the stage and put back.",
+        "The shift is voted from every row-to-reference vector, objects pair within Tolerance, and Model fits a rigid turn + shift (or a shift); reg_dx_um / reg_dy_um / reg_dz_um, reg_residual_um and reg_rotation_deg record it.",
+        "Shown: a 2×2 stage raster's nuclei registered onto their own table — every object pairs with itself and the move is zero; feed it a later run of the same plate to see one."
+      ]
+    },
+    "table.standard_curve": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "signal": "mean_intensity",
+        "name": "concentration",
+        "bmax": 5000.0,
+        "kd": 2000.0
+      },
+      "fixed_modes": {
+        "curve": "typed",
+        "model": "langmuir"
+      },
+      "features": [
+        "Turns a measured signal (a bead's background-subtracted MFI) into a concentration through a standard curve: Langmuir Bmax·c/(Kd + c) or a line.",
+        "Curve = fit takes the standards from a second wire — each standard bead's signal at a known concentration, weighted by its pixel count and filtered (sighting=0) — and gives the range and a detection limit (blank + 3 SD); <name>_flag says in range, extrapolated, below LOD or above Bmax.",
+        "Shown: each nucleus's mean intensity through a typed Langmuir curve (Bmax 5000, Kd 2000) — wire a standards table and switch Curve to fit for a real one."
+      ]
+    },
+    "table.point_source_fit": {
+      "kind": "table",
+      "phantom": "cells2d",
+      "prelude": "measured2d",
+      "fixed_params": {
+        "value": "mean_intensity",
+        "distance": "x_um",
+        "time": "t",
+        "start_h": 1.0,
+        "bootstrap": 0
+      },
+      "fixed_modes": {
+        "time_kind": "hours",
+        "rate": "constant"
+      },
+      "features": [
+        "Fits Crank's continuous point source C = q/(4πDr)·erfc(r/2√(Dt)) (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — against their distance and time.",
+        "Rate = constant gives each timepoint's average production rate since the source started (the paper's fit); piecewise fits the rate's history by superposition. D fixed (20 µm²/s, the paper's IL-8 value) or fitted; a source on an impermeable floor doubles every concentration.",
+        "Adds the model's value per row and a <name>_rates table (fg/s, pg/h, bootstrap 95 % interval) for Plot XY; Plot XY's point_source trendline and Gradient Map's point-source trend draw the fit.",
+        "Shown: each nucleus's mean intensity fitted as if released from x = 0 an hour ago — wire a Standard Curve's concentrations, their 3-D distance and Table Concat's clock for a real one."
+      ]
+    },
+    "analysis.gradient_map": {
+      "kind": "points",
+      "phantom": "plate_mosaic",
+      "prelude": [
+        "labels2d",
+        {
+          "op": "analysis.measure",
+          "params": {
+            "flip_x": false
+          }
+        },
+        {
+          "op": "view.canvas"
+        }
+      ],
+      "extra_inputs": {
+        "points": {
+          "pre": 2
+        },
+        "source": {
+          "pre": 2
+        }
+      },
+      "fixed_params": {
+        "value": "mean_intensity",
+        "spacing": 2.0,
+        "z": ""
+      },
+      "features": [
+        "A value measured at scattered objects drawn as a map: the exponential decay it follows with distance from a point source, times the objects' own deviations interpolated between them — exact at each object, the decay's shape between.",
+        "Wire the image to draw on (an Experiment Canvas with a baked background, a stitched mosaic), the objects (Points) and the source's table (Source); Per column makes one map per timepoint. Plot Field colours the lattice table and rings the objects (Marks = <name>_objects).",
+        "Shown: a 2×2 stage raster's nuclei (built with +x = stage +x, hence Measure's Flip X off) on an Experiment Canvas spanning it, their intensity mapped round the colony's own centre."
+      ]
+    },
     "table.join": {
       "kind": "table",
       "phantom": "cells2d",
@@ -1841,6 +1940,21 @@
         "Delays the series by two frames: the before view is frame 3 of the input, the after view shows what frame 1 looked like — the beads are back where they were two frames earlier (the field drifts (+1.5, −2.0) px a frame). Drag Delta to change the lag; Direction `earlier` pulls later frames forward instead.",
         "T, the frame interval and the per-frame clock do not change: the content moved on the same grid, which is what lets two streams of one acquisition be lined up for a Merge or a comparison when one lags the other.",
         "Frames with no source repeat the nearest edge frame (`hold`) or are blank (`blank`); per-frame masks and detections move with the image, and rows shifted off either end are dropped. The T twin of Shift."
+      ]
+    },
+    "util.trim": {
+      "kind": "image",
+      "phantom": "star_field",
+      "fixed_params": {
+        "fraction": 0.5
+      },
+      "view": {
+        "t": 1
+      },
+      "features": [
+        "Thins the six-frame series to half: frames 0, 2 and 5 survive (`span` keeps the first and the last). The after view's frame 1 is the input's frame 2. Drag Fraction to keep more or fewer; 12 frames trimmed to a third would keep 0, 3, 7, 11.",
+        "Spacing `stride` takes one fixed step from frame 0 instead (here 0, 2, 4): the steps are uniform, so dt_s survives multiplied, at the cost of the tail. `span`'s uneven steps drop dt_s, and every kept frame keeps its own time instead (the clock, or frame_time_s on a series without one) — speeds and velocities downstream use each step's real gap.",
+        "Works before a Timeseries Builder (each file's frames are trimmed and still interleave by their own clocks) or after it (the built series is trimmed). Axis Z thins a stack, M the positions."
       ]
     },
     "field.gradient": {

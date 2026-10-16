@@ -4,7 +4,7 @@ the field as a colour map with a colour bar, optional arrows and iso-contours, a
 playback strip."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -18,7 +18,8 @@ from nodegraph.engine import EvalContext
 from nodegraph.registry import (Granularity, InBool, InDataset, InFloat, InInt, InString,
                                 Mode, OutDataset)
 
-_CMAPS = ("auto", "turbo", "viridis", "magma", "cividis", "coolwarm")
+_CMAPS = ("auto", "turbo", "viridis", "magma", "inferno", "cividis", "coolwarm")
+_SCALES = ("linear", "log")
 #: maps with a meaningful midpoint: blank limits are centred on zero for these
 _DIVERGING = frozenset({"coolwarm"})
 
@@ -93,8 +94,34 @@ def _thin_arrows(rows: np.ndarray, spacing: float, every: int) -> Tuple[np.ndarr
     return rows[np.sort(first)], cell
 
 
+def _marks(ds: Dataset, spec: Optional[Dict[str, Any]], m: int, t: int, z: int,
+           c: int) -> List[List[Any]]:
+    """``[y, x, text]`` of every row of the marks table on the viewed (m, t, z): the measured
+    objects drawn as rings over the field, each with its label column's value (blank text
+    without one). ``[]`` without a marks table."""
+    if not spec:
+        return []
+    cols = FM.point_tables(ds).get(spec["table"]) or {}
+    if "y" not in cols or "x" not in cols:
+        return []
+    idx = FM._frame_rows(cols, m, t, c)
+    if idx.size and "z" in cols and FM._z_kind(ds, spec["table"]) != "subpixel":
+        idx = idx[np.rint(np.asarray(cols["z"], dtype=float)[idx]) == z]
+    if not idx.size:
+        return []
+    y = np.asarray(cols["y"], dtype=float)[idx]
+    x = np.asarray(cols["x"], dtype=float)[idx]
+    lab = spec.get("label") or ""
+    texts = (FIG.point_text(np.asarray(cols[lab])[idx], decimals=int(spec.get("decimals", 0)),
+                            unit=str(spec.get("unit", "")))
+             if lab and lab in cols else [""] * idx.size)
+    return [[float(a), float(b), str(tx)] for a, b, tx in zip(y, x, texts)
+            if np.isfinite(a) and np.isfinite(b)]
+
+
 def _frame_entry(ds: Dataset, layer: str, col: str, m: int, t: int, z: int, c: int,
-                 side: int, arrows: bool, every: int) -> Dict[str, Any]:
+                 side: int, arrows: bool, every: int,
+                 marks: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     img, _f = _background(ds, m, t, z, c, side)
     # a lattice field draws one cell per node whatever this says; a scattered one (a
     # stitched mosaic, tracked points) is resampled to about two figure pixels a cell —
@@ -115,6 +142,9 @@ def _frame_entry(ds: Dataset, layer: str, col: str, m: int, t: int, z: int, c: i
             # the 95th-percentile arrow as long as the gap between DRAWN arrows
             s = vf.spacing_px if np.isfinite(vf.spacing_px) and vf.spacing_px > 0 else cell
             entry["arrow_scale"] = float(FM.auto_scale(vf)) * cell / s
+    mk = _marks(ds, marks, m, t, z, c)
+    if mk:
+        entry["marks"] = mk
     return entry
 
 
@@ -152,6 +182,15 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
       the whole table, so every view (position, frame, plane) shares one scale. Blank limits on a
       DIVERGING map are made symmetric about zero, so its neutral colour sits on 0 (the
       Viewer Field overlay's ``center_zero`` default). Typed limits are kept as typed.
+    * **Colour scale and marks** (2026-10-15, an IL-8 gradient interpolated from capture
+      beads). ``color_scale = log`` spaces the colours and the contour levels by ratio — a
+      decay spanning decades — over the positive values (a blank low limit is the 1st
+      percentile of the POSITIVE values). ``marks`` names a Point table on the same wire
+      whose rows of the viewed frame are drawn as white rings — the measured objects a map
+      was made from — each labelled with ``mark_label`` rounded to ``mark_decimals`` and
+      placed clear of the others, as Plot XY's Label by. The colour bar takes
+      ``color_label`` (blank: the column and its unit) and an arrow at an end the table's
+      values pass — an extrapolated core brighter than the scale says so.
     """
     FIG.require_matplotlib()
     ds: Dataset = ctx.inputs[0]
@@ -174,9 +213,35 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
     arrows = bool(ctx.params.get("arrows", True))
     every = max(1, int(ctx.params.get("arrow_every", 1) or 1))
     rng = FIG.parse_range(ctx.params.get("color_range", ""), socket="color_range")
+    scale = str(modes.get("color_scale", "linear"))
     lo, hi = FM.series_limits(ds, layer, col)
+    if scale == "log" and rng[0] is None and not lo > 0:
+        allv = np.asarray((FM.point_tables(ds).get(layer) or {}).get(col, []), dtype=float)
+        allv = allv[np.isfinite(allv) & (allv > 0)]
+        lo = float(np.percentile(allv, 1.0)) if allv.size else 1.0
     lo = rng[0] if rng[0] is not None else lo
     hi = rng[1] if rng[1] is not None else hi
+    if scale == "log" and not (lo > 0 and hi > lo):
+        raise ValueError(f"plot field: a log colour scale needs 0 < low < high; the range is "
+                         f"{lo:g} to {hi:g}. Type a Colour range with a positive low end, or "
+                         f"use the linear scale.")
+    mtab = ctx.layer("marks")
+    marks: Optional[Dict[str, Any]] = None
+    if mtab:
+        mcols = FM.point_tables(ds).get(mtab)
+        if mcols is None:
+            raise ValueError(f"plot field: Marks names the Point table {mtab!r}, which is not "
+                             f"on the wire; it carries {', '.join(FM.point_tables(ds)) or 'none'}.")
+        mlab = str(ctx.params.get("mark_label", "") or "")
+        if mlab and mlab not in mcols:
+            raise ValueError(f"plot field: the marks table {mtab!r} has no column {mlab!r}; it "
+                             f"has {', '.join(sorted(mcols))}.")
+        munit = ""
+        if mlab and np.asarray(mcols[mlab]).dtype.kind not in "USO":
+            from nodegraph.units import format_unit, unit_of
+            munit = format_unit(unit_of(ds, Domain.POINT, mlab, mtab), pretty=True)
+        marks = {"table": mtab, "label": mlab, "unit": munit,
+                 "decimals": max(0, int(ctx.params.get("mark_decimals", 0) or 0))}
     cm = str(modes.get("colormap", "auto"))
     cmap = cm if cm != "auto" else ("coolwarm" if lo < 0.0 < hi else "turbo")
     if cmap in _DIVERGING and rng[0] is None and rng[1] is None:
@@ -185,6 +250,10 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
         r = max(abs(lo), abs(hi))
         lo, hi = -r, r
     unit = FM.column_unit(ds, layer, col)
+    allv = np.asarray((FM.point_tables(ds).get(layer) or {}).get(col, []), dtype=float)
+    allv = allv[np.isfinite(allv)]
+    below = bool(allv.size and (allv < lo).any())
+    above = bool(allv.size and (allv > hi).any())
     # the INPUT's pixel size, not ctx.calib: a plot's own envelope carries no calibration
     # (a chart has no µm, and the Viewer must not draw a scale bar on it), so the image's
     # scale is read where it lives; the input's identity already keys the memo
@@ -203,10 +272,13 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
         "per": "view",
         "frames": [],
         "image_hw": [int(ax.y), int(ax.x)],
-        "draw": {"colormap": cmap, "range": [float(lo), float(hi)],
+        "draw": {"colormap": cmap, "range": [float(lo), float(hi)], "scale": scale,
                  "opacity": float(min(1.0, max(0.0, float(ctx.params.get("opacity", 0.6))))),
                  "contours": max(0, int(ctx.params.get("contours", 0) or 0)),
-                 "value_label": f"{col} ({unit})" if unit else col,
+                 "value_label": str(ctx.params.get("color_label", "") or "")
+                 or (f"{col} ({unit})" if unit else col),
+                 "extend": {(True, True): "both", (True, False): "min",
+                            (False, True): "max"}.get((below, above), "neither"),
                  "scale_bar": ({"um": bar_um, "px": bar_um / px_um}
                                if bar_um > 0 and px_um > 0 else None)},
         "axes": {"title": title,
@@ -214,6 +286,7 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
                  "y_label": str(ctx.params.get("y_label", "") or "")},
         "style": style,
         "source": {"table": layer, "value": col, "c": c},
+        "marks": marks,
     }
     extra = FIG.view_metadata(md_in, ax)
     _clock, t_labels = FIG.frame_clock(md_in, int(ax.t), ctx.calib("dt_s"))
@@ -236,7 +309,8 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
     def spec_at(m: int, t: int, z: int, side: int) -> Dict[str, Any]:
         """The whole spec of view ``(m, t, z)``, its background ≤ ``side`` px a side."""
         out = dict(template)
-        out["frames"] = [_frame_entry(ds, layer, col, m, t, z, c, side, arrows, every)]
+        out["frames"] = [_frame_entry(ds, layer, col, m, t, z, c, side, arrows, every,
+                                      marks)]
         out["per"] = "all"
         out["source"] = dict(template["source"], m=int(m), t=int(t), z=int(z))
         st = stamp(m, t, z)
@@ -247,14 +321,16 @@ def _compute_plot_field(ctx: EvalContext) -> Dataset:
 
     h, w = FIG.figure_pixels(style["width_mm"], style["height_mm"], style["dpi"])
     prov = FIG.ViewFigureProvider(template, spec_at, ax.m, ax.t, ax.z, h, w,
-                                  key=_view_key(template, ds, layer, col))
+                                  key=_view_key(template, ds, layer, col, marks))
     return FIG.picture_views(prov, extra)
 
 
-def _view_key(template: Dict[str, Any], ds: Dataset, layer: str, col: str) -> str:
+def _view_key(template: Dict[str, Any], ds: Dataset, layer: str, col: str,
+              marks: Optional[Dict[str, Any]] = None) -> str:
     """Everything a view's pixels depend on: the template (settings, limits, style), the
     drawing code, the input image's identity, the pixel size and frame interval, and the
-    field columns the raster and the arrows read. It keys the provider's cached views."""
+    field columns the raster and the arrows read — and the marks table's positions and
+    labels. It keys the provider's cached views."""
     import json
     from nodegraph.memo import digest
     cols = FM.point_tables(ds).get(layer) or {}
@@ -262,6 +338,13 @@ def _view_key(template: Dict[str, Any], ds: Dataset, layer: str, col: str) -> st
                          "vy", "vx", "vz") if k in cols]
     data = digest(*[np.ascontiguousarray(np.asarray(cols[k], dtype=float)).tobytes()
                     for k in names]) if names else ""
+    if marks:
+        mc = FM.point_tables(ds).get(marks["table"]) or {}
+        keys = [k for k in ("m", "t", "z", "c", "y", "x") if k in mc]
+        parts = [np.ascontiguousarray(np.asarray(mc[k], dtype=float)).tobytes() for k in keys]
+        if marks.get("label") in mc:
+            parts.append(repr(np.asarray(mc[marks["label"]]).tolist()).encode())
+        data = digest(data, *parts)
     img = getattr(ds, "image", None)
     try:
         img_id = repr(img.fingerprint()) if img is not None else "no image"
@@ -297,6 +380,9 @@ register_node(
                              "blank "
                              "is also made symmetric about zero so white means 0. A peak "
                              "beyond the range saturates: type a wider range to see it."),
+        InString("color_label", "Colour bar label", field=False, default="",
+                 description="The colour bar's title. Blank uses the value column's name and "
+                             "unit. Changes the picture only."),
         InFloat("opacity", "Opacity", unit="", field=False, default=0.6,
                 description="How opaque the colour map is over the image, 0 to 1. Lower "
                             "shows more of the image; 1 hides it under the field."),
@@ -311,6 +397,19 @@ register_node(
                           "Only read when Arrows is on."),
         InInt("contours", "Contours", unit="", field=False, default=0,
               description="How many iso-lines to draw over the colour map; 0 draws none."),
+        InString("marks", "Marks", field=False, default="", layer_in=Domain.POINT,
+                 description="A Point table drawn as white rings over the map — the measured "
+                             "objects a field was interpolated from (Gradient Map writes them "
+                             "as `<name>_objects`). Only rows of the frame shown are drawn. "
+                             "Blank draws none. Changes no measurement."),
+        InString("mark_label", "Mark label", field=False, default="", column_in=Domain.POINT,
+                 column_from="marks",
+                 description="A column of the marks table printed beside each ring — the "
+                             "bead's own measured value, say — placed clear of the others. "
+                             "Blank prints none. Only read with Marks set."),
+        InInt("mark_decimals", "Mark decimals", unit="", field=False, default=0,
+              description="Decimal places of a numeric mark label: 0 prints 918, 1 prints "
+                          "918.7. Rounding only. Only read with Marks and Mark label set."),
         InFloat("scale_bar_um", "Scale bar", unit="um", field=False, default=0.0,
                 description="The scale bar's length in µm; 0 picks a round length about a "
                             "fifth of the field. No bar without a pixel size."),
@@ -330,11 +429,25 @@ register_node(
                             "safe — the accessible choice for a one-signed quantity.",
                  "magma": "Black through red to pale yellow, perceptually uniform — strong "
                           "contrast where the field peaks.",
+                 "inferno": "Black through red and orange to pale yellow, perceptually "
+                            "uniform — a heat scale where the source glows; dark areas stay "
+                            "dark over a dark background, so raise the opacity.",
                  "cividis": "Blue to yellow, designed to read the same for the common "
                             "colour-vision deficiencies.",
                  "coolwarm": "Blue through white to red, diverging — for a signed quantity "
                              "whose zero must read as neutral. Blank limits are centred on "
                              "zero.",
+             }),
+        Mode("color_scale", list(_SCALES), default="linear", label="Colour scale",
+             description="How the field's values map onto the colours, and how the "
+                         "contour levels are spaced. Changes the picture only.",
+             choice_docs={
+                 "linear": "Equal steps in value are equal steps in colour and equal gaps "
+                           "between contours — a decay reads as it is: a hot core that fades "
+                           "fast, with the far field in the bottom colours.",
+                 "log": "Equal RATIOS are equal steps — a field spanning decades shows "
+                        "structure everywhere and contours fall at 1, 2, 5, … ratios. Zero "
+                        "and below are not drawn; needs a positive low limit.",
              }),
         *FIG.style_modes(palette=False),
     ],
