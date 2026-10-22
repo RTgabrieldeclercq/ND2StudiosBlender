@@ -2,9 +2,9 @@
  "CON-01": {
   "anchors": {
    "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
-   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
+   "sym:nodegraph.registry.define_node": "c4178e54a87548c0be0f7a7abb2397c1"
   },
-  "blessed": "2026-10-06",
+  "blessed": "2026-10-22",
   "file": "codemap/concepts.md"
  },
  "CON-02": {
@@ -89,9 +89,9 @@
  "CON-12": {
   "anchors": {
    "sym:nodegraph.registry.SocketSpec": "e2b4360003ef3d619631e8bd0a633d3f",
-   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
+   "sym:nodegraph.registry.define_node": "c4178e54a87548c0be0f7a7abb2397c1"
   },
-  "blessed": "2026-10-06",
+  "blessed": "2026-10-22",
   "file": "codemap/concepts.md"
  },
  "CON-13": {
@@ -275,9 +275,9 @@
  },
  "INV-03": {
   "anchors": {
-   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
+   "sym:nodegraph.registry.define_node": "c4178e54a87548c0be0f7a7abb2397c1"
   },
-  "blessed": "2026-10-06",
+  "blessed": "2026-10-22",
   "file": "codemap/invariants.md"
  },
  "INV-04": {
@@ -417,9 +417,9 @@
   "anchors": {
    "sym:nodegraph.catalog._base.register_node": "9c9411513b02cad417491606de4447f0",
    "sym:nodegraph.catalog.module_order": "1ae7d144cb5031219d2c60724c714e67",
-   "sym:nodegraph.registry.define_node": "acfd601d328d2e2e6873b2a9ad876590"
+   "sym:nodegraph.registry.define_node": "c4178e54a87548c0be0f7a7abb2397c1"
   },
-  "blessed": "2026-10-06",
+  "blessed": "2026-10-22",
   "file": "codemap/workflows.md"
  },
  "WF-05": {

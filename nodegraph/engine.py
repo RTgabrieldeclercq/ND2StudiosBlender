@@ -801,6 +801,8 @@ class Engine:
         if spec is not None:
             drop = {i.name for i in spec.inputs if getattr(i, "presentation", False)}
             params = {k: v for k, v in params.items() if k not in drop}
+            if spec.file_identity is not None:       # the file it reads, as the memo keys it
+                params["__file_identity__"] = spec.identity_of_file(node.params, state)
         source: Any = None
         if not preds:
             source = self._source_identity(node_id)
@@ -895,6 +897,11 @@ class Engine:
 
         # fold the mode/toggle state into params so the lever re-keys the memo
         params = {**node.params, "__modes__": dict(state)}
+        # A compute that reads a FILE outside the graph (Load Table) names its identity —
+        # path, size, mtime — so an in-place rewrite re-keys. Read per lookup, like the code
+        # fingerprint below, so a file changed between two pulls on one Engine is a miss.
+        if spec is not None and spec.file_identity is not None:
+            params["__file_identity__"] = spec.identity_of_file(node.params, state)
         # A source node's payload comes from OUTSIDE the recipe (a seed or provider), so
         # its identity must enter the key or two distinct sources with the same op+params
         # collide and share one cached payload (review #3). A provider's data-version

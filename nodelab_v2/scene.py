@@ -243,6 +243,9 @@ class GraphScene(QGraphicsScene):
     #: shape (and same handler in the window) as the inspector's, so baking from the
     #: canvas and baking from the panel are literally one code path.
     dock_action = Signal(str, str)
+    #: a card's ACTION button (2026-10-22, :mod:`nodelab_v2.card_actions`) — ``(node_id,
+    #: action key)``, forwarded to the window exactly like the inspector's button.
+    card_action = Signal(str, str)
     #: a source card's context-menu *Ingest this file* — the same thing double-clicking a
     #: not-yet-ingested source does, spelled out for discoverability.
     ingest_requested = Signal(str)
@@ -426,6 +429,7 @@ class GraphScene(QGraphicsScene):
                 item = NodeItem(rec, self.doc)
                 item.delete_requested.connect(self._on_delete_requested)
                 item.pick_requested.connect(self.pick_requested)
+                item.card_action.connect(self.card_action)
                 self.addItem(item)
                 self.node_items[nid] = item
         self._run = {k: v for k, v in self._run.items() if k in self.node_items}

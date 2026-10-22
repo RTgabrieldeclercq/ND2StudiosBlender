@@ -172,6 +172,8 @@ class SpreadsheetPanel(QWidget):
         self._tables: Dict[Tuple[str, Optional[str]], Dict[str, np.ndarray]] = {}
         self.dataset = None                       # the last shown Dataset (for export)
         self.node_id: Optional[str] = None
+        #: the page ``node_id`` is on — what the export's origin record names (2026-10-22)
+        self.page_id: Optional[str] = None
 
     def restyle(self) -> None:
         self.setStyleSheet(f"""
@@ -191,9 +193,10 @@ class SpreadsheetPanel(QWidget):
                 color:{T.INK.name()}; }}
         """ + T.controls_qss())
 
-    def show_dataset(self, node_id: str, dataset) -> None:
+    def show_dataset(self, node_id: str, dataset, page_id: Optional[str] = None) -> None:
         self.dataset = dataset
         self.node_id = node_id
+        self.page_id = page_id
         self._tables = all_tables(dataset)
         self._pick.blockSignals(True)
         self._pick.clear()

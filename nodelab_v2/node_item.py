@@ -60,6 +60,7 @@ from nodegraph.registry import NODES
 from nodegraph.sockets import SocketType
 from nodelab_v2 import multilink as ML
 from nodelab_v2 import theme as T
+from nodelab_v2.card_actions import actions_for
 from nodelab_v2.document import (
     BATCH_OP, BUNDLE_PATHS_KEY, GraphDocument, NodeRecord, TITLE_KEY, UNBATCH_OP)
 from nodelab_v2.ops import (DOCK_OP, PAGE_INPUT_OP, PAGE_NAME_KEY, PAGE_OUTPUT_OP,
@@ -591,6 +592,10 @@ class NodeItem(QGraphicsObject):
     #: which arms the viewer. The same request the inspector's Pick button sends, built by
     #: the same function, so a pick means the same thing from either surface.
     pick_requested = Signal(object)
+    #: a card ACTION button was clicked (2026-10-22, :mod:`nodelab_v2.card_actions`):
+    #: ``(node_id, action key)``, re-emitted by the scene up to the window, which carries it
+    #: out — the same signal the inspector's button sends.
+    card_action = Signal(str, str)
 
     def __init__(self, rec: NodeRecord, doc: GraphDocument) -> None:
         super().__init__()
@@ -1102,6 +1107,10 @@ class NodeItem(QGraphicsObject):
             # the grouping row (2026-10-07): Group selected (+ Ungroup) under the outputs
             self._rows.append(("split", None, y))
             y += T.ROW_H
+        if self._card_actions():
+            # the action row (2026-10-22): a note and the card's buttons, under everything
+            self._rows.append(("action", None, y))
+            y += T.ROW_H
         self._height = y + T.PAD_BOTTOM
         if self._switch is not None:
             self._switch.set_allow_3d(not self.z_is_one())
@@ -1195,16 +1204,19 @@ class NodeItem(QGraphicsObject):
         want = ([s.name for s in self._card_inputs()],
                 [s.name for s in self._active_outputs()],
                 [m.name for m in self._active_modes() if self._modes_on_rows(m)],
-                self._split_checkable())
+                self._split_checkable(), bool(self._card_actions()))
         have = ([k[1] for k in self._sockets if k[0] == "in"],
                 [k[1] for k in self._sockets if k[0] == "out"],
                 [r[1].name for r in self._rows if r[0] == "mode"],
-                any(r[0] == "split" for r in self._rows))
+                any(r[0] == "split" for r in self._rows),
+                any(r[0] == "action" for r in self._rows))
         collapse_changed = getattr(self, "_shown_collapsed", None) != self.rec.collapsed
         if want != have or collapse_changed:
             self._shown_collapsed = self.rec.collapsed
             self._layout()
         else:
+            if self._card_actions():
+                self._apply_card_tip()          # the action's note follows the file chosen
             if self._switch is not None:
                 self._switch.set_allow_3d(not self.z_is_one())
                 if self._switch.dim != self.dim:
@@ -1588,6 +1600,8 @@ class NodeItem(QGraphicsObject):
                 self._paint_value_pill(p, y, f"{val} ▾", None, False, obj=obj)
             elif kind == "split":
                 self._paint_split_row(p, y)
+            elif kind == "action":
+                self._paint_action_row(p, y)
             elif kind == "out":
                 p.setFont(lf); p.setPen(T.INK)
                 text = self._output_row_text(obj)    # "K · name" on chK; a channel on out
@@ -1654,6 +1668,51 @@ class NodeItem(QGraphicsObject):
             p.drawText(g_rect, Qt.AlignCenter, _GROUP_TXT)
         if u_rect is not None:
             self._paint_pill_at(p, u_rect, _UNGROUP_TXT, "", False, hot=(hot_kind == "ungroup"))
+
+    def _card_actions(self) -> list:
+        """This card's action buttons (:mod:`nodelab_v2.card_actions`) — none on a dot or a
+        collapsed card, which have no row to put them on."""
+        if self._is_dot or self.rec.collapsed:
+            return []
+        return actions_for(self.rec)
+
+    def _action_rects(self, y: float) -> list:
+        """``[(CardAction, QRectF)]`` — the buttons right-aligned on the action row, in
+        declaration order. THE geometry both :meth:`paint` and :meth:`controls` use."""
+        fm = QFontMetricsF(QFont(T.MONO, 8))
+        right = T.NODE_W - 12
+        out = []
+        for act in reversed(self._card_actions()):
+            w = fm.horizontalAdvance(act.label) + 16
+            out.append((act, QRectF(right - w, y + 4, w, T.ROW_H - 8)))
+            right -= w + 6
+        return list(reversed(out))
+
+    def _paint_action_row(self, p: QPainter, y: float) -> None:
+        """The action row (2026-10-22): the first action's note, muted and elided, on the
+        left (``source WellA3.nd2``), the buttons on the right — dimmed while an action
+        cannot run, so it reads as waiting rather than broken; its hover says why."""
+        rects = self._action_rects(y)
+        if not rects:
+            return
+        left = rects[0][1].left() - 8
+        note = rects[0][0].note
+        if note and left > 24:
+            nf = QFont(T.SANS, 8)
+            p.setFont(nf); p.setPen(T.MUTED)
+            p.drawText(QRectF(14, y, left - 14, T.ROW_H), Qt.AlignVCenter | Qt.AlignLeft,
+                       QFontMetricsF(nf).elidedText(note, Qt.ElideMiddle, left - 14))
+        hot = self._hot_ctl if (self._hot_ctl is not None
+                                and self._hot_ctl.kind == "action") else None
+        for act, r in rects:
+            if act.enabled:
+                self._paint_pill_at(p, r, act.label, "", False,
+                                    hot=(hot is not None and hot.obj == act.key))
+            else:
+                p.setPen(QPen(T.alpha(T.BORDER, 150), 1)); p.setBrush(T.alpha(T.BODY, 120))
+                p.drawRoundedRect(r, 5, 5)
+                p.setFont(QFont(T.MONO, 8)); p.setPen(T.alpha(T.MUTED, 170))
+                p.drawText(r, Qt.AlignCenter, act.label)
 
     def _paint_domain_chips(self, p: QPainter, x: float, y: float, domains,
                             *, align_left: bool, missing=frozenset()) -> None:
@@ -1897,6 +1956,10 @@ class NodeItem(QGraphicsObject):
                 out.append(Ctl(g_rect, "group", None))
                 if u_rect is not None:
                     out.append(Ctl(u_rect, "ungroup", None))
+            elif kind == "action":
+                # ``obj`` is the action's KEY: the window dispatches on it
+                for act, r in self._action_rects(y):
+                    out.append(Ctl(r, "action", act.key))
             elif kind == "in" and obj.type is not SocketType.DATASET:
                 derived = self.is_derived(obj)
                 pill = self._pill_rect(y, self._pill_text(obj),
@@ -2112,6 +2175,7 @@ class NodeItem(QGraphicsObject):
         txt = self._run_text()
         if txt:
             parts.append(txt)
+        parts.extend(a.tip for a in self._card_actions() if a.tip)
         self.setToolTip("\n".join(parts) if len(parts) > 1 else "")
 
     @staticmethod
@@ -2384,6 +2448,9 @@ class NodeItem(QGraphicsObject):
         elif ctl.kind == "ungroup":
             if self.doc.split_ungroup(self.rec.id):
                 self._after_split_edit()
+        elif ctl.kind == "action":
+            # a disabled action still reaches the window, which says why it cannot run
+            self.card_action.emit(self.rec.id, str(ctl.obj))
         elif ctl.kind == "pin":
             self._toggle_pin(ctl.obj)
         elif ctl.kind == "pick":

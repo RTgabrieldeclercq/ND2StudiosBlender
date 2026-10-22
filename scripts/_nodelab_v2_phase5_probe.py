@@ -10079,6 +10079,113 @@ def main(argv) -> int:
         "a new payload even when the channel names do not change, and Info opens the series' "
         "local frame times, the source file's sections, every channel and the raw text")
 
+    # ── LT1 / LT2: Load Table — an export's origin on the card, and Load file (2026-10-22) ──
+    import tifffile as _tiffLT
+    from nodegraph import table_file as _TFLT
+    from nodegraph.dataset import AxisSizes as _AxLT, Dataset as _DsLT
+    from nodegraph.domains import Domain as _DomLT
+    from nodegraph.structure import StructureTable as _STLT
+    from nodelab_v2.export import export_context as _ectxLT, export_dataset as _edsLT
+    from nodelab_v2.workspace import qualify as _qLT
+    win.file_new()
+    app.processEvents()
+    _wsLT = win.workspace
+    _inLT = next(p.id for p in _wsLT.pages.values() if p.kind == "input")
+    _anLT = next(p.id for p in _wsLT.pages.values() if p.kind == "analyze")
+    _dLT = tempfile.mkdtemp(prefix="nd2lt_")
+    _tifLT = os.path.join(_dLT, "spotsrc.tif")
+    _tiffLT.imwrite(_tifLT, np.full((2, 30, 32), 500, np.uint16), metadata={"axes": "ZYX"})
+    _dsLT = _DsLT(axes=_AxLT(m=1, t=1, z=2, c=1, y=30, x=32),
+                  metadata={"pixel_size_um": 0.5, "source_path": [_tifLT],
+                            "source_file": ["spotsrc.tif"]}).with_structure(_STLT(
+        _DomLT.POINT, {"id": np.arange(3), "m": np.zeros(3, np.int64),
+                       "t": np.zeros(3, np.int64), "c": np.zeros(3, np.int64),
+                       "z": np.array([0, 1, 1]), "y": np.array([5.0, 10.0, 20.0]),
+                       "x": np.array([6.0, 12.0, 24.0]), "mfi": np.array([1.0, 2.0, 3.0])},
+        layer="spots", z_kind="plane_index"))
+    _pqLT = os.path.join(_dLT, "spots.parquet")
+    _edsLT(_dsLT, _pqLT, _ectxLT(_wsLT, _anLT, "n1", None))
+    _recLT = _TFLT.read_origin(_pqLT)
+    assert _recLT["page"]["kind"] == "analyze" and _recLT["source_files"] == [_tifLT], _recLT
+    win._show_page(win._main_canvas, _anLT)
+    app.processEvents()
+    _ltLT = win.doc.add_node("io.load_table", x=420.0, y=200.0, params={"path": _pqLT})
+    app.processEvents()
+    _itLT = win.scene.node_items[_ltLT.id]
+    _actsLT = [c for c in _itLT.controls() if c.kind == "action"]
+    assert len(_actsLT) == 1 and _actsLT[0].obj == "load_source", _actsLT
+    assert "spotsrc.tif" in _itLT.toolTip(), _itLT.toolTip()
+    win.scene.clearSelection()
+    _itLT.setSelected(True)
+    for _ in range(3):
+        app.processEvents()
+    _rowsLT = dict(win.inspector._last_table_origin)
+    assert _rowsLT.get("Source", "").endswith("(found)"), _rowsLT
+    assert "(analyze)" in _rowsLT.get("Page", ""), _rowsLT
+    _ok("LT1 Load Table: an export's origin record (page, source) is on the card's hover and "
+        "in the inspector's Origin section, and the card carries one Load file action")
+
+    # LT2 the card's Load file: the TIFF lands on Image Input (published), a Page Input on
+    # the Analysis page reads it into Load Table, Onto flips to image, and the pull carries
+    # the table ON the image; a second press adds nothing
+    _doneLT: list = []
+    win.runner.finished.connect(lambda nid, payload, *a: _doneLT.append((nid, payload)))
+    _itLT.card_action.emit(_ltLT.id, "load_source")
+    app.processEvents()
+    _docInLT = _wsLT.pages[_inLT].doc
+    _loadsLT = [r for r in _docInLT.nodes.values() if r.op_key == "io.load"]
+    assert len(_loadsLT) == 1 and os.path.normcase(_loadsLT[0].params["path"]) == \
+        os.path.normcase(_tifLT), [r.params for r in _loadsLT]
+    assert "spotsrc" in [n for n, _ in _wsLT.outputs_of(_inLT)], _wsLT.outputs_of(_inLT)
+    _docAnLT = _wsLT.pages[_anLT].doc
+    _pinsLT = [r for r in _docAnLT.nodes.values() if r.op_key == "page.input"
+               and r.params.get("source") == f"{_inLT}:spotsrc"]
+    assert len(_pinsLT) == 1, [r.params for r in _docAnLT.nodes.values()]
+    assert (_pinsLT[0].id, "out", _ltLT.id, "data") in set(_docAnLT.edges), _docAnLT.edges
+    assert _docAnLT.nodes[_ltLT.id].modes.get("onto") == "image"
+    assert _wsLT.active == _anLT, "back on the Load Table's page"
+    _ridLT = _qLT(_anLT, _ltLT.id)
+    _t0LT = time.time()
+    while _ridLT not in [n for n, _p in _doneLT] and time.time() - _t0LT < 240:
+        app.processEvents()
+        time.sleep(0.005)
+    _payLT = next((p for n, p in _doneLT if n == _ridLT), None)
+    assert _payLT is not None, ("Load Table did not pull after Load file", _doneLT[-3:])
+    assert _payLT.image is not None and _payLT.axes.z == 2, _payLT.axes
+    assert list(_payLT.get(_DomLT.POINT, "mfi", "spots").values) == [1.0, 2.0, 3.0]
+    _itLT.card_action.emit(_ltLT.id, "load_source")
+    app.processEvents()
+    assert len([r for r in _docInLT.nodes.values() if r.op_key == "io.load"]) == 1
+    assert len([r for r in _docAnLT.nodes.values() if r.op_key == "page.input"
+                and r.params.get("source") == f"{_inLT}:spotsrc"]) == 1, "reused, not added"
+    # on the Image Input page itself a Page Input cannot read its own page: the existing
+    # source card is wired in directly
+    win._show_page(win._main_canvas, _inLT)
+    app.processEvents()
+    _lt2LT = win.doc.add_node("io.load_table", x=620.0, y=460.0, params={"path": _pqLT})
+    app.processEvents()
+    win.scene.node_items[_lt2LT.id].card_action.emit(_lt2LT.id, "load_source")
+    app.processEvents()
+    assert (_loadsLT[0].id, "image", _lt2LT.id, "data") in set(win.doc.edges), win.doc.edges
+    assert len([r for r in win.doc.nodes.values() if r.op_key == "io.load"]) == 1
+    # each press ends in a pull: let the queue drain (the slot empty for a quiet half
+    # second) so no worker thread is mid-run when the probe exits
+    _t1LT, _quietLT = time.time(), None
+    while time.time() - _t1LT < 180:
+        app.processEvents()
+        if win.runner.busy:
+            _quietLT = None
+        elif _quietLT is None:
+            _quietLT = time.time()
+        elif time.time() - _quietLT > 0.5:
+            break
+        time.sleep(0.005)
+    assert not win.runner.busy, "the Load file pulls did not finish"
+    _ok("LT2 Load file: the source TIFF is loaded on Image Input and published, a Page Input "
+        "on the Analysis page wires it into Load Table (Onto → image) and the pull carries "
+        "the table on the image; a second press reuses both; on Image Input itself the "
+        "existing card is wired in directly")
+
     # the analysis lanes (2026-10-09): a spawned process pool keeps a management thread and
     # its worker processes alive; tear them down before os._exit rather than under it, the
     # same discipline as the LabLink panel above

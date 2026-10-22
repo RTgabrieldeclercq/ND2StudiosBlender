@@ -625,6 +625,7 @@ class MainWindow(QMainWindow):
         # Only the window has the runner (to run it), the document (to record it) and the
         # dormant set (to release what the bake made redundant).
         self.inspector.dock_action.connect(self._on_dock_action)
+        self.inspector.card_action.connect(self._inspector_card_action)
         self.inspector.iterate_action.connect(self._on_iterate_action)
         self.inspector.movie_action.connect(self._on_movie_action)
         self.inspector.reload_requested.connect(self.reload_node_type)
@@ -1014,7 +1015,8 @@ class MainWindow(QMainWindow):
         self._sync_solo(push=False)
         nid, ds = v.showing()
         if ds is not None and nid:
-            self.sheet.show_dataset(split_run_id(nid)[1], ds)
+            _pid, _nid = split_run_id(nid)
+            self.sheet.show_dataset(_nid, ds, page_id=_pid or None)
 
     def _prune_viewers(self) -> None:
         """A panel came or went: forget every reference to a viewer that was closed, and
@@ -1131,6 +1133,7 @@ class MainWindow(QMainWindow):
         sc.ingest_requested.connect(self.ingest_source)
         sc.pick_requested.connect(self._arm_pick)
         sc.dock_action.connect(self._on_dock_action)
+        sc.card_action.connect(part(self._on_card_action, page_id))
         sc.topology_refused.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         sc.multilink_note.connect(lambda msg: self.statusBar().showMessage(msg, 8000))
         sc.topology_gate = self._scene_topology_gate
@@ -4644,6 +4647,173 @@ class MainWindow(QMainWindow):
         return (isinstance(bd, (int, float)) and not isinstance(bd, bool)
                 and 0 < int(bd) <= 16)
 
+    # ── card actions (2026-10-22, nodelab_v2.card_actions) ─────────────────────────────
+    def _on_card_action(self, page_id: Optional[str], node_id: str, action: str) -> None:
+        """A card's action button, from the card (``page_id`` its scene's page) or the
+        inspector — one handler, so the two surfaces cannot do different things."""
+        from nodelab_v2.card_actions import LOAD_SOURCE_ACTION
+        if action == LOAD_SOURCE_ACTION:
+            self.load_table_source(node_id, page_id)
+
+    def _inspector_card_action(self, node_id: str, action: str) -> None:
+        """The inspector's action button: the page is the one whose document holds the
+        inspected card (node ids repeat across pages, so the id alone cannot say)."""
+        node = getattr(self.inspector, "_node", None)
+        doc = getattr(node, "doc", None)
+        pid = next((p.id for p in self.workspace.pages.values() if p.doc is doc), None)
+        self._on_card_action(pid, node_id, action)
+
+    @staticmethod
+    def _same_files(rec, paths: List[str]) -> bool:
+        """Whether ``io.load`` card ``rec`` reads exactly ``paths`` (a bundle: all of them,
+        in order) — compared as normalised absolute paths."""
+        import os
+        from nodelab_v2.runner import BUNDLE_PATHS_KEY
+        got = rec.params.get(BUNDLE_PATHS_KEY) or [rec.params.get("path")]
+        norm = [os.path.normcase(os.path.abspath(str(x))) for x in got if x]
+        return norm == [os.path.normcase(os.path.abspath(x)) for x in paths]
+
+    def _published_name(self, page_id: str, paths: List[str]) -> str:
+        """The Page Output name under which page ``page_id`` already publishes a source
+        card reading ``paths`` — publishing an unpublished one first — else ``""``."""
+        page = self.workspace.pages.get(page_id)
+        if page is None:
+            return ""
+        doc = page.doc
+        for r in list(doc.nodes.values()):
+            if r.op_key != LOAD_OP or not self._same_files(r, paths):
+                continue
+            # the WHOLE dataset (`image`): an Output fed from one channel's tap would put
+            # the table on that channel alone
+            for (src, ssock, dst, dsock) in doc.edges:
+                out = doc.nodes.get(dst)
+                if src == r.id and ssock == "image" and out is not None \
+                        and out.op_key == PAGE_OUTPUT_OP and dsock == "data":
+                    name = str(out.params.get(PAGE_NAME_KEY) or "").strip()
+                    if name:
+                        return name
+            if not self._topology_ok(doc):
+                return ""
+            if self.workspace.active != page_id:
+                self._show_page(self._canvas, page_id)
+            out = self._publish_source(r, str(r.params.get("path") or ""))
+            return str(out.params.get(PAGE_NAME_KEY) or "")
+        return ""
+
+    def load_table_source(self, node_id: str, page_id: Optional[str] = None) -> bool:
+        """Load Table's *Load file* (2026-10-22): put the image a table was exported from
+        under it.
+
+        The table's origin record names its source file(s) (:mod:`nodegraph.table_file`).
+        Each is looked for at its recorded path, then beside the table file (the two moved
+        together, or came from the other machine), then asked for. The file then lands
+        where every loaded image lands — the Image Input page, published as a Page Output —
+        unless that page already reads it, in which case the existing card is reused (and
+        published if it was not). On the Load Table's own page a Page Input reading that
+        output is found or added, wired into the node's ``data``, and ``onto`` is set to
+        ``image``; the node is then pulled, so the Viewer shows the table over the image it
+        was measured on. Several source files (a bundle) load as one bundle card, which is
+        what lays their positions out in the order the table's ``m`` counts them.
+
+        On a page that cannot read the Image Input page — the Image Input page itself, or a
+        Free-only workspace — the source card goes on the node's own page and is wired in
+        directly. Returns whether the node was wired."""
+        import os
+        from nodegraph import table_file as TF
+        from nodelab_v2.card_actions import LOAD_TABLE_OP
+        ws = self.workspace
+        pid = page_id or ws.active or ""
+        page = ws.pages.get(pid)
+        rec = page.doc.nodes.get(node_id) if page is not None else None
+        if rec is None or rec.op_key != LOAD_TABLE_OP:
+            return False
+
+        def say(msg: str) -> None:
+            self.statusBar().showMessage(msg, 12000)
+
+        path = TF.clean_path(rec.params.get("path"))
+        if not path or not os.path.isfile(path):
+            say("Load file: choose the table file first — Load Table's File, Browse…")
+            return False
+        recorded = TF.source_files(TF.read_origin(path))
+        if not recorded:
+            QMessageBox.information(
+                self, "No source file recorded",
+                f"{os.path.basename(path)} names no source image, so there is nothing to "
+                f"load. Wire the image into Load Table by hand and set Onto to image.")
+            return False
+        paths: List[str] = []
+        for s in recorded:
+            here = TF.locate_source(s, path)
+            if not here:
+                here, _f = QFileDialog.getOpenFileName(
+                    self, f"Where is {os.path.basename(s.replace(chr(92), '/'))} now?",
+                    os.path.dirname(os.path.abspath(path)),
+                    "Microscopy images (*.nd2 *.tif *.tiff);;All files (*)")
+                if not here:
+                    say("Load file cancelled — the source image was not found")
+                    return False
+            paths.append(os.path.abspath(here))
+        if not self._topology_ok(page.doc):
+            return False
+
+        inp = self._input_page(create=False)
+        direct = inp is None or page.kind == "input"
+        x, y = float(rec.x) - 300.0, float(rec.y)
+        if direct:
+            src = next((r for r in page.doc.nodes.values()
+                        if r.op_key == LOAD_OP and self._same_files(r, paths)), None)
+            if src is None:
+                if ws.active != pid:
+                    self._show_page(self._canvas, pid)
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    src = (self._add_bundle_node(paths, x, y) if len(paths) > 1
+                           else self._add_source_node(paths[0], x, y))[0]
+                except Exception as exc:  # noqa: BLE001 — a reader failure, said once
+                    QApplication.restoreOverrideCursor()
+                    QMessageBox.warning(self, "Load file failed", f"{exc}")
+                    return False
+                QApplication.restoreOverrideCursor()
+            feed, sock, where = src.id, "image", "on this page"
+        else:
+            name = self._published_name(inp, paths) if inp else ""
+            if not name:
+                outs = self._load_source_paths(paths, group=len(paths) > 1, preview=False)
+                if not outs:
+                    say("Load file: the source image did not load — see the message above")
+                    return False
+                inp = self._input_page(create=False) or inp
+                name = str(outs[0].params.get(PAGE_NAME_KEY) or "")
+            if ws.active != pid:
+                self._show_page(self._canvas, pid)
+            page = ws.pages[pid]                     # Make unique swaps the page's document
+            source = f"{inp}:{name}"
+            pin = next((r for r in page.doc.nodes.values() if r.op_key == PAGE_INPUT_OP
+                        and str(r.params.get(PAGE_SOURCE_KEY) or "") == source), None)
+            if pin is None:
+                pin = page.doc.add_node(PAGE_INPUT_OP, x=x + 20.0, y=y,
+                                        params={PAGE_SOURCE_KEY: source})
+            feed, sock = pin.id, "out"
+            where = f"through a Page Input reading “{name}” on {ws.pages[inp].name}"
+        rec = page.doc.nodes.get(node_id)
+        if rec is None:
+            return False
+        rec.modes["onto"] = "image"              # gates `data` in before it is wired
+        page.doc.touch(node_id)
+        try:
+            page.doc.connect(feed, sock, node_id, "data")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Load file", f"Could not wire the image in: {exc}")
+            return False
+        item = self.scene_for(pid).node_items.get(node_id)
+        if item is not None:
+            item.refresh()
+        self.pull_node(node_id, page_id=pid)
+        say(f"Load file: {', '.join(os.path.basename(p) for p in paths)} wired into "
+            f"Load Table {where}; Onto is image")
+        return True
+
     def _on_dock_action(self, node_id: str, action: str) -> None:
         """Everything a Dock node's buttons and menu can ask for."""
         rec = self.doc.nodes.get(node_id)
@@ -5728,7 +5898,7 @@ class MainWindow(QMainWindow):
         if act is not None and act in panes:
             # the spreadsheet and the sweep table follow the ACTIVE viewer: a delivery to
             # another viewer must not yank them off the node being tuned
-            self.sheet.show_dataset(node_id, payload)
+            self.sheet.show_dataset(node_id, payload, page_id=pid or None)
             if on_active:
                 self._record_sweep(node_id, payload)
         for pane in panes:
@@ -6408,7 +6578,7 @@ class MainWindow(QMainWindow):
 
     @_needs_source_page
     def _load_source_paths(self, paths: list, group: bool = False,
-                           chain_axis: str = "") -> None:
+                           chain_axis: str = "", preview: bool = True) -> list:
         """Drop one ``io.load`` card per path, stacked, selected, and scrolled into view —
         or, with ``group``, ONE bundle card carrying all of them.
 
@@ -6430,13 +6600,18 @@ class MainWindow(QMainWindow):
         (the CRC_TF_ELISA ``_Seq`` series: 8, 8, 8, 7, 7 frames), which is exactly what the
         builder accepts; dropping it left the user five unrelated sources and no series.
         Onto M there is nothing to build, and past the builder's slot ceiling the cards
-        load unwired and the status bar says why."""
+        load unwired and the status bar says why.
+
+        Returns the Page Outputs that publish what loaded (empty on a Free-only workspace,
+        or when nothing did) — what Load Table's *Load file* binds its Page Input to.
+        ``preview=False`` skips pulling the new source into the Viewer, for a caller that
+        pulls something else straight after."""
         import os
         from nodegraph.catalog.util.timeseries import MAX_FILES as _TS_SLOTS
 
         publish = self._begin_source_load()     # V4.00 step 11: onto the Image Input page
         if publish is None:
-            return                              # a linked Input page refused; hint shown
+            return []                           # a linked Input page refused; hint shown
         c = self.view.mapToScene(self.view.viewport().rect().center())
         x, y = c.x() - 107, c.y() - 40
         added: list = []
@@ -6460,8 +6635,9 @@ class MainWindow(QMainWindow):
                 box.setDefaultButton(sep)
                 box.exec()
                 if box.clickedButton() is sep:
-                    self._load_source_paths(paths, group=False, chain_axis=chain_axis)
-                return
+                    return self._load_source_paths(paths, group=False, chain_axis=chain_axis,
+                                                   preview=preview)
+                return []
             QApplication.restoreOverrideCursor()
             chain = None
             if chain_axis and chain_axis != "M":
@@ -6492,8 +6668,9 @@ class MainWindow(QMainWindow):
             if outs:
                 self.statusBar().showMessage(
                     self.statusBar().currentMessage() + self._published_note(outs))
-                self.pull_node(rec.id)          # the Viewer shows what was loaded
-            return
+                if preview:
+                    self.pull_node(rec.id)      # the Viewer shows what was loaded
+            return outs
 
         # A sequence that could not share one card still becomes ONE series: the cards go
         # into a Timeseries Builder, and the builder (not each card) is what gets published.
@@ -6557,7 +6734,7 @@ class MainWindow(QMainWindow):
                 f"Could not read {len(failed)} of {len(paths)} file(s):\n\n{detail}"
                 + (f"\n\nThe other {len(added)} loaded." if added else ""))
         if not added:
-            return
+            return outs
         if len(added) == 1:
             rec, axes = added[0]
             self.statusBar().showMessage(
@@ -6580,7 +6757,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 self.statusBar().currentMessage() + self._published_note(outs))
             # the Viewer shows what was loaded -- the built series, when there is one
-            self.pull_node(chain.id if chain is not None else added[0][0].id)
+            if preview:
+                self.pull_node(chain.id if chain is not None else added[0][0].id)
+        return outs
 
     def file_open(self) -> None:
         path, _f = QFileDialog.getOpenFileName(self, "Open graph", "", FILE_FILTER)
@@ -6638,7 +6817,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"saved {path}")
 
     def file_export(self) -> None:
-        from nodelab_v2.export import export_dataset
+        """File → Export table…: the Spreadsheet's Dataset as one long-form CSV / Parquet /
+        Arrow file, with its ORIGIN RECORD (2026-10-22) — the graph, page and node it came
+        from, the chain in front of it, the source image — inside the file (a CSV's beside
+        it, ``<file>.origin.json``), which is what Load Table reads back."""
+        from nodelab_v2.export import export_context, export_dataset
         ds = self.sheet.dataset
         if ds is None:
             QMessageBox.information(self, "Nothing to export",
@@ -6652,11 +6835,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            n = export_dataset(ds, path)
+            ctx = export_context(self.workspace, self.sheet.page_id,
+                                 self.sheet.node_id or "", self.doc.path)
+            n = export_dataset(ds, path, ctx)
         except (ValueError, OSError, ImportError) as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
-        self.statusBar().showMessage(f"exported {n} rows → {path}")
+        side = " (origin record beside it, .origin.json)" if path.lower().endswith(".csv") \
+            else " (origin record inside)"
+        self.statusBar().showMessage(f"exported {n} rows → {path}{side}")
 
     # ── empty canvas / example content ────────────────────────────────────────
     def _sync_welcome(self, *_a) -> None:

@@ -236,6 +236,9 @@ MODULES: Tuple[str, ...] = (
     # 2026-10-16: thin an axis to evenly spaced frames (Crop's frames mode by a rule rather
     # than a list), appended for the same reason
     "util.trim",
+    # 2026-10-22: an exported table file (Parquet / Arrow / CSV) read back with its origin
+    # record (nodegraph.table_file), appended for the same reason
+    "io.load_table",
 )
 
 

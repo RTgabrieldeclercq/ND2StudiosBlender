@@ -599,6 +599,27 @@ class NodeSpec:
     #: Presentation-only and memo-neutral, exactly like ``description``: nothing hashes it and
     #: no compute may read it, so its wording is a zero-risk edit.
     trained_note: Optional[Callable[..., Any]] = None
+    #: The identity of the FILE a compute reads from outside the graph (2026-10-22):
+    #: ``(params, modes) -> hashable``, typically ``(abspath, size, mtime_ns)``. The engine
+    #: folds it into the node's memo key on EVERY lookup (and into its lineage), so a file
+    #: rewritten in place — a table re-exported to the same name — is a miss, not a stale
+    #: hit. Without it a root node's key is only its op and params: a path that did not
+    #: change serves the cached payload of whatever the file held when it was first read.
+    #: Resolved through :meth:`identity_of_file`, which is total — a stat failure is
+    #: ``None``, and the compute reports the missing file itself.
+    file_identity: Optional[Callable[..., Any]] = None
+
+    def identity_of_file(self, params: Mapping[str, Any],
+                         modes: Mapping[str, Any]) -> Any:
+        """Resolve :attr:`file_identity`, swallowing everything (``None`` when there is no
+        hook or it raises) — it runs on every memo lookup and must never fail a pull."""
+        fn = self.file_identity
+        if fn is None:
+            return None
+        try:
+            return fn(dict(params or {}), dict(modes or {}))
+        except Exception:  # noqa: BLE001 — an identity probe must never break a pull
+            return None
 
     def note_for_trained(self, params: Mapping[str, Any],
                          modes: Mapping[str, Any]) -> str:
@@ -1315,7 +1336,8 @@ def define_node(op_key: str, label: str, *, category: str = "general",
                 extra_layers: Optional[Callable[..., Any]] = None,
                 adds_columns: Optional[Callable[..., Any]] = None,
                 trained_params: Optional[Callable[..., Any]] = None,
-                trained_note: Optional[Callable[..., Any]] = None) -> NodeSpec:
+                trained_note: Optional[Callable[..., Any]] = None,
+                file_identity: Optional[Callable[..., Any]] = None) -> NodeSpec:
     """Build and register a :class:`NodeSpec`."""
     return NODES.register(NodeSpec(
         op_key=op_key, label=label, category=category,
@@ -1334,6 +1356,7 @@ def define_node(op_key: str, label: str, *, category: str = "general",
         adds_columns=adds_columns,
         trained_params=trained_params,
         trained_note=trained_note,
+        file_identity=file_identity,
     ))
 
 

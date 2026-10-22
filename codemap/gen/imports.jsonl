@@ -729,6 +729,16 @@
 {"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodegraph.catalog.io.load_analysis"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_analysis"}
 {"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_analysis"}
+{"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.catalog._shared.analysis_mesh","k":"imp","lazy":true,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.catalog._shared.columns","k":"imp","lazy":true,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":false,"src":"nodegraph.catalog.io.load_table"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_figure"}
 {"dst":"nodegraph.catalog._shared.figure","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_figure"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_figure"}
@@ -1355,6 +1365,7 @@
 {"dst":"nodegraph.spill","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.streaming","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.tracking","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.trained","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.transfer","k":"imp","lazy":false,"src":"nodegraph.selftest"}
@@ -1363,6 +1374,7 @@
 {"dst":"nodelab_v2","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.acquisition_view","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.canvas_actions","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.card_actions","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.demo_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1414,6 +1426,8 @@
 {"dst":"nodegraph.reducers","k":"imp","lazy":false,"src":"nodegraph.streaming"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.structure"}
 {"dst":"nodegraph.memo","k":"imp","lazy":false,"src":"nodegraph.structure"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.table_file"}
+{"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodegraph.table_file"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.tracking"}
 {"dst":"nodegraph.structure","k":"imp","lazy":false,"src":"nodegraph.tracking"}
 {"dst":"nodegraph.bridges","k":"imp","lazy":true,"src":"nodegraph.transfer"}
@@ -1438,6 +1452,8 @@
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodelab_v2.welcome","k":"imp","lazy":false,"src":"nodelab_v2.canvas"}
 {"dst":"nodegraph.groups","k":"imp","lazy":false,"src":"nodelab_v2.canvas_actions"}
+{"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.card_actions"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":false,"src":"nodelab_v2.card_actions"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.console"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.console"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.demo_recipes"}
@@ -1491,6 +1507,9 @@
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.edge_item"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.edge_item"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.edge_item"}
+{"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.export"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":false,"src":"nodelab_v2.export"}
+{"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"nodelab_v2.export"}
 {"dst":"nodelab_v2.tables","k":"imp","lazy":false,"src":"nodelab_v2.export"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
@@ -1505,14 +1524,17 @@
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodelab_v2.ingest"}
 {"dst":"nodelab_v2.nd2_compat","k":"imp","lazy":true,"src":"nodelab_v2.ingest"}
 {"dst":"nodelab_v2.nd2_meta","k":"imp","lazy":true,"src":"nodelab_v2.ingest"}
+{"dst":"nodegraph","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.hotreload","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.iterate","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"nodelab_v2.inspector"}
+{"dst":"nodelab_v2.card_actions","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.node_item","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.inspector"}
@@ -1620,6 +1642,7 @@
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"nodelab_v2.node_item"}
+{"dst":"nodelab_v2.card_actions","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.multilink","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.node_item"}
@@ -1774,9 +1797,11 @@
 {"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.roles","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":true,"src":"nodelab_v2.window"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.canvas_actions","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.card_actions","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.console","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.demo_window","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.window"}
@@ -1920,6 +1945,7 @@
 {"dst":"nodegraph.serialize","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.streaming","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.structure","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
+{"dst":"nodegraph.table_file","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodegraph.zones","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}
 {"dst":"nodelab_v2.canvas","k":"imp","lazy":true,"src":"scripts._nodelab_v2_phase5_probe"}

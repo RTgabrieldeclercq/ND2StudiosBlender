@@ -55,6 +55,7 @@ from nodelab_v2.ops import (DOCK_OP, MOVIE_OP, PAGE_INPUT_OP, PAGE_SOURCE_KEY,
                             PRECISION_UNSET, bake_record)
 from nodelab_v2.picker import PICK_GLYPH, PICK_HELP, request_for
 from nodelab_v2 import readiness as RD
+from nodelab_v2.card_actions import LOAD_TABLE_OP, actions_for
 from nodelab_v2.quick import is_quick_op
 from nodegraph.registry import NODES
 
@@ -284,6 +285,9 @@ class InspectorPanel(QScrollArea):
     #: window owns the runner and the document, so it is the one that can actually run a
     #: bake, record it and release the memory afterwards.
     dock_action = Signal(str, str)
+    #: a card ACTION's button (2026-10-22, :mod:`nodelab_v2.card_actions`) — ``(node_id,
+    #: action key)``; the same signal the node card sends, handled by the same window method.
+    card_action = Signal(str, str)
     #: an Iterate node's button was pressed: ``(node_id, action)`` with action one of
     #: ``sweep`` (mint and run every iteration) / ``stop_sweep`` (back to the cheap
     #: single-clone form). Same division of labour as the two above.
@@ -350,6 +354,8 @@ class InspectorPanel(QScrollArea):
         self._node: Optional[NodeItem] = None
         self._auto_boxes = []              # (node, socket, box) — live ƒmd refresh (G8)
         self._last_trained_note = ""
+        #: the Load Table Origin rows last shown — asserted by the phase-5 GUI gate
+        self._last_table_origin: list = []
         self._last_dir = ""                # last browsed folder (seeds the next dialog)
         # carries a refused target choice across the rebuild the choice triggers, so the
         # reason is shown in the panel instead of being swallowed by the combo's signal
@@ -694,6 +700,11 @@ class InspectorPanel(QScrollArea):
         # export movie — look at the movie before writing it
         if spec.op_key == MOVIE_OP:
             self._v.addWidget(self._movie_section(node))
+            self._v.addWidget(self._sep())
+
+        # load table (2026-10-22) — where the file came from, and Load file
+        if spec.op_key == LOAD_TABLE_OP:
+            self._v.addWidget(self._table_origin_section(node))
             self._v.addWidget(self._sep())
 
         # overlay (2026-09-30) — the frame pins the Viewer wrote, removable one by one
@@ -1214,6 +1225,43 @@ class InspectorPanel(QScrollArea):
             rec.set_locked(rec.locked - {name})
             node.doc.touch(node.node_id)
         QTimer.singleShot(0, self._rebuild)
+
+    def _table_origin_section(self, node: NodeItem) -> QWidget:
+        """Load Table's Origin (2026-10-22): the file's origin record in full — when and on
+        which machine, the graph, page and node it was exported from, the chain in front of
+        that node, each source file and whether it is still where the record says, the axes,
+        the calibration and every table — then the card's action buttons (*Load file*),
+        which send the same ``card_action`` the card does."""
+        from nodegraph import table_file as TF
+        sec = self._section("Origin")
+        path = TF.clean_path(node.rec.params.get("path"))
+        origin = TF.read_origin(path) if path else {}
+        rows = TF.origin_rows(origin, path) if path else [
+            ("File", "none chosen — Browse… in Parameters for a table from File → "
+                     "Export table…")]
+        self._last_table_origin = rows
+        grid = QGridLayout(); grid.setHorizontalSpacing(10); grid.setVerticalSpacing(3)
+        for i, (label, value) in enumerate(rows):
+            k = QLabel(label); k.setProperty("role", "muted")
+            kf = k.font(); kf.setPointSize(9); k.setFont(kf)
+            v = QLabel(value); v.setWordWrap(True)
+            v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            vf = v.font(); vf.setPointSize(9); v.setFont(vf)
+            grid.addWidget(k, i, 0, Qt.AlignTop)
+            grid.addWidget(v, i, 1)
+        grid.setColumnStretch(1, 1)
+        sec._lay.addLayout(grid)  # type: ignore[attr-defined]
+        nid = node.node_id
+        row = QHBoxLayout(); row.setSpacing(6)
+        for act in actions_for(node.rec):
+            b = QPushButton(act.label)
+            b.setToolTip(act.tip)
+            b.setEnabled(act.enabled)
+            b.clicked.connect(lambda _=False, k=act.key: self.card_action.emit(nid, k))
+            row.addWidget(b)
+        row.addStretch(1)
+        sec._lay.addLayout(row)  # type: ignore[attr-defined]
+        return sec
 
     def _movie_section(self, node: NodeItem) -> QWidget:
         """The Export Movie node's own panel: what it plays, and the way into the editor.

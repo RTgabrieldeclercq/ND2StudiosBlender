@@ -67,6 +67,14 @@
         "Wire the image the trial was computed on so the grid and vectors overlay it, or switch Onto to tables_only for the Spreadsheet."
       ]
     },
+    "io.load_table": {
+      "kind": "guide",
+      "features": [
+        "Reads a table file written by File > Export table... (Parquet, Arrow or CSV) back onto the graph: every table on its original layer, per-frame attributes back into their arrays.",
+        "The card and the inspector's Origin section say when and where the file was made: graph, page, node, the chain in front of it and the source image.",
+        "Load file puts the original image under the table: loaded on Image Input, read here through a Page Input, Onto switched to image so the Viewer overlays the rows."
+      ]
+    },
     "io.write_figure": {
       "kind": "guide",
       "features": [

@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 143,
+    "nodes": 144,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 1028,
-    "outputs": 150,
+    "inputs": 1030,
+    "outputs": 151,
     "gui_ops_included": true
   },
   "stages": {
@@ -89,6 +89,7 @@
         "io.dock",
         "io.load",
         "io.load_analysis",
+        "io.load_table",
         "io.write_figure",
         "io.write_movie",
         "io.write_tiff",
@@ -287,8 +288,8 @@
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
-      "count": 6,
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back, and the one that reads an exported table file back with its origin.",
+      "count": 7,
       "ops": [
         {
           "op": "io.dock",
@@ -304,6 +305,11 @@
           "op": "io.load_analysis",
           "label": "Load Analysis",
           "summary": "Load a saved DIC/DVC/PIV/SerialTrack trial (the `<file>.analysis` folder beside the image) back onto the graph — its tables on their original layers and its provenance — without recomputing."
+        },
+        {
+          "op": "io.load_table",
+          "label": "Load Table",
+          "summary": "Load an exported table file (Parquet / Arrow / CSV) back onto the graph — its tables on their original layers, its origin (when, which graph and node, which source image) shown on the card — and, with Load file, onto the original image."
         },
         {
           "op": "io.write_figure",
@@ -1290,6 +1296,7 @@
       "io.dock",
       "io.load",
       "io.load_analysis",
+      "io.load_table",
       "io.write_figure",
       "io.write_movie",
       "io.write_tiff",
@@ -15962,6 +15969,103 @@
       "params_read": [
         "__modes__",
         "trial"
+      ]
+    },
+    "io.load_table": {
+      "op": "io.load_table",
+      "label": "Load Table",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "input",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/io/load_table.py",
+      "gui_only": false,
+      "summary": "Load an exported table file (Parquet / Arrow / CSV) back onto the graph — its tables on their original layers, its origin (when, which graph and node, which source image) shown on the card — and, with Load file, onto the original image.",
+      "overview": "A table file written by *File → Export table…* (or any long-form CSV / Parquet / Arrow file) read back onto the graph, with the record of what made it. The file is one long-form table — a ``domain`` and ``layer`` column per row, then the union of every table's columns (:mod:`nodegraph.table_file`). This node cuts it back into its tables: structure tables (Label / Point / Track / Mesh) land on their ORIGINAL domain and layer with their original columns and ``z_kind``; lattice tables (Frame / Plane / Timepoint / Multipoint / Channel / Global) go back into their domain's arrays at the indices their rows name. Columns the export derived from metadata (``file``, ``group``) are re-derived, not stored twice. **The origin record.** An export writes what made the file — when, on which machine, which graph, page and node, the chain in front of it, the source image file(s), the axes and the metadata — inside a Parquet / Arrow file, or beside a CSV as ``<file>.origin.json``. The output carries it as ``table_file_origin`` (with ``table_file`` and a one-line ``table_file_note``), so re-exporting a loaded table records that it was loaded from this file; the card and the inspector show it. ``onto = tables_only`` (the default) needs no wire: a Dataset with the export's axes and metadata and no image — for the Spreadsheet, plots and table nodes. ``onto = image`` attaches the tables to the wired Dataset — the ORIGINAL image, which the card's *Load file* button loads on the Image Input page and wires in through a Page Input — so the Viewer draws them over it; one whose positions, frames, planes or batch differ from the export's is refused (rows would land on the wrong frame). Resolved spec: category io; op ``io.load_table``; reads nothing from the image; adds whatever the file holds (structure domains declared, the layers and columns announced from the record by ``extra_layers`` / ``adds_columns``); footprint WHOLE_SERIES / {} (it reads no pixels); ``file_identity`` = the file's path, size and mtime (and the CSV sidecar's), so a table re-exported to the same name is recomputed, not served stale.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": [
+          "label",
+          "mesh",
+          "point",
+          "track"
+        ]
+      },
+      "modes": [
+        {
+          "name": "onto",
+          "label": "Onto",
+          "choices": [
+            "tables_only",
+            "image"
+          ],
+          "default": "tables_only",
+          "description": "What the loaded tables are attached to: nothing (a tables-only Dataset, the default) or the wired image (overlays, and nodes that also need pixels).",
+          "choice_docs": {
+            "tables_only": "No input needed: a Dataset with the export's axes and metadata (calibration, position names) but no image, carrying only the tables — for the Spreadsheet, plots and table nodes, or a table whose image is not at hand.",
+            "image": "Attach the tables to the wired Dataset — the image they were exported from — so the Viewer draws points, tracks and labels over it. A Dataset whose positions, frames or planes differ is refused rather than mislabelled; Load file sets this and wires the image."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "available_in": {
+            "onto": [
+              "image"
+            ]
+          },
+          "description": "The image the table was exported from — the same file, through the same registration and crop chain — so the Viewer draws the rows where they were measured. The card's Load file button wires it for you (a Page Input reading the file from the Image Input page). Refused when its positions, frames or planes differ from the export's."
+        },
+        {
+          "name": "path",
+          "label": "File",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "path_kind": "open_file",
+          "path_filter": "Tables (*.parquet *.arrow *.csv);;Parquet (*.parquet);;Arrow IPC (*.arrow);;CSV (*.csv);;All files (*)",
+          "path_hint": "a .parquet / .arrow / .csv from File → Export table…",
+          "description": "The table file to load: a Parquet, Arrow or CSV file written by File → Export table… (any long-form file with `domain`/`layer` columns also loads; one without them becomes a single Point table named after the file). Its origin record — when, which graph and node, which source image — is read with it and shown on the card. Re-exporting to the same name is picked up on the next pull: the file's size and date are part of what is cached."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_load_table",
+      "meta_transform": "_meta_load_table",
+      "extra_layers": "_layers_load_table",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "path"
       ]
     },
     "io.write_figure": {

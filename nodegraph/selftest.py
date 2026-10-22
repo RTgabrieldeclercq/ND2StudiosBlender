@@ -7302,6 +7302,167 @@ def test_analysis_store_writes() -> None:
         "reads the whole trial; an unwritable source folder opens the trial in the spare")
 
 
+def test_load_table() -> None:
+    """Load Table (2026-10-22): a Dataset exported by `nodelab_v2.export.export_dataset` —
+    Parquet, Arrow and CSV — comes back through `io.load_table` with every table on its
+    original domain and layer (structure + Frame + Global), the same dtypes and values, its
+    z_kind, and the export's axes and calibration (`tables_only`) or attached to a wired image
+    (`image`, a wrong M refused); the origin record names the graph, node, chain and source
+    file and is shown as `table_file_note`; the edit-time envelope predicts the axes, layers
+    and columns; a re-export to the SAME path re-keys the memo (`file_identity`); a plain CSV
+    with no record loads as one Point table; the card action offers Load file only when a
+    source is recorded."""
+    if not _HAVE_PYARROW:
+        _ok("load table: SKIPPED (pyarrow absent)")
+        return
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from nodegraph import table_file as TF
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.structure import StructureTable
+    from nodelab_v2.export import export_dataset
+    from nodelab_v2.tables import all_tables
+    from nodelab_v2.card_actions import LOAD_SOURCE_ACTION, actions_for
+
+    tmp = _tempfile.mkdtemp(prefix="ng-ltab-")
+    try:
+        src = _os.path.join(tmp, "WellA3.nd2")
+        with open(src, "wb") as fh:
+            fh.write(b"stand-in for the acquisition")
+        ax = AxisSizes(m=2, t=3, z=1, c=1, y=64, x=64)
+        md = {"pixel_size_um": 1.72, "source_file": ["WellA3.nd2"] * 2,
+              "source_path": [_os.path.abspath(src)] * 2, "dic_solver": "aldic"}
+        cells = StructureTable(Domain.POINT, {
+            "id": np.arange(5), "m": np.array([0, 0, 1, 1, 1]), "t": np.array([0, 1, 2, 0, 1]),
+            "c": np.zeros(5, np.int64), "z": np.zeros(5, np.int64),
+            "y": np.array([1.5, 2.0, 3.0, 4.0, 5.25]), "x": np.array([9.0, 8, 7, 6, 5]),
+            "area": np.array([10, 20, 30, 40, 50]),
+            "kind": np.array(["a", "b", "c", "d", "e"], dtype=object)},
+            layer="cells", z_kind="plane_index")
+        # a track SUMMARY carries no coordinate columns: it must come back without any
+        tracks = StructureTable(Domain.TRACK, {"id": np.arange(2),
+                                               "n_points": np.array([3, 2])}, layer="tracks")
+        ds = (Dataset(axes=ax, metadata=md).with_structure(cells).with_structure(tracks)
+              .with_layer(Domain.FRAME, "drift_y", np.arange(6, dtype=float).reshape(2, 3))
+              .with_layer(Domain.GLOBAL, "n_total", np.asarray(5)))
+        ctx = {"graph": _os.path.join(tmp, "run.nd2graph.json"),
+               "page": {"id": "pg4", "name": "Analysis", "kind": "analyze"},
+               "node": {"id": "n7", "op": "analysis.measure", "label": "Measure"},
+               "chain": [{"node": "pg1/n1", "op": "io.load", "label": "WellA3.nd2",
+                          "params": {"path": src}}]}
+        define_node("io.ltabseed", "S", outputs=[OutDataset()])
+
+        def pull(path, onto="tables_only", data=ds, engine=None):
+            g = Graph()
+            g.add(NodeInstance("L", "io.load_table", params={"path": path},
+                               modes={"onto": onto}))
+            seeds, meta = {}, {}
+            if onto == "image":
+                g.add(NodeInstance("S", "io.ltabseed"))
+                g.connect("S", "L", dst_socket="data")
+                seeds = {"S": data}
+                meta = {"S": MetaEnvelope(axes=data.axes, metadata=dict(data.metadata))}
+            e = engine or Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=meta)
+            return e, e.pull("L")
+
+        want = all_tables(ds)
+        for ext in ("parquet", "arrow", "csv"):
+            path = _os.path.join(tmp, f"cells.{ext}")
+            n = export_dataset(ds, path, ctx)
+            assert n == 5 + 2 + 6 + 1, (ext, n)
+            rec = TF.read_origin(path)
+            assert rec["format"] == TF.ORIGIN_FORMAT and rec["node"]["op"] == "analysis.measure"
+            assert rec["source_files"] == [_os.path.abspath(src)], rec["source_files"]
+            assert rec["axes"]["m"] == 2 and rec["metadata"]["pixel_size_um"] == 1.72
+            pl = {(e["domain"], e["layer"]): e for e in rec["tables"]}
+            assert pl[("point", "cells")]["z_kind"] == "plane_index", pl
+            assert pl[("point", "cells")]["derived"] == ["file"], pl   # re-derived on load
+            if ext == "csv":
+                assert _os.path.isfile(TF.sidecar_path(path)), "the CSV record sits beside it"
+            for onto in ("tables_only", "image"):
+                e, out = pull(path, onto)
+                got = all_tables(out)
+                assert sorted(got) == sorted(want), (ext, onto, sorted(got))
+                for key, cols in want.items():
+                    assert set(got[key]) == set(cols), (ext, onto, key, set(got[key]))
+                    for c, v in cols.items():
+                        a, b = np.asarray(v), np.asarray(got[key][c])
+                        assert np.array_equal(a, b), (ext, onto, key, c, a, b)
+                        assert a.dtype.kind == b.dtype.kind or {a.dtype.kind, b.dtype.kind} \
+                            <= {"O", "U"}, (ext, onto, key, c, a.dtype, b.dtype)
+                assert out.axes == ax and e.env("L").axes == out.axes, (out.axes, e.env("L").axes)
+                assert out.metadata["pixel_size_um"] == 1.72
+                assert out.metadata["dic_solver"] == "aldic", "the export's stamps ride along"
+                assert out.structure_zkind(Domain.POINT, "cells") == "plane_index"
+                note = out.metadata[TF.TABLE_NOTE_KEY]
+                assert "Measure" in note and "WellA3.nd2" in note and "run.nd2graph.json" in note
+                assert note == e.env("L").metadata[TF.TABLE_NOTE_KEY], "envelope ≡ payload"
+                assert out.metadata[TF.TABLE_ORIGIN_KEY]["chain"][0]["op"] == "io.load"
+                env = e.env("L")
+                assert (Domain.POINT, "cells") in env.layer_names, env.layer_names
+                assert (Domain.FRAME, "drift_y") in env.layer_names, env.layer_names
+                assert (Domain.POINT, "cells", "area") in env.column_names
+        # a wired image whose M differs is refused, naming the axis
+        one = Dataset(axes=AxisSizes(m=1, t=3, z=1, c=1, y=64, x=64), metadata={})
+        try:
+            pull(_os.path.join(tmp, "cells.parquet"), "image", data=one)
+            raise AssertionError("an image with the wrong M was accepted")
+        except ValueError as exc:
+            assert "does not match the table on m" in str(exc), exc
+
+        # a re-export to the SAME path re-keys the memo: same Engine, new numbers
+        path = _os.path.join(tmp, "cells.parquet")
+        e, first = pull(path)
+        bigger = ds.with_structure(StructureTable(Domain.POINT, {
+            **{k: np.concatenate([np.asarray(v), np.asarray(v)[:1]])
+               for k, v in cells.columns.items()}, "id": np.arange(6)},
+            layer="cells", z_kind="plane_index"))
+        export_dataset(bigger, path, ctx)
+        _e, again = pull(path, engine=e)
+        n1 = len(first.get(Domain.POINT, "id", "cells").values)
+        n2 = len(again.get(Domain.POINT, "id", "cells").values)
+        assert (n1, n2) == (5, 6), (n1, n2)
+
+        # a plain CSV from elsewhere: one Point table named after the file, axes from rows
+        plain = _os.path.join(tmp, "spots_by_hand.csv")
+        with open(plain, "w", encoding="utf-8") as fh:
+            fh.write("y,x,intensity\n3.5,4,100\n10,20.5,250\n")
+        _e, po = pull(plain)
+        pc = all_tables(po)[("point", "spots_by_hand")]
+        assert list(pc["intensity"]) == [100, 250] and list(pc["id"]) == [0, 1], pc
+        assert po.axes.y == 11 and po.axes.x == 21 and po.axes.m == 1, po.axes
+        assert "no origin record" in po.metadata[TF.TABLE_NOTE_KEY]
+
+        # the card action (Qt-free half): offered, with the source named, only when recorded
+        class _Rec:
+            op_key = "io.load_table"
+
+            def __init__(self, p):
+                self.params = {"path": p}
+        act = actions_for(_Rec(_os.path.join(tmp, "cells.arrow")))
+        assert len(act) == 1 and act[0].key == LOAD_SOURCE_ACTION and act[0].enabled, act
+        assert act[0].note == "source WellA3.nd2", act[0].note
+        assert not actions_for(_Rec(plain))[0].enabled, "no record, nothing to load"
+        assert not actions_for(_Rec(""))[0].enabled
+        # the source is found beside the table when its recorded path no longer exists
+        moved = _os.path.join(tmp, "moved")
+        _os.makedirs(moved)
+        _shutil.copy(_os.path.join(tmp, "cells.parquet"), moved)
+        assert TF.locate_source(_os.path.join(tmp, "gone", "WellA3.nd2"),
+                                _os.path.join(tmp, "cells.parquet")) == \
+            _os.path.join(tmp, "WellA3.nd2")
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+    _ok("load table (2026-10-22): Parquet / Arrow / CSV exports come back with every table "
+        "on its layer (Point + coordinate-free Track + Frame + Global, dtypes and z_kind "
+        "intact), the export's axes "
+        "and calibration (tables_only) or on a wired image (wrong M refused); the origin "
+        "record names graph, node, chain and source; the envelope predicts axes, layers and "
+        "columns; a same-path re-export re-keys the memo; a plain CSV loads as one Point "
+        "table; Load file is offered only with a recorded source")
+
+
 def test_analysis_parallel() -> None:
     """Process lanes ≡ serial (2026-10-09) for the other two unit families: PIV over three
     (m, z) units and DVC over two m units, each pulled once on the governor's process lanes
@@ -36025,6 +36186,7 @@ def main() -> int:
     test_catalog_dic()
     test_analysis_store()
     test_analysis_store_writes()
+    test_load_table()
     test_analysis_parallel()
     test_quick_scope()
     test_analysis_mesh()
