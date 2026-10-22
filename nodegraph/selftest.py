@@ -7463,6 +7463,223 @@ def test_load_table() -> None:
         "table; Load file is offered only with a recorded source")
 
 
+def test_cyto_nuc_ratio() -> None:
+    """Cyto / Nuc Ratio (2026-10-22) on a synthetic plate whose answer is known: nuclei at
+    100, cytoplasm at 300 inside 12 px cells, background 10. `ring` gives cyto/nuc = 3
+    exactly, never counts a nuclear voxel, scales its thickness with pixel_size_um and leaves
+    out the `gap`; `outside` background is 10 and N/C = 90/290; `median` names its columns;
+    `cells` with a LABEL raster cuts the nuclei out of the cells, splits a binucleate cell
+    by nearest nucleus and gives a nucleus outside every cell no cytoplasm (NaN ratio); a
+    plain MASK is split by nearest nucleus; two signals are named after their channels (a
+    repeat deduped, `signal_names` overriding); 3D nuclei grow a shell across z on the
+    anisotropic grid; the cytoplasm table's ids are the nucleus ids; the edit-time catalog
+    declares the signal columns; and a cells wire under `ring`, a mismatched signal grid
+    and a sub-pixel ring are refused."""
+    try:
+        import scipy  # noqa: F401 — the node's EDT
+    except ImportError:
+        _ok("cyto/nuc ratio: SKIPPED (scipy absent)")
+        return
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    H = W = 64
+    yy, xx = np.mgrid[:H, :W]
+    centers = {1: (20, 18), 2: (20, 40), 3: (48, 30), 4: (56, 58)}
+    nuc = np.zeros((H, W), np.int64)
+    for i, (cy, cx) in centers.items():
+        nuc[(yy - cy) ** 2 + (xx - cx) ** 2 <= 25] = i
+    cellmask = np.zeros((H, W), bool)
+    for i, (cy, cx) in list(centers.items())[:3]:       # nucleus 4 lies in no cell
+        cellmask |= (yy - cy) ** 2 + (xx - cx) ** 2 <= 144
+    cells = np.zeros((H, W), np.int64)
+    cells[cellmask & (yy < 34)] = 7                       # ONE cell holding nuclei 1 and 2
+    cells[cellmask & (yy >= 34)] = 9
+    sig = np.full((H, W), 10.0)
+    sig[cellmask] = 300.0
+    sig[nuc > 0] = 100.0
+
+    def six(a, z=1):
+        return np.asarray(a).reshape(1, 1, z, 1, H, W)
+
+    def tab(lab, zk="plane_index"):
+        lab = np.asarray(lab)
+        ids = np.unique(lab)
+        ids = ids[ids > 0]
+        zc = [np.nonzero(lab == i) for i in ids]
+        z0 = np.zeros(ids.size, np.int64)
+        z = (np.array([c[0].mean() for c in zc]) if zk == "subpixel" else z0)
+        return {"id": ids, "m": z0, "t": z0, "c": z0, "z": z,
+                "y": np.array([c[-2].mean() for c in zc]),
+                "x": np.array([c[-1].mean() for c in zc])}
+
+    def lab_ds(lab6, layer, px=1.0, chan="DAPI", zk="plane_index", z=1, zs=None):
+        md = {"pixel_size_um": px, "channel_names": [chan]}
+        if zs:
+            md["z_step_um"] = zs
+        a = AxisSizes(m=1, t=1, z=z, c=1, y=H, x=W)
+        return (Dataset(axes=a, metadata=md)
+                .with_image(ArrayProvider(np.where(lab6 > 0, 500.0, 5.0)))
+                .with_layer(Domain.VOXEL, layer, lab6)
+                .with_structure(StructureTable(Domain.LABEL, tab(lab6[0, 0, :, 0], zk),
+                                               layer=layer, z_kind=zk)))
+
+    def sig_ds(img6, chan, px=1.0, z=1, zs=None):
+        md = {"pixel_size_um": px, "channel_names": [chan]}
+        if zs:
+            md["z_step_um"] = zs
+        return Dataset(axes=AxisSizes(m=1, t=1, z=z, c=1, y=H, x=W),
+                       metadata=md).with_image(ArrayProvider(img6))
+
+    nds = lab_ds(six(nuc), "nuclei")
+    for fx in ("cnr.n", "cnr.c", "cnr.s", "cnr.s2"):
+        define_node(fx, fx, outputs=[OutDataset()])
+
+    def run(modes, params=None, *, data=nds, cells_ds=None, signals=(), cat=False):
+        g = Graph()
+        g.add(NodeInstance("N", "cnr.n"))
+        g.add(NodeInstance("R", "analysis.cyto_nuc_ratio", params=params or {},
+                           modes=modes))
+        g.connect("N", "R", dst_socket="data")
+        seeds = {"N": data}
+        if cells_ds is not None:
+            g.add(NodeInstance("C", "cnr.c"))
+            g.connect("C", "R", dst_socket="cells")
+            seeds["C"] = cells_ds
+        for k, sdx in enumerate(signals):
+            nid = f"S{k}"
+            g.add(NodeInstance(nid, "cnr.s" if k == 0 else "cnr.s2"))
+            g.connect(nid, "R", dst_socket="signal" if k == 0 else f"signal_{k + 1}")
+            seeds[nid] = sdx
+        meta = {k: MetaEnvelope(axes=v.axes, metadata=dict(v.metadata)) for k, v in seeds.items()}
+        if cat:                       # what Segmentation's envelope announces downstream
+            meta["N"] = meta["N"].with_layer_names(((Domain.LABEL, "nuclei"),)) \
+                .with_column_names(((Domain.LABEL, "nuclei", "id"),))
+        e = Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=meta)
+        return e, e.pull("R")
+
+    def cols(o, layer):
+        return {a.name: np.asarray(a.values) for a in o.layers_on(Domain.LABEL)
+                if a.layer == layer}
+
+    p65 = sig_ds(six(sig), "p65")
+    # ── ring: exact ratio, no nuclear voxel, µm-true width, gap ─────────────────────
+    e, o = run({"cytoplasm": "ring"}, {"ring_width": 3.0}, signals=(p65,))
+    t = cols(o, "nuclei")
+    assert np.allclose(t["p65_cyto_nuc_ratio"][:3], 3.0), t["p65_cyto_nuc_ratio"]
+    assert np.allclose(t["p65_nuc_mean"], 100.0) and np.allclose(t["p65_cyto_mean"][:3], 300.0)
+    cy = np.asarray(o.get(Domain.VOXEL, "cytoplasm").values)[0, 0, 0, 0]
+    assert not (cy[nuc > 0] > 0).any(), "a nuclear voxel was counted as cytoplasm"
+    ring_vox = t["cyto_voxels"].copy()
+    _e, o_fine = run({"cytoplasm": "ring"}, {"ring_width": 3.0},
+                     data=lab_ds(six(nuc), "nuclei", px=0.5),
+                     signals=(sig_ds(six(sig), "p65", px=0.5),))
+    assert (cols(o_fine, "nuclei")["cyto_voxels"][:3] > 1.8 * ring_vox[:3]).all(), \
+        "3 µm at 0.5 µm/px must be a thicker ring in pixels than at 1 µm/px"
+    _e, o_gap = run({"cytoplasm": "ring"}, {"ring_width": 3.0, "gap": 1.0}, signals=(p65,))
+    cg = np.asarray(o_gap.get(Domain.VOXEL, "cytoplasm").values)[0, 0, 0, 0]
+    from scipy import ndimage as _ndi
+    assert not (cg[_ndi.binary_dilation(nuc > 0)] > 0).any(), "the gap was not left out"
+    ct = cols(o, "cytoplasm")
+    assert set(ct["id"].tolist()) <= set(t["id"].tolist())
+    assert np.array_equal(ct["area"], t["cyto_voxels"][np.searchsorted(t["id"], ct["id"])])
+    assert o.structure_zkind(Domain.LABEL, "cytoplasm") == "plane_index"
+    # ── background, median, inverse ratio ────────────────────────────────────────
+    _e, o = run({"cytoplasm": "ring", "background": "outside", "stat": "median",
+                 "ratio": "nuc_over_cyto"}, {"ring_width": 3.0}, signals=(p65,))
+    t = cols(o, "nuclei")
+    assert np.allclose(t["p65_background"], 10.0), t["p65_background"]
+    assert np.allclose(t["p65_nuc_cyto_ratio"][:3], 90.0 / 290.0), t["p65_nuc_cyto_ratio"]
+    assert "p65_nuc_median" in t and "p65_cyto_mean" not in t
+    # ── cells: label raster, binucleate split, nucleus outside every cell ───────────
+    cds = lab_ds(six(cells), "cells", chan="WGA")
+    _e, o = run({"cytoplasm": "cells"}, signals=(p65,), cells_ds=cds)
+    t = cols(o, "nuclei")
+    cy = np.asarray(o.get(Domain.VOXEL, "cytoplasm").values)[0, 0, 0, 0]
+    assert not (cy[nuc > 0] > 0).any(), "the nucleus was not cut out of its cell"
+    assert np.allclose(t["p65_cyto_nuc_ratio"][:3], 3.0), t["p65_cyto_nuc_ratio"]
+    assert (cy[20, 8], cy[20, 50], cy[48, 42]) == (1, 2, 3), "binucleate cell not split"
+    assert t["cyto_voxels"][3] == 0 and np.isnan(t["p65_cyto_nuc_ratio"][3]), t
+    assert set(np.unique(cy[cells == 7]).tolist()) <= {0, 1, 2}
+    # a plain MASK (no Label table) is split by nearest nucleus
+    mask_ds = (Dataset(axes=nds.axes, metadata={"pixel_size_um": 1.0})
+               .with_image(ArrayProvider(six(cellmask * 50.0)))
+               .with_layer(Domain.VOXEL, "mask", six(cellmask.astype(np.int64))))
+    _e, o = run({"cytoplasm": "cells"}, signals=(p65,), cells_ds=mask_ds)
+    cy = np.asarray(o.get(Domain.VOXEL, "cytoplasm").values)[0, 0, 0, 0]
+    assert cy[20, 8] == 1 and cy[48, 42] == 3 and not (cy[nuc > 0] > 0).any()
+    # ── two signals: channel names, a repeat deduped, `signal_names` overriding ───────
+    _e, o = run({"cytoplasm": "ring"}, {"ring_width": 3.0}, signals=(p65, p65))
+    assert {"p65_cyto_nuc_ratio", "p65_2_cyto_nuc_ratio"} <= set(cols(o, "nuclei"))
+    _e, o = run({"cytoplasm": "ring"}, {"ring_width": 3.0, "signal_names": ", NF kB"},
+                signals=(p65, sig_ds(six(sig * 2), "p65")))
+    t = cols(o, "nuclei")
+    assert "NF_kB_cyto_mean" in t and np.allclose(t["NF_kB_cyto_mean"][:3], 600.0), sorted(t)
+    # ── the edit-time catalog names the same columns ─────────────────────────────────
+    e, _o = run({"cytoplasm": "ring"}, {"ring_width": 3.0}, signals=(p65,), cat=True)
+    declared = {c for d, lyr, c in e.env("R").column_names if lyr == "nuclei"}
+    assert {"p65_nuc_mean", "p65_cyto_mean", "p65_cyto_nuc_ratio", "cyto_voxels"} <= \
+        declared, declared
+    # ── 3D nuclei: a shell across z on the anisotropic grid ──────────────────────────
+    # a ball on planes 3..9 at z_step 2 µm: a 2 µm shell reaches ONE plane past it (2 and
+    # 10) — per-plane rings would reach none, an ignored z_step two
+    Z = 13
+    zz = np.arange(Z)[:, None, None]
+    ball = np.zeros((Z, H, W), np.int64)
+    ball[((yy - 32) ** 2 + (xx - 32) ** 2)[None] + ((zz - 6) * 2) ** 2 <= 36] = 1
+    vol = np.full((Z, H, W), 300.0)
+    vol[ball > 0] = 100.0
+    d3 = lab_ds(six(ball, Z), "nuclei", zk="subpixel", z=Z, zs=2.0)
+    _e, o = run({"cytoplasm": "ring"}, {"ring_width": 2.0},
+                data=d3, signals=(sig_ds(six(vol, Z), "p65", z=Z, zs=2.0),))
+    cy3 = np.asarray(o.get(Domain.VOXEL, "cytoplasm").values)[0, 0, :, 0]
+    zs_with = sorted(set(np.nonzero(cy3)[0].tolist()))
+    assert (zs_with[0], zs_with[-1]) == (2, 10), zs_with
+    assert o.structure_zkind(Domain.LABEL, "cytoplasm") == "subpixel"
+    assert np.allclose(cols(o, "nuclei")["p65_cyto_nuc_ratio"], 3.0)
+    # ── the card grows a signal slot as each one is filled (Qt-free document half) ───
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.ops import ensure_ops
+    ensure_ops()
+    doc = GraphDocument()
+    card = doc.add_node("analysis.cyto_nuc_ratio", x=0, y=0)
+
+    def shown():
+        return [sp.name for sp in doc.input_specs(card.id)
+                if getattr(sp.type, "name", "") == "DATASET"]
+    assert shown() == ["data", "cells", "signal"], shown()
+    for k in range(2):
+        src = doc.add_node("cnr.s", x=-200, y=100 * k)
+        doc.connect(src.id, "out", card.id, "signal" if k == 0 else "signal_2")
+    assert shown()[-3:] == ["signal", "signal_2", "signal_3"], shown()
+    # ── refusals ─────────────────────────────────────────────────────────────────────
+    for case, kw, needle in (
+            ("cells under ring", dict(modes={"cytoplasm": "ring"}, cells_ds=cds),
+             "Cytoplasm is `ring`"),
+            ("mismatched grid", dict(modes={"cytoplasm": "ring"},
+                                     signals=(Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1,
+                                                                     y=H, x=W - 1),
+                                                      metadata={}).with_image(
+                                         ArrayProvider(np.zeros((1, 1, 1, 1, H, W - 1)))),)),
+             "geometry"),
+            ("sub-pixel ring", dict(modes={"cytoplasm": "ring"},
+                                    params={"ring_width": 0.4}), "below one voxel")):
+        try:
+            run(kw.pop("modes"), kw.pop("params", {"ring_width": 3.0}), **kw)
+            raise AssertionError(f"{case} was accepted")
+        except ValueError as exc:
+            assert needle in str(exc), (case, exc)
+    _ok("cyto/nuc ratio (2026-10-22): ring cyto/nuc = 3.000 exactly with no nuclear voxel, "
+        "µm-true width (thicker in px at 0.5 µm/px) and the gap left out; outside "
+        "background 10, N/C 90/290, median-named columns; cells cut the nuclei out, split a "
+        "binucleate cell by nearest nucleus, give an orphan nucleus NaN, and a mask splits "
+        "by nearest; signals named by channel (deduped, overridable); 3D shell on the "
+        "anisotropic grid; cytoplasm ids = nucleus ids; edit-time columns declared; the "
+        "card grows Signal 2, 3 as each is wired; cells under ring, a mismatched grid and "
+        "a sub-pixel ring refused")
+
+
 def test_analysis_parallel() -> None:
     """Process lanes ≡ serial (2026-10-09) for the other two unit families: PIV over three
     (m, z) units and DVC over two m units, each pulled once on the governor's process lanes
@@ -36187,6 +36404,7 @@ def main() -> int:
     test_analysis_store()
     test_analysis_store_writes()
     test_load_table()
+    test_cyto_nuc_ratio()
     test_analysis_parallel()
     test_quick_scope()
     test_analysis_mesh()

@@ -239,6 +239,9 @@ MODULES: Tuple[str, ...] = (
     # 2026-10-22: an exported table file (Parquet / Arrow / CSV) read back with its origin
     # record (nodegraph.table_file), appended for the same reason
     "io.load_table",
+    # 2026-10-22: a cytoplasm per nucleus (ring, or another channel's cells) and each signal's
+    # cytoplasm/nucleus ratio, appended for the same reason
+    "analysis.cyto_nuc_ratio",
 )
 
 

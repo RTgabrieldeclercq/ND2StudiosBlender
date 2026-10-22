@@ -134,8 +134,8 @@
       "label": "Measurement & statistics",
       "stage": "quantify",
       "pages": ["process"],
-      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
-      "ops": ["analysis.measure", "analysis.object_metrics", "analysis.object_field", "analysis.gradient_map", "analysis.cluster_points", "analysis.reduce_scalar"]
+      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar, and the cytoplasm-to-nucleus ratio of each cell's signals (a ring around each nucleus, or another channel's cell segmentation).",
+      "ops": ["analysis.measure", "analysis.object_metrics", "analysis.object_field", "analysis.gradient_map", "analysis.cluster_points", "analysis.reduce_scalar", "analysis.cyto_nuc_ratio"]
     },
     "arithmetic": {
       "label": "Math & units",

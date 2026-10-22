@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 144,
+    "nodes": 145,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 1030,
-    "outputs": 151,
+    "inputs": 1046,
+    "outputs": 152,
     "gui_ops_included": true
   },
   "stages": {
@@ -204,6 +204,7 @@
       "ops": [
         "analysis.accumulate_field",
         "analysis.cluster_points",
+        "analysis.cyto_nuc_ratio",
         "analysis.dic_correlate",
         "analysis.dvc_field",
         "analysis.filter_labels",
@@ -774,13 +775,18 @@
     "measurement_and_statistics": {
       "label": "Measurement & statistics",
       "stage": "quantify",
-      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
-      "count": 6,
+      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar, and the cytoplasm-to-nucleus ratio of each cell's signals (a ring around each nucleus, or another channel's cell segmentation).",
+      "count": 7,
       "ops": [
         {
           "op": "analysis.cluster_points",
           "label": "Cluster Points",
           "summary": "Cluster a Point cloud into groups (GaussianMixture / KMeans, BIC model-order sweep over n_clusters ± relax%) → a per-point cluster-id label column; µm-scaled so anisotropic Z doesn't bias the fit (ported v1 kernel; scikit-learn)."
+        },
+        {
+          "op": "analysis.cyto_nuc_ratio",
+          "label": "Cyto / Nuc Ratio",
+          "summary": "Cytoplasm around each nucleus — a ring grown from the nuclei, or another channel's cell segmentation with the nuclei cut out — and, for each wired signal channel, the nucleus and cytoplasm intensity and their ratio per cell, as columns on the nucleus table; the cytoplasm is kept as a label layer whose ids are the nucleus ids."
         },
         {
           "op": "analysis.gradient_map",
@@ -1203,6 +1209,7 @@
       "analysis.accumulate_field",
       "analysis.boundary_band",
       "analysis.cluster_points",
+      "analysis.cyto_nuc_ratio",
       "analysis.dic_correlate",
       "analysis.draw_regions",
       "analysis.dvc_field",
@@ -1967,6 +1974,296 @@
         "name",
         "relax_pct",
         "source"
+      ]
+    },
+    "analysis.cyto_nuc_ratio": {
+      "op": "analysis.cyto_nuc_ratio",
+      "label": "Cyto / Nuc Ratio",
+      "category": "analysis",
+      "role": "measurement_and_statistics",
+      "stage": "quantify",
+      "pages": [
+        "process"
+      ],
+      "module": "nodegraph/catalog/analysis/cyto_nuc_ratio.py",
+      "gui_only": false,
+      "summary": "Cytoplasm around each nucleus — a ring grown from the nuclei, or another channel's cell segmentation with the nuclei cut out — and, for each wired signal channel, the nucleus and cytoplasm intensity and their ratio per cell, as columns on the nucleus table; the cytoplasm is kept as a label layer whose ids are the nucleus ids.",
+      "overview": "A cytoplasm region per nucleus, and the cytoplasm-to-nucleus ratio of every signal. **The cytoplasm** (``cytoplasm`` Mode) is built per unit — a plane when the nuclei were segmented per plane (``z_kind = plane_index``), a volume when they were segmented in 3D (``subpixel``): the dimensionality is INHERITED from the nuclei's own table (§7b), not chosen with a lever that could disagree with it. * ``ring`` — grown around each nucleus: every voxel between ``gap`` and ``gap + ring_width`` µm of the nearest nucleus edge, true Euclidean distance on the anisotropic voxel grid, owned by that nearest nucleus so neighbouring rings meet halfway and never overlap. * ``cells`` — a cell segmentation from another channel (the ``cells`` input, else a second layer on ``data``). Where it overlaps the nucleus segmentation, the nucleus wins: no nuclear voxel is ever counted as cytoplasm, so the nuclear signal cannot leak into the cytoplasm mean and flatten the ratio. A LABEL raster is matched cell-to-nucleus by overlap (a nucleus's home cell covers most of it; a cell holding two nuclei is split between them by nearest nucleus; a cell holding none is dropped); a plain MASK is split by nearest nucleus. **The signals.** ``signal`` … ``signal_8`` each take one channel (a channel tap off the same file — the grid must match ``data`` voxel for voxel, refused otherwise); with none wired, ``data``'s own image is measured. Per signal, per nucleus: the nucleus and cytoplasm ``stat`` (mean or median), optionally the ``outside`` background (median of the unit's voxels in neither a nucleus nor a cytoplasm region), and the ratio ``(cyto − bg) / (nuc − bg)`` (or its inverse) — NaN where the denominator is not positive or a cell has no cytoplasm. Columns are named after the signal's channel (``p65_cyto_mean``), or ``signal<k>``, or what ``signal_names`` says. **Output.** The nucleus Label table gains the columns (plus ``nuc_voxels`` / ``cyto_voxels``); the cytoplasm is a new label instance under ``name`` — a Voxel raster whose ids ARE the nucleus ids (the join is the id) and its Label table (id, m, t, c, z, y, x, ``area`` in voxels). Resolved spec: category analysis; op ``analysis.cyto_nuc_ratio``; reads VOXEL + LABEL (the nuclei instance), adds VOXEL + LABEL; footprint WHOLE_VOLUME (a ring needs the whole plane or volume around its nucleus); µm params converted along ``pixel_size_um`` (and ``z_step_um`` for a 3D nucleus on a stack); no numba — the work is two scipy EDTs and numpy group reductions.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_volume",
+        "kernel_axes": null,
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [
+          "label",
+          "voxel"
+        ],
+        "reads_by_mode": {},
+        "adds": [
+          "label",
+          "voxel"
+        ]
+      },
+      "modes": [
+        {
+          "name": "cytoplasm",
+          "label": "Cytoplasm",
+          "choices": [
+            "ring",
+            "cells"
+          ],
+          "default": "ring",
+          "description": "Where each nucleus's cytoplasm comes from: a ring grown around the nucleus, or a cell segmentation made on another channel. Either way no nuclear voxel is ever counted as cytoplasm.",
+          "choice_docs": {
+            "ring": "Grow a ring around every nucleus: the voxels between `gap` and `gap + ring width` µm from its edge, owned by the nearest nucleus so neighbouring rings meet halfway and never overlap. Needs only the nuclei — the usual choice when there is no membrane or cytoplasm stain, at the cost of sampling a fixed shell rather than the real cell.",
+            "cells": "Use a cell segmentation from another channel, wired into `cells` (or a second layer on `data`). Where it overlaps a nucleus, the nucleus is removed from it, so the ratio compares cytoplasm with nucleus and never nucleus with itself. A label raster is matched to nuclei by overlap (a cell with two nuclei is split between them, one with none is dropped); a plain mask is split by nearest nucleus."
+          }
+        },
+        {
+          "name": "stat",
+          "label": "Statistic",
+          "choices": [
+            "mean",
+            "median"
+          ],
+          "default": "mean",
+          "description": "How each region's intensity is summarised before the ratio is taken — it names the columns (`_mean` / `_median`).",
+          "choice_docs": {
+            "mean": "The average voxel value of the nucleus and of the cytoplasm — the conventional translocation measure, and the one that matches Measure's `mean_intensity`. A few very bright puncta in the cytoplasm pull it up.",
+            "median": "The middle voxel value: unmoved by puncta, saturated voxels or a sliver of a neighbour's nucleus at the region's edge, so it reports each compartment's bulk level. Prefer it on spotty signals."
+          }
+        },
+        {
+          "name": "background",
+          "label": "Background",
+          "choices": [
+            "none",
+            "outside"
+          ],
+          "default": "none",
+          "description": "What is subtracted from both compartments before the ratio. A camera offset left in both pulls every ratio toward 1.",
+          "choice_docs": {
+            "none": "Nothing: the ratio is of the raw values. Right after a Subtract Background node, or when the offset is negligible against the signal.",
+            "outside": "Subtract the median of the voxels in neither a nucleus nor a cytoplasm region (nor, under `cells`, a cell), per plane — or per volume for 3D nuclei — and per signal, written as `<signal>_background`. Under `ring` that region includes any cytoplasm beyond the ring, which inflates it on confluent cells."
+          }
+        },
+        {
+          "name": "ratio",
+          "label": "Ratio",
+          "choices": [
+            "cyto_over_nuc",
+            "nuc_over_cyto"
+          ],
+          "default": "cyto_over_nuc",
+          "description": "Which way the ratio is taken; it names the column.",
+          "choice_docs": {
+            "cyto_over_nuc": "Cytoplasm ÷ nucleus (`<signal>_cyto_nuc_ratio`): above 1 when the protein sits in the cytoplasm, below 1 when it has entered the nucleus.",
+            "nuc_over_cyto": "Nucleus ÷ cytoplasm (`<signal>_nuc_cyto_ratio`), the N/C convention of most nuclear-translocation assays (NF-κB, YAP): rises as the protein moves in."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The nuclei: a Dataset carrying the nuclear label raster AND its table (Segmentation on the nuclear channel). Their ids are the rows of the result, and their dimensionality decides the rings' — per plane for 2D-segmented nuclei, a 3D shell for 3D ones. With no signal wired, its own image is the one measured."
+        },
+        {
+          "name": "cells",
+          "label": "Cells",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "description": "The cell segmentation from another channel (a membrane or cytoplasm stain), read under Cytoplasm = `cells` — a label raster (matched to nuclei by overlap) or a plain mask (split by nearest nucleus). Must be on the same voxel grid as `data`. Unwired, `cells` mode looks for a second layer on `data`; wired under `ring`, it is refused rather than ignored."
+        },
+        {
+          "name": "signal",
+          "label": "Signal 1",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "The signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Its nucleus, cytoplasm and ratio columns are named after its channel. Unwired (and no other signal wired), the nuclei's own image is measured."
+        },
+        {
+          "name": "signal_2",
+          "label": "Signal 2",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "signal_3",
+          "label": "Signal 3",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "signal_4",
+          "label": "Signal 4",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "signal_5",
+          "label": "Signal 5",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "signal_6",
+          "label": "Signal 6",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "signal_7",
+          "label": "Signal 7",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "signal_8",
+          "label": "Signal 8",
+          "type": "dataset",
+          "role": "dataset",
+          "view_source": true,
+          "passes_domains": false,
+          "grow_group": "signals",
+          "description": "Another signal to measure: one channel, tapped off the same file as `data` (Channel Select), so its voxels line up with the nuclei — a different grid is refused. Each signal adds its own nucleus, cytoplasm and ratio columns, named after its channel. The next empty slot appears once this one is wired."
+        },
+        {
+          "name": "nuclei",
+          "label": "Nuclei",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in": "voxel",
+          "description": "Which label raster on `data` holds the nuclei. Leave it EMPTY and the only label instance on the wire is used (the usual case); name one when the wire carries two. One result row per nucleus id, so this choice decides what gets measured."
+        },
+        {
+          "name": "cells_layer",
+          "label": "Cell layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "cytoplasm": [
+              "cells"
+            ]
+          },
+          "layer_in": "voxel",
+          "layer_from": "cells",
+          "description": "Which raster on `cells` is the cell segmentation. Leave it EMPTY and the only label instance there is used (else the only raster at all). A label raster is matched to nuclei by overlap; a mask is split by nearest nucleus — naming the mask instead of the labels of the same segmentation changes how multi-nucleate cells are divided. Only read under Cytoplasm = `cells`."
+        },
+        {
+          "name": "ring_width",
+          "label": "Ring width",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 3.0,
+          "available_in": {
+            "cytoplasm": [
+              "ring"
+            ]
+          },
+          "pick_kind": "distance",
+          "description": "How thick the cytoplasmic ring is, in µm from where the gap ends — a true Euclidean distance, the same physical length in every direction. WIDER samples more cytoplasm (steadier means) but reaches past small cells into background, which drags `cyto` down and the cyto/nuc ratio with it; narrower stays inside the cell but on fewer voxels. Neighbouring rings stop where they meet. Refused below one pixel. Only read under Cytoplasm = `ring`."
+        },
+        {
+          "name": "gap",
+          "label": "Gap",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 0.0,
+          "description": "A band left out between each nucleus and its cytoplasm, in µm. The nuclear edge is blurred by the optics, so the voxels just outside it carry nuclear signal; a gap of about one PSF width (~0.5 µm at high NA) keeps that out of the cytoplasm mean and makes the ratio more contrasty. 0 (the default) starts the cytoplasm at the first voxel past the nucleus. Applies in both modes."
+        },
+        {
+          "name": "signal_names",
+          "label": "Signal names",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Column names for the signals, comma-separated in slot order (`p65, tubulin`). A blank entry takes the signal's channel name, else `signal<k>`. Renaming changes only the column names, never a value."
+        },
+        {
+          "name": "name",
+          "label": "Cytoplasm layer",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "cytoplasm",
+          "layer_out": [
+            "voxel",
+            "label"
+          ],
+          "description": "The name of the cytoplasm label raster and its table. Its ids ARE the nucleus ids, so the two tables join on `id`; draw it in the Viewer to check the rings before trusting a ratio. Must differ from the nuclei layer."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_cyto_nuc_ratio",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "cells_layer",
+        "gap",
+        "name",
+        "nuclei",
+        "ring_width",
+        "signal_names"
       ]
     },
     "analysis.dic_correlate": {
