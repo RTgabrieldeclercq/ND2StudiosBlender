@@ -18436,6 +18436,55 @@ def test_overlay_resample() -> None:
     assert sorted(set(unflipped.image.get_region(0, 0, 0, 0, 1, 0, 8, 0, 8)
                       .ravel().tolist())) == [26, 27, 34, 35]
 
+    # ── NATIVE resolution: a large secondary tile behind a small field (2026-10-29) ─────────
+    # The TFM case: a 294 µm field under a 1760 µm CRC tile. The field covers a small window
+    # of the tile and is sampled finer than it, so every secondary pixel in that window must
+    # be drawn, magnified. The bake used to read the WHOLE tile and weigh all of its pixels
+    # against the field's output rows, call that minification, and block-average the tile
+    # down to the output size before magnifying it — 0.86 µm/px nuclei baked at 1.7 µm/px.
+    reads = []
+
+    class _Rec(ArrayProvider):
+        def get_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b=0):
+            reads.append((y1 - y0, x1 - x0))
+            return super().get_region(level, m, t, z, c, y0, y1, x0, x1, b=b)
+
+    big_md = {"pixel_size_um": 2.0, "stage_xy_um": [(4.0, 4.0)], "bit_depth": 12,
+              "channel_names": ["GFP"]}
+    big_ax = AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64)      # 128 µm tile centred on field 0
+    tile = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    big = Dataset(axes=big_ax, metadata=big_md).with_image(_Rec(tile.reshape(1, 1, 1, 1, 64, 64)))
+    g = Graph()
+    g.add(NodeInstance("A", "io.load")); g.add(NodeInstance("B", "io.load"))
+    g.add(NodeInstance("O", "view.overlay", modes={"output": "resample"}))
+    g.connect("A", "O"); g.connect("B", "O", dst_socket="secondary")
+    nat = Engine(g, computes=COMPUTES, seeds={"A": pri, "B": big},
+                 meta_seeds={"A": env_p}).pull("O")
+    baked = np.asarray(nat.image.get_region(0, 0, 0, 0, 1, 0, 8, 0, 8))
+    # the 8 µm field spans 4 x 4 tile pixels (rows/cols 30-33): all 16 drawn, each as a 2 x 2
+    # block of the 1 µm output, and nothing else
+    assert sorted(set(baked.ravel().tolist())) == sorted(tile[30:34, 30:34].ravel().tolist()), \
+        sorted(set(baked.ravel().tolist()))
+    assert (baked[0::2, 0::2] == baked[1::2, 1::2]).all() and \
+        (baked[0::2, :] == baked[1::2, :]).all(), baked
+    # ...and only that window was read, not the 64 x 64 tile
+    assert reads and max(r for r, _c in reads) <= 6 and max(c for _r, c in reads) <= 6, reads
+    # the compositor gives the same answer from a WHOLE-tile reader (the Viewer's in-memory
+    # path) as from a windowed one, because it cuts the tile to its window before weighing
+    # minification — 16 native values either way
+    from nodegraph.placement import compose_secondary_plane as _compose_w, pixel_window
+    entry = {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 0.0], "flip_x": True,
+             "flip_y": False, "placed_by": "stage", "t_pairs": [[0, 0, 0.0]]}
+
+    def _windowed(j, w=None):
+        y0, y1, x0, x1 = pixel_window(w, 64, 64)
+        return tile[y0:y1, x0:x1].astype(np.float32), (y0 / 64, y1 / 64, x0 / 64, x1 / 64)
+    whole = _compose_w(entry, (8, 8), pri_md, pri_ax, 0, big_md, big_ax,
+                       lambda j, w=None: tile.astype(np.float32))
+    win = _compose_w(entry, (8, 8), pri_md, pri_ax, 0, big_md, big_ax, _windowed)
+    assert whole is not None and win is not None and np.array_equal(whole, win), (whole, win)
+    assert len(np.unique(whole)) == 16, np.unique(whole)
+
     # the footprint is honest per mode: display reads nothing, resample reads across M
     spec = NODES.get("view.overlay")
     assert spec.resolve_granularity({"output": "display"}) is Granularity.TILEABLE
@@ -18458,7 +18507,10 @@ def test_overlay_resample() -> None:
         "fields sample different (and exactly the predicted) columns of the secondary with "
         "the flip_x default this node shares with Stitch, the footprint resolves "
         "TILEABLE/MULTI_VIEW per mode, the modes memoize apart, and an out-of-range "
-        "secondary channel refuses instead of clamping onto a neighbour")
+        "secondary channel refuses instead of clamping onto a neighbour; a large tile behind "
+        "a small, finer field bakes at its NATIVE resolution (all 16 window pixels, 2 x 2 "
+        "each), reads only that window, and the compositor answers the same from a whole-tile "
+        "reader as from a windowed one")
 
 
 def test_overlay_override_and_presentation() -> None:
@@ -34880,6 +34932,84 @@ def test_unique_objects_langmuir() -> None:
         "and the linear-axis blank leaves the points and the fit")
 
 
+def test_curate_objects() -> None:
+    """A bead QC review applied by id (2026-10-30): ``table.curate_objects`` drops the rows of
+    the ids in Drop (matched before any merge), gives Merge's ``from`` rows the ``to`` id (chains
+    resolved), keeps every column, the row order and the old id in ``object_uid_before``, skips
+    listed ids the table lacks, writes a new table when named and the read table back over
+    itself only when a table node wrote it; it refuses a blank Name on a measured table, a
+    merge into a dropped id, a cycle, a malformed list and a text id column, and announces the
+    added column."""
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # objects 1..6 over three frames; 5 and 6 are one bead split twice (5>4, 6>5)
+    uids = [1, 2, 3, 4, 1, 2, 3, 5, 1, 3, 6, 2]
+    n = len(uids)
+    tab = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.repeat([0, 1, 2], 4),
+           "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+           "object_uid": np.array(uids, dtype=np.int64), "sig": np.arange(n, dtype=float),
+           "stage_x_um": np.array([0., 100, 200, 300, 0, 100, 200, 300, 0, 200, 300, 100]),
+           "stage_y_um": np.zeros(n)}
+    ax = AxisSizes(m=1, t=3, z=1, c=1, y=4, x=4)
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 3, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, tab, layer="beads"))
+
+    def run(params, chain=False):
+        nodes = {"S": NodeInstance("S", "io.load"),
+                 "C": NodeInstance("C", "table.curate_objects", params=params)}
+        edges = [Edge("S", "C", "image", "data")]
+        if chain:      # a table a table node wrote: Unique Objects' "unique"
+            nodes["U"] = NodeInstance("U", "table.unique_objects",
+                                      params={"table": "beads", "tolerance": 1.0})
+            edges = [Edge("S", "U", "image", "data"), Edge("U", "C", "out", "data")]
+        g = Graph(nodes=nodes, edges=edges)
+        return Engine(g, computes=COMPUTES, seeds={"S": seed},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)}).pull("C")
+
+    def table(ds, layer):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.LABEL) if a.layer == layer}
+
+    out = run({"table": "beads", "drop": "2, 99", "merge": "5>4, 6>5", "name": "qc"})
+    q, whole = table(out, "qc"), table(out, "beads")
+    assert len(whole["id"]) == n and "object_uid_before" not in whole, "the input table is whole"
+    assert q["sig"].tolist() == [0., 2, 3, 4, 6, 7, 8, 9, 10], q["sig"]
+    assert q["object_uid"].tolist() == [1, 3, 4, 1, 3, 4, 1, 3, 4], q["object_uid"]
+    assert q["object_uid_before"].tolist() == [1, 3, 4, 1, 3, 5, 1, 3, 6], "old ids kept"
+    assert set(tab) <= set(q), "every column survives"
+    ranged = table(run({"table": "beads", "drop": "1-2", "name": "qc"}), "qc")
+    assert sorted(set(ranged["object_uid"].tolist())) == [3, 4, 5, 6], "a-b is a range"
+    # in place: allowed on a table a table node wrote, refused on a measured one
+    ip = run({"table": "unique", "drop": "1"}, chain=True)
+    u = table(ip, "unique")
+    assert len(u["id"]) == n - 3 and 1 not in u["object_uid"].tolist(), u["object_uid"]
+    assert len(table(ip, "beads")["id"]) == n, "the measured table is untouched"
+    for bad, frag in (({"table": "beads", "drop": "2"}, "Name"),
+                      ({"table": "beads", "drop": "4", "merge": "5>4", "name": "qc"}, "Drop removes"),
+                      ({"table": "beads", "merge": "4>5, 5>4", "name": "qc"}, "cycle"),
+                      ({"table": "beads", "merge": "4>5, 4>6", "name": "qc"}, "both"),
+                      ({"table": "beads", "drop": "two", "name": "qc"}, "not an id"),
+                      ({"table": "beads", "merge": "4-5", "name": "qc"}, "from>to"),
+                      ({"table": "beads", "id_column": "nope", "name": "qc"}, "nope")):
+        try:
+            run(bad)
+        except Exception as ex:                        # noqa: BLE001 — the refusal itself
+            assert frag in str(ex), (bad, ex)
+        else:
+            raise AssertionError(f"Curate Objects accepted {bad}")
+    declared = {(lyr, c) for _d, lyr, c in NODES.get("table.curate_objects").adds_columns(
+        {"table": "beads", "name": "qc"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "object_uid"), (Domain.LABEL, "beads", "sig")))}
+    assert {("qc", "object_uid_before"), ("qc", "sig")} <= declared, declared
+    _ok("curate objects (2026-10-30): Drop removes ids matched before Merge, a-b ranges, "
+        "absent ids skipped; Merge resolves chains and keeps the old id; every column and the "
+        "row order survive; a new table when named, in place only over a table a table node "
+        "wrote; merge-into-dropped, cycles, two-way merges, bad lists and missing columns "
+        "refused; the added column announced")
+
+
 def test_bead_distance_plot() -> None:
     """Capture beads around a spheroid (2026-10-14): a mosaic's stage Z, and Plot XY's
     Colour by / Label by.
@@ -35691,6 +35821,27 @@ def test_gradient_map_standard_curve() -> None:
     lin = sc({"std_where": "sighting=0"}, {"model": "linear"})
     lc = lin.metadata["standard_curve"]["il8_pg_ml"]
     assert lc["model"] == "linear" and lc["slope"] > 0
+    # Uncertainty = monte_carlo (2026-10-29): each row's SD from refits on perturbed standards
+    # (McGhee et al. 2022, Appendix B.1). Standards with no spread give SD 0; spread gives a
+    # positive SD that grows relatively toward the curve's top, and repeats exactly
+    mc_mode = {"uncertainty": "monte_carlo"}
+    exact = sc({"std_weight": "area", "std_where": "sighting=0", "mc_runs": 40}, mc_mode)
+    te = tab(exact, "beads", Domain.LABEL)
+    assert np.allclose(te["il8_pg_ml_sd"][:3], 0.0, atol=1e-6), te["il8_pg_ml_sd"]
+    assert np.isnan(te["il8_pg_ml_sd"][3]) and np.isnan(te["il8_pg_ml_sd"][5]), \
+        "above Bmax and no signal have no SD"
+    ue = exact.metadata["standard_curve"]["il8_pg_ml"]["uncertainty"]
+    assert ue["runs"] == 40 and ue["fitted"] == 40 and ue["column"] == "il8_pg_ml_sd", ue
+    spread_p = {"std_weight": "area", "mc_runs": 300, "x_rel_sd": 0.02}
+    n1 = tab(sc(spread_p, mc_mode), "beads", Domain.LABEL)
+    n2 = tab(sc(spread_p, mc_mode), "beads", Domain.LABEL)
+    rel = n1["il8_pg_ml_sd"][:3] / n1["il8_pg_ml"][:3]
+    assert (n1["il8_pg_ml_sd"][:3] > 0).all() and rel[2] > rel[0], (rel, n1["il8_pg_ml_sd"])
+    assert np.array_equal(n1["il8_pg_ml_sd"], n2["il8_pg_ml_sd"], equal_nan=True), "seeded"
+    assert "il8_pg_ml_sd" not in tab(fit, "beads", Domain.LABEL), "off by default"
+    sc_cols = lambda m: {c for _d, _l, c in NODES.get("table.standard_curve").adds_columns(  # noqa: E731
+        {"table": "beads", "name": "il8_pg_ml"}, m, ((Domain.LABEL, "beads", "rpe_bgsub"),))}
+    assert "il8_pg_ml_sd" in sc_cols(mc_mode) and "il8_pg_ml_sd" not in sc_cols({}), sc_cols({})
     pts, blank = standard_points(np.array([1.0, 1.0, 0.0]), np.array([10.0, 20.0, 3.0]),
                                  np.array([3.0, 1.0, 1.0]))
     assert pts == [(1.0, 12.5, 2)] and blank["mean"] == 3.0 and blank["n"] == 1
@@ -35773,7 +35924,9 @@ def test_gradient_map_standard_curve() -> None:
         "blanks the source; 3-D distances let a far object weigh as far; idw needs no "
         "source, the trend methods refuse without one; Standard Curve recovers Bmax/Kd from "
         "weighted, filtered standards, inverts exactly and flags LOD / range / Bmax; typed and "
-        "linear curves; Plot Field marks, log scale, colour-bar label, extend arrow and group "
+        "linear curves; its Monte Carlo writes each row's SD (0 for spread-free standards, "
+        "growing toward the top, seeded, announced at edit time); Plot Field marks, log "
+        "scale, colour-bar label, extend arrow and group "
         "titles; Plot XY's absolute weighting and trendline span (a number or a column's "
         "median, drawn only); Measure flips a mosaic like a camera field")
 
@@ -35800,6 +35953,7 @@ def test_point_source_fit() -> None:
     from nodegraph.catalog.analysis.gradient_map import point_source_trend
     from nodegraph.nodes import COMPUTES
     from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import NODES
     from nodegraph.structure import StructureTable
 
     D_TRUE, JD0, H = 25.0, 2461000.0, 3600.0
@@ -35880,6 +36034,72 @@ def test_point_source_fit() -> None:
     assert np.allclose(wr["background_pg_ml"], [30.0, 400.0], rtol=1e-3), wr
     wb = tab(wout, "beads")
     assert np.allclose(wb["crank"], wb["conc"], rtol=1e-4)
+    # a flat profile (Run 4's late hourly passes) has no point source: the rate is the bound
+    # itself, 0, not the ~1e-20 'trf' stops at, which printed as "q = 3.54e-20 fg/s"
+    flat = tab(pull(beads(lambda rr, tt: np.where(tt == t[0], 50.0, 900.0) + 0.0 * rr),
+                    {"D": D_TRUE}, {"rate": "constant", "background": "uniform",
+                                    "weight": "sqrt"}), "crank_rates")
+    assert np.all(np.asarray(flat["q_fg_s"]) == 0.0), flat["q_fg_s"]
+    assert np.allclose(flat["background_pg_ml"], [50.0, 900.0], rtol=1e-3), flat
+    # Uncertainty = monte_carlo (2026-10-29, the paper's Appendix B.3): with every spread 0 the
+    # runs ARE the least-squares fit (SD 0); with spread, the mean stays near the truth, the
+    # SD is positive, lo/hi are mean -/+ SD, and the seed repeats it exactly
+    mcm = {"rate": "constant", "background": "uniform", "weight": "absolute",
+           "uncertainty": "monte_carlo"}
+    mcp = {"D": D_TRUE, "mc_runs": 300, "D_sd": 0.0, "t_sd": 0.0, "r_sd": 0.0,
+           "value_rel_sd": 0.0}
+    m0 = tab(pull(walled, mcp, mcm), "crank_rates")
+    assert np.allclose(m0["q_fg_s"], [0.4, 0.7], rtol=1e-6), m0["q_fg_s"]
+    assert np.allclose(m0["q_sd_fg_s"], 0.0, atol=1e-9), m0["q_sd_fg_s"]
+    assert np.allclose(m0["background_pg_ml"], [30.0, 400.0], rtol=1e-6), m0
+    assert np.allclose(m0["background_sd_pg_ml"], 0.0, atol=1e-9), m0
+    spread = dict(mcp, D_sd=5.0, r_sd=30.0, t_sd=600.0, value_rel_sd=0.1)
+    mo = pull(walled, spread, mcm)
+    m1, m2 = tab(mo, "crank_rates"), tab(pull(walled, spread, mcm), "crank_rates")
+    assert (m1["q_sd_fg_s"] > 0).all() and (m1["background_sd_pg_ml"] > 0).all(), m1
+    assert np.allclose(m1["q_fg_s"], [0.4, 0.7], rtol=0.15), m1["q_fg_s"]
+    assert np.array_equal(m1["q_fg_s"], m2["q_fg_s"]), "the Monte Carlo is seeded"
+    assert np.allclose(m1["q_lo_fg_s"], m1["q_fg_s"] - m1["q_sd_fg_s"])
+    assert np.allclose(m1["q_ci_fg_s"], m1["q_sd_fg_s"])
+    # D's draw is lognormal: with its SD as large as D itself (a normal draw would put 16 % of
+    # runs at D <= 0 and some just above, where a run needs ~1e100 fg/s) the mean stays sane
+    wide = tab(pull(walled, dict(spread, D_sd=D_TRUE), mcm), "crank_rates")
+    assert np.isfinite(wide["q_fg_s"]).all() and \
+        (wide["q_fg_s"] < 3 * np.array([0.4, 0.7])).all(), wide["q_fg_s"]
+    mrec = mo.metadata["point_source_fit"]["conc"]
+    assert mrec["uncertainty"]["method"] == "monte_carlo" and mrec["uncertainty"]["runs"] == 300
+    assert all("q_nominal_fg_s" in g and "q_sd_fg_s" in g for g in mrec["groups"]), mrec
+    # each timepoint's stream is seeded by its LABEL: T1 alone gets what T1 got beside T2 (a
+    # subset of passes fitted for a combined plot agrees with the full fit)
+    rr2 = np.concatenate([r, r])
+    tt2 = np.concatenate([np.full(r.size, t[0]), np.full(r.size, t[1])])
+    yy2 = 0.5 * PS.unit_response(rr2, tt2, D_TRUE) + 10.0
+    kw_mc = dict(D=D_TRUE, background="uniform", n_runs=200, D_sd=5.0, t_sd=60.0, r_sd=20.0)
+    both = PS.monte_carlo(rr2, tt2, yy2, 0.1 * yy2, np.repeat([0, 1], r.size), 2,
+                          labels=["T1", "T2"], **kw_mc)
+    alone = PS.monte_carlo(rr2[:r.size], tt2[:r.size], yy2[:r.size], 0.1 * yy2[:r.size],
+                           np.zeros(r.size, int), 1, labels=["T1"], **kw_mc)
+    assert both["q_mean"][0] == alone["q_mean"][0] and both["q_sd"][0] == alone["q_sd"][0], \
+        (both, alone)
+    # a per-row SD column (here 100 % of each value) widens the spread the relative 0 had not
+    msd = tab(pull(walled, dict(mcp, value_sd="conc"), mcm), "crank_rates")
+    assert (msd["q_sd_fg_s"] > 0).all(), msd["q_sd_fg_s"]
+    # Fit span: a near bead read 10x too bright pulls the rate up unless the span drops it;
+    # a column bound is that column's median
+    bright = beads(lambda rr, tt: np.where(tt == t[0], q_true["T1"], q_true["T2"])
+                   * PS.unit_response(rr, tt, D_TRUE) * np.where(rr == r[0], 10.0, 1.0))
+    absm = {"rate": "constant", "weight": "absolute"}
+    skewed = tab(pull(bright, {"D": D_TRUE}, absm), "crank_rates")
+    clean = pull(bright, {"D": D_TRUE, "fit_span": f"{r[1] - 1:g},"}, absm)
+    assert (skewed["q_fg_s"] > 1.2 * np.array([0.4, 0.7])).all(), skewed["q_fg_s"]
+    assert np.allclose(tab(clean, "crank_rates")["q_fg_s"], [0.4, 0.7], rtol=1e-6)
+    assert clean.metadata["point_source_fit"]["conc"]["n"] == 2 * (r.size - 1)
+    by_col = pull(bright, {"D": D_TRUE, "fit_span": "dist,"}, absm)
+    assert by_col.metadata["point_source_fit"]["conc"]["n"] == 2 * int((r >= np.median(r)).sum())
+    assert np.allclose(tab(by_col, "crank_rates")["q_fg_s"], [0.4, 0.7], rtol=1e-6)
+    psf_cols = {c for _d, lyr, c in NODES.get("table.point_source_fit").adds_columns(
+        {"name": "crank"}, {}, ()) if lyr == "crank_rates"}
+    assert {"q_sd_fg_s", "background_sd_pg_ml"} <= psf_cols, psf_cols
     # piecewise: a rate history comes back from both timepoints at once
     hist = {"rate": "piecewise", "D": D_TRUE, "breaks_s": [0.0, t[0], t[1]],
             "q_fg_s": [0.3, 0.9]}
@@ -35887,10 +36107,18 @@ def test_point_source_fit() -> None:
                   {"rate": "piecewise"}), "crank_rates")
     assert np.allclose(pw["q_fg_s"], [0.3, 0.9], rtol=1e-3), pw["q_fg_s"]
     assert np.allclose(pw["t_mid_h"], [7.5, 20.0]), pw["t_mid_h"]
-    for bad, why in (({"value": ""}, "Value"), ({"name": "conc"}, "already has")):
+    for bad, bad_modes, why in (
+            ({"value": ""}, {}, "Value"), ({"name": "conc"}, {}, "already has"),
+            ({"fit_span": "1,2,3"}, {}, "low, high"), ({"fit_span": "nope,"}, {}, "nope"),
+            ({"mc_runs": 10}, {"uncertainty": "monte_carlo", "weight": "sqrt"}, "absolute"),
+            ({"mc_runs": 10}, {"uncertainty": "monte_carlo", "weight": "absolute",
+                               "rate": "piecewise"}, "constant"),
+            ({"mc_runs": 1}, {"uncertainty": "monte_carlo", "weight": "absolute"}, "at least 2"),
+            ({"value_sd": "nope"}, {"uncertainty": "monte_carlo", "weight": "absolute"},
+             "Value SD")):
         try:
-            pull(const, bad)
-            raise AssertionError(f"Point-Source Fit must refuse {bad}")
+            pull(const, bad, bad_modes)
+            raise AssertionError(f"Point-Source Fit must refuse {bad} {bad_modes}")
         except ValueError as exc:
             assert why in str(exc), str(exc)
 
@@ -35947,10 +36175,362 @@ def test_point_source_fit() -> None:
         "history back by superposition, half the rate on an impermeable floor, a finite "
         "well's uniform level back beside each rate under square-root weighting; times from "
         "each row's clock plus Source started; a rates table with bootstrap intervals; the "
+        "paper's Monte Carlo (spread-free runs ARE the fit, SD 0; with spread the mean holds, "
+        "lo/hi = mean ∓ SD, seeded; a per-row SD column) and Fit span (a too-bright near bead "
+        "dropped; a column's median as the bound); refusals; the "
         "fit's record carries the standard curve, so Plot XY draws the model through each "
         "timepoint's beads in pg/mL and in MFI, and refuses another X; Error = column draws "
         "a column's half-widths; Gradient Map refits only the profile's amplitude, exactly; "
         "If/Else splits a raster-less Label table")
+
+
+def _pixel_fixture():
+    """The Members = pixel fixture: 2 frames × 2 planes × 2 channels, a BIJECTION image (every
+    voxel a different number, so an address off by one in any axis is a different value) and
+    three regions — region 1 a 3×3 square (whose distances are known by hand)."""
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+    M, T, Z, C, Y, X = 1, 2, 2, 2, 10, 12
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 2.0, "bit_depth": 16,
+            "channel_names": ["DAPI", "GFP"]}
+    t_, z_, c_, y_, x_ = np.meshgrid(np.arange(T), np.arange(Z), np.arange(C), np.arange(Y),
+                                     np.arange(X), indexing="ij")
+    img = (100000.0 * t_ + 10000.0 * z_ + 1000.0 * c_ + 100.0 * y_ + x_)[None].astype(float)
+    lab = np.zeros((M, T, Z, C, Y, X), dtype=np.int64)
+    lab[0, 0, 0, :, 1:4, 1:4] = 1               # 3x3 square: centre (2, 2)
+    lab[0, 1, 1, :, 5:9, 6:11] = 2
+    lab[0, 0, 1, :, 6:8, 0:2] = 3
+    ltab = _ST(D.LABEL, {"id": np.array([1, 2, 3]), "m": np.zeros(3, np.int64),
+                         "t": np.array([0, 1, 0]), "c": np.zeros(3, np.int64),
+                         "z": np.array([0.0, 1.0, 1.0]), "y": np.array([2.0, 6.5, 6.5]),
+                         "x": np.array([2.0, 8.0, 0.5])}, layer="labels", z_kind="plane_index")
+    ds = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+          .with_layer(D.VOXEL, "labels", lab).with_structure(ltab))
+    return ax, meta, img, lab, ds
+
+
+def test_measure_pixels() -> None:
+    """``analysis.measure`` with Members = pixel (2026-11-02) — one row per voxel.
+
+    A third ``target``: the voxels of chosen regions (or of the volume) become a Point table of
+    their own, so the distribution INSIDE an object — rim vs core, colocalization, a histogram
+    — is a table rather than a summary. What is asserted, and what each would catch:
+
+    1. **Parity.** ``intensity`` averaged per ``label_id`` IS the label branch's
+       ``mean_intensity`` and the row count its ``area`` — every voxel gathered, each in the
+       right region, nothing twice.
+    2. **Every address.** Against a bijection image, each per-channel column is the image at
+       the row's own (t, z, c, y, x) — a transposed axis is a different number, not a near one.
+    3. **Schema.** Invariant coordinates, ``z_kind = plane_index`` (no sub-pixel part), marked
+       as a pixel table, µm from the calibration, and the edit-time column catalog equal to
+       what the pull wrote (a column the catalog misses is unpickable downstream).
+    4. **ids** narrow to the named regions; ids matching none are refused, as is a non-id.
+    5. **volume** writes m·t·z·c·y·x rows, background ``label_id`` 0.
+    6. **A plain mask** is accepted here — the label branch rightly refuses it.
+    7. **max_rows** refuses before reading anything, naming the count.
+    8. **geometry** by hand on the 3×3 square: centre 2 px from outside, rim 1 px; centroid
+       distance 0 at the centre, √2 px at a corner.
+    9. **raw** redirects the sampled pixels.
+    10. **Re-running** replaces an earlier pixel table whole; a detection table's name is
+        refused rather than overwritten.
+    11. **Table Join on `label`** hands each pixel its region's columns.
+    12. The three targets **memoize apart**.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import COORD_COLUMNS as _COORD
+    from nodegraph.structure import StructureTable as _ST
+    from nodegraph.tables import pixel_layers
+    ax, meta, img, lab, base = _pixel_fixture()
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    define_node("io.pixseed", "S", outputs=[OutDataset()])
+
+    def run(nodes, edges, sink, seed=base, extra=None):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b, *sock in edges:
+            g.connect(a, b, **({"dst_socket": sock[0]} if sock else {}))
+        seeds = {"S": seed, **(extra or {})}
+        e = Engine(g, computes=COMPUTES, seeds=seeds,
+                   meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                               for k, v in seeds.items()})
+        return e, e.pull(sink)
+
+    def table(out, layer="pixels"):
+        return {a.name: np.asarray(a.values) for a in out.layers_on(D.POINT)
+                if a.layer == layer}
+
+    PX = {"modes": {"target": "pixel"}}
+    e, out = run([("S", "io.pixseed", {}), ("Q", "analysis.measure", PX)], [("S", "Q")], "Q")
+    px = table(out)
+
+    # ── 1. parity with the label branch ───────────────────────────────────────────
+    _, obj = run([("S", "io.pixseed", {}),
+                  ("Q", "analysis.measure", {"params": {"stats": "mean,count"}})],
+                 [("S", "Q")], "Q")
+    ids = obj.get(D.LABEL, "id", layer="labels").values.tolist()
+    means = obj.get(D.LABEL, "mean_intensity", layer="labels").values
+    areas = obj.get(D.LABEL, "area", layer="labels").values
+    for i, mean, area in zip(ids, means, areas):
+        sel = px["label_id"] == i
+        assert int(sel.sum()) == int(area), (i, int(sel.sum()), area)
+        assert np.isclose(float(px["intensity"][sel].astype(float).mean()), float(mean)), \
+            (i, px["intensity"][sel].mean(), mean)
+    assert len(px["id"]) == int(np.count_nonzero(lab))
+
+    # ── 2. every row is the image at its own address ──────────────────────────────
+    t, z, c, y, x = (px[k].astype(int) for k in ("t", "z", "c", "y", "x"))
+    assert np.array_equal(px["intensity"], img[0, t, z, c, y, x].astype(np.float32))
+    assert np.array_equal(px["DAPI_intensity"], img[0, t, z, 0, y, x].astype(np.float32))
+    assert np.array_equal(px["GFP_intensity"], img[0, t, z, 1, y, x].astype(np.float32))
+    assert np.array_equal(px["label_id"], lab[0, t, z, c, y, x])
+
+    # ── 3. schema, provenance, the edit-time catalog ──────────────────────────────
+    assert set(_COORD) <= set(px), sorted(px)
+    assert out.structure_zkind(D.POINT, "pixels") == "plane_index"
+    assert pixel_layers(out.metadata) == {"pixels"}
+    assert np.allclose(px["x_um"], x * 0.5) and np.allclose(px["z_um"], z * 2.0)
+    assert np.array_equal(px["id"], np.arange(1, len(px["id"]) + 1))
+    declared = {col for d, lyr, col in e.env("Q").column_names
+                if d is D.POINT and lyr == "pixels"}
+    assert declared == set(px), (sorted(declared ^ set(px)))
+    assert (D.POINT, "pixels") in e.env("Q").layer_names
+    assert "pixel_size_um" in dict(e.entry("Q").reads)
+
+    # ── 4. ids ────────────────────────────────────────────────────────────────────
+    _, o2 = run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure", {**PX, "params": {"ids": "1, 3"}})],
+                [("S", "Q")], "Q")
+    assert set(table(o2)["label_id"].tolist()) == {1, 3}
+    for bad, msg in (("99", "none of the ids"), ("1, two", "is not a region id")):
+        try:
+            run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure", {**PX, "params": {"ids": bad}})], [("S", "Q")], "Q")
+            raise AssertionError(f"ids {bad!r} must be refused")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+
+    # ── 5. volume ─────────────────────────────────────────────────────────────────
+    _, o3 = run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure",
+                  {"modes": {"target": "pixel", "pixels_of": "volume"}})], [("S", "Q")], "Q")
+    vol = table(o3)
+    assert len(vol["id"]) == lab.size
+    assert int((vol["label_id"] == 0).sum()) == int((lab == 0).sum())
+
+    # ── 6. a plain mask: honest here, refused by the label branch ────────────────
+    mask_ds = (Dataset(axes=ax, metadata=meta).with_image(base.image)
+               .with_layer(D.VOXEL, "mask", (lab > 0).astype(np.uint8)))
+    _, o4 = run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure", {**PX, "params": {"labels": "mask"}})],
+                [("S", "Q")], "Q", seed=mask_ds)
+    assert set(table(o4)["label_id"].tolist()) == {1}
+    assert len(table(o4)["id"]) == int(np.count_nonzero(lab))
+    try:
+        run([("S", "io.pixseed", {}),
+             ("Q", "analysis.measure", {"params": {"labels": "mask"}})],
+            [("S", "Q")], "Q", seed=mask_ds)
+        raise AssertionError("the label branch must still refuse a bare mask")
+    except ValueError as exc:
+        assert "not a LABEL raster" in str(exc), exc
+
+    # ── 7. max_rows ───────────────────────────────────────────────────────────────
+    try:
+        run([("S", "io.pixseed", {}),
+             ("Q", "analysis.measure", {**PX, "params": {"max_rows": 5}})], [("S", "Q")], "Q")
+        raise AssertionError("max_rows must refuse")
+    except ValueError as exc:
+        assert f"{int(np.count_nonzero(lab)):,} rows" in str(exc), exc
+
+    # ── 8. geometry by hand on the 3x3 square (2-D: plane_index labels) ──────────
+    if _HAVE_SKIMAGE:                                   # scipy rides with skimage here
+        _, o5 = run([("S", "io.pixseed", {}),
+                     ("Q", "analysis.measure",
+                      {**PX, "params": {"geometry": "edge_dist,centroid_dist", "ids": "1"}})],
+                    [("S", "Q")], "Q")
+        g5 = table(o5)
+        at = lambda yy, xx: np.flatnonzero((g5["y"] == yy) & (g5["x"] == xx) & (g5["c"] == 0))[0]  # noqa: E731
+        assert np.isclose(g5["edge_dist_um"][at(2, 2)], 1.0), g5["edge_dist_um"][at(2, 2)]
+        assert np.isclose(g5["edge_dist_um"][at(1, 1)], 0.5)
+        assert np.isclose(g5["centroid_dist_um"][at(2, 2)], 0.0)
+        assert np.isclose(g5["centroid_dist_um"][at(1, 1)], np.sqrt(2) * 0.5)
+
+    # ── 9. raw ────────────────────────────────────────────────────────────────────
+    define_node("io.pixraw", "R", outputs=[OutDataset()])
+    raw_ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img + 7.0))
+    _, o6 = run([("S", "io.pixseed", {}), ("R", "io.pixraw", {}),
+                 ("Q", "analysis.measure", PX)], [("S", "Q"), ("R", "Q", "raw")], "Q",
+                extra={"R": raw_ds})
+    assert np.allclose(table(o6)["intensity"], px["intensity"] + 7.0)
+
+    # ── 10. re-run replaces whole; a detection table's name is refused ────────────
+    _, o7 = run([("S", "io.pixseed", {}), ("Q", "analysis.measure", PX),
+                 ("Q2", "analysis.measure", {**PX, "params": {"ids": "2"}})],
+                [("S", "Q"), ("Q", "Q2")], "Q2")
+    t7 = table(o7)
+    assert set(t7["label_id"].tolist()) == {2} and len({len(v) for v in t7.values()}) == 1
+    spots = _ST(D.POINT, {"id": np.array([1]), "m": np.array([0]), "t": np.array([0]),
+                          "c": np.array([0]), "z": np.array([0.0]), "y": np.array([1.0]),
+                          "x": np.array([1.0])}, layer="spots", z_kind="plane_index")
+    try:
+        run([("S", "io.pixseed", {}),
+             ("Q", "analysis.measure", {**PX, "params": {"pixels": "spots"}})],
+            [("S", "Q")], "Q", seed=base.with_structure(spots))
+        raise AssertionError("a detection table's name must be refused")
+    except ValueError as exc:
+        assert "already a Point table" in str(exc), exc
+
+    # ── 11. Table Join on `label`: every pixel gets its region's columns ──────────
+    _, o8 = run([("S", "io.pixseed", {}),
+                 ("O", "analysis.measure", {"params": {"stats": "mean,count"}}),
+                 ("Q", "analysis.measure", PX),
+                 ("J", "table.join", {"modes": {"domain": "point", "other_domain": "label",
+                                                "on": "label"},
+                                      "params": {"table": "pixels", "other_table": "labels"}})],
+                [("S", "O"), ("O", "Q"), ("Q", "J")], "J")
+    j = table(o8, "joined")
+    want = dict(zip(ids, means))
+    assert np.allclose(j["other_mean_intensity"],
+                       [want[int(i)] for i in j["label_id"].tolist()])
+
+    # ── 12. the three targets memoize apart ───────────────────────────────────────
+    hashes = set()
+    with_spots = base.with_structure(spots)          # the point target needs a Point table
+    for target in ("label", "point", "pixel"):
+        eng, _o = run([("S", "io.pixseed", {}),
+                       ("Q", "analysis.measure", {"modes": {"target": target}})],
+                      [("S", "Q")], "Q", seed=with_spots)
+        hashes.add(eng.entry("Q").recipe_hash)
+    assert len(hashes) == 3, hashes
+    _ok("measure pixels (2026-11-02): one row per voxel as a Point table (plane_index, "
+        "marked) — intensity per label_id reproduces mean_intensity and area; every "
+        "per-channel column is the image at its own address; catalog == pull; ids narrow and "
+        "refuse a miss; volume writes every voxel; a mask is accepted (the label branch "
+        "still refuses it); max_rows refuses first; edge/centroid distances by hand; raw "
+        "redirects; a re-run replaces whole and a detection table is never overwritten; "
+        "Table Join on `label` hands each pixel its region's columns")
+
+
+def test_table_export_split() -> None:
+    """The table export (2026-11-02): a pixel table — or one longer than a spreadsheet opens
+    — goes to a file of its own, written column-wise; everything else keeps the one long
+    file it always had. And ``io.write_table`` writes the same files from inside a graph.
+
+    1. CSV and Parquet: the object table stays in the long file (domain/layer columns), the
+       pixel table goes to ``<stem>_pixels``, every row of each.
+    2. A lone pixel table is written to the path asked for.
+    3. An over-long ordinary table splits off the same way (threshold patched down).
+    4. The node: auto format with no extension writes the shared CSV and the pixel Parquet,
+       hands the Dataset on unchanged, ``refuse`` checks every file first, a mismatched
+       extension and an empty path are refused, per_table gives every table a file.
+    5. The old ``nodelab_v2`` import paths are the same objects.
+    """
+    import os
+    import tempfile
+    import nodegraph.table_export as TE
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.tables import mark_pixel_table
+    from nodegraph.structure import StructureTable as _ST
+    ax, meta, img, lab, base = _pixel_fixture()
+    define_node("io.expseed", "S", outputs=[OutDataset()])
+
+    def pull(nodes, edges, sink, seed=base):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b in edges:
+            g.connect(a, b)
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=seed.axes, metadata=seed.metadata)})
+        return e.pull(sink)
+
+    PX = {"modes": {"target": "pixel"}}
+    out = pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX)], [("S", "Q")], "Q")
+    n_px = int(np.count_nonzero(lab))
+    tmp = tempfile.mkdtemp(prefix="nd2tab_")
+
+    # ── 1. split: long file for the regions, a file of its own for the pixels ─────
+    files = TE.export_dataset_files(out, os.path.join(tmp, "a.csv"))
+    assert [os.path.basename(p) for p, _n in files] == ["a.csv", "a_pixels.csv"], files
+    assert dict((os.path.basename(p), n) for p, n in files) == {"a.csv": 3,
+                                                               "a_pixels.csv": n_px}
+    with open(os.path.join(tmp, "a.csv"), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert lines[0].startswith("domain,layer,") and len(lines) == 4
+    assert not any(ln.startswith("point,") for ln in lines)
+    with open(os.path.join(tmp, "a_pixels.csv"), encoding="utf-8") as f:
+        assert len(f.read().splitlines()) == n_px + 1
+    assert not any(n.endswith((".part.csv", ".part.parquet")) for n in os.listdir(tmp))
+    try:
+        import pyarrow.parquet as _pq
+    except ImportError:                                 # pragma: no cover - env without it
+        _pq = None
+    if _pq is not None:
+        TE.export_dataset_files(out, os.path.join(tmp, "b.parquet"))
+        back = _pq.read_table(os.path.join(tmp, "b_pixels.parquet"))
+        assert back.num_rows == n_px and "label_id" in back.column_names
+
+    # ── 2. a lone pixel table is written to the path asked for ────────────────────
+    cols = {a.name: a.values for a in out.layers_on(D.POINT) if a.layer == "pixels"}
+    lone = mark_pixel_table(Dataset(axes=ax, metadata={}).with_structure(
+        _ST(D.POINT, cols, layer="pixels", z_kind="plane_index")), "pixels")
+    files = TE.export_dataset_files(lone, os.path.join(tmp, "lone.csv"))
+    assert [os.path.basename(p) for p, _n in files] == ["lone.csv"]
+
+    # ── 3. an over-long ordinary table splits off too ─────────────────────────────
+    one = _ST(D.POINT, {"id": np.array([1]), "m": np.array([0]), "t": np.array([0]),
+                        "c": np.array([0]), "z": np.array([0.0]), "y": np.array([1.0]),
+                        "x": np.array([1.0])}, layer="spots", z_kind="plane_index")
+    keep = TE.EXCEL_MAX_ROWS
+    try:
+        TE.EXCEL_MAX_ROWS = 3                           # 2 data rows fit, 3 labels do not
+        files = TE.export_dataset_files(base.with_structure(one),
+                                        os.path.join(tmp, "long.csv"))
+        assert [(os.path.basename(p), n) for p, n in files] == [
+            ("long.csv", 1), ("long_labels.csv", 3)], files
+    finally:
+        TE.EXCEL_MAX_ROWS = keep
+
+    # ── 4. the node ───────────────────────────────────────────────────────────────
+    stem = os.path.join(tmp, "run")
+    W = ("W", "io.write_table", {"params": {"path": stem}})
+    w_out = pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX), W],
+                 [("S", "Q"), ("Q", "W")], "W")
+    assert set(w_out.attributes) == set(out.attributes), "Export Table must pass through"
+    assert os.path.exists(stem + ".csv")
+    if _pq is not None:
+        assert _pq.read_table(stem + "_pixels.parquet").num_rows == n_px
+    for kw, msg in (({"params": {"path": stem}, "modes": {"existing": "refuse"}},
+                     "already exist"),
+                    ({"params": {"path": stem + ".parquet"}, "modes": {"format": "csv"}},
+                     "but Format is csv"),
+                    ({"params": {"path": ""}}, "has no destination")):
+        try:
+            pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX),
+                  ("W", "io.write_table", kw)], [("S", "Q"), ("Q", "W")], "W")
+            raise AssertionError(f"Export Table must refuse: {msg}")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+    per = os.path.join(tmp, "per")
+    pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX),
+          ("W", "io.write_table", {"params": {"path": per},
+                                   "modes": {"format": "csv", "layout": "per_table"}})],
+         [("S", "Q"), ("Q", "W")], "W")
+    assert os.path.exists(per + "_labels.csv") and os.path.exists(per + "_pixels.csv")
+
+    # ── 5. the old import paths ───────────────────────────────────────────────────
+    import nodelab_v2.export as _old_export
+    import nodelab_v2.tables as _old_tables
+    import nodegraph.tables as _new_tables
+    assert _old_export.export_dataset is TE.export_dataset
+    assert _old_tables.all_tables is _new_tables.all_tables
+    _ok("table export split (2026-11-02): a pixel table (and an over-long one) gets a file of "
+        "its own, column-wise, CSV and Parquet; the rest keep the long file; a lone pixel "
+        "table lands on the path asked for; Export Table writes the same from a graph, "
+        "passes the Dataset through, refuses an existing file / a mismatched format / no "
+        "path, and per_table splits every table; the nodelab_v2 paths re-export the engine's")
 
 
 def main() -> int:
@@ -36185,6 +36765,7 @@ def main() -> int:
     test_nd2_true_clock()
     test_standard_curve_trendline()
     test_unique_objects_langmuir()
+    test_curate_objects()
     test_pooled_pixel_spread()
     test_bead_distance_plot()
     test_overlay_union_axes()
@@ -36192,6 +36773,8 @@ def main() -> int:
     test_register_positions_exponential()
     test_gradient_map_standard_curve()
     test_point_source_fit()
+    test_measure_pixels()
+    test_table_export_split()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 

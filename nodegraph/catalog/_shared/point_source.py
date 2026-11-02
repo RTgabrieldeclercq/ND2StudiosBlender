@@ -25,8 +25,9 @@ Two rate models, both linear in the rates:
 
 Fitted in data units (``absolute``, non-negative least squares) or on the logarithm
 (``relative``, every point weighed by its relative miss, as the exponential trendline does);
-``D`` fixed or chosen by profile over a log grid. Numpy + scipy (``erfc``, ``nnls``,
-``least_squares``).
+``D`` fixed or chosen by profile over a log grid. :func:`monte_carlo` gives the rates' mean and
+SD the paper's way (its Appendix B.3: refits on perturbed concentrations, distances, times and
+D). Numpy + scipy (``erfc``, ``nnls``, ``least_squares``).
 """
 from __future__ import annotations
 
@@ -44,21 +45,27 @@ BACKGROUNDS = ("none", "uniform")
 #: The D profile's search range (µm²/s) and grid when D is fitted.
 D_RANGE = (0.5, 500.0)
 _D_GRID = 49
+#: :func:`monte_carlo`'s seed (the paper's publication date), so a run is reproducible.
+MC_SEED = 20221107
 
 
-def unit_response(r: np.ndarray, tau: np.ndarray, D: float,
+def unit_response(r: np.ndarray, tau: np.ndarray, D,
                   boundary: str = "infinite") -> np.ndarray:
     """pg/mL at ``r`` µm from a source of 1 fg/s switched on ``tau`` seconds ago: Crank's
     continuous point source ``erfc(r / 2√(Dτ)) / (4πDr)``, doubled on an impermeable floor.
-    0 where ``tau <= 0`` (the source not yet on) and NaN where ``r <= 0``."""
+    0 where ``tau <= 0`` (the source not yet on) or ``D <= 0``, NaN where ``r <= 0``. ``D``
+    may be an array broadcasting with ``r`` and ``tau`` (one D per Monte Carlo run)."""
     from scipy.special import erfc
     r = np.asarray(r, dtype=float)
     tau = np.asarray(tau, dtype=float)
-    out = np.zeros(np.broadcast(r, tau).shape)
-    on = (tau > 0) & (r > 0)
-    rr, tt = np.broadcast_to(r, out.shape)[on], np.broadcast_to(tau, out.shape)[on]
-    out[on] = erfc(rr / (2.0 * np.sqrt(D * tt))) / (4.0 * math.pi * D * rr)
-    out[np.broadcast_to(r, out.shape) <= 0] = np.nan
+    dv = np.asarray(D, dtype=float)
+    shape = np.broadcast(r, tau, dv).shape
+    rb, tb, db = (np.broadcast_to(v, shape) for v in (r, tau, dv))
+    out = np.zeros(shape)
+    on = (tb > 0) & (rb > 0) & (db > 0)
+    rr, tt, dd = rb[on], tb[on], db[on]
+    out[on] = erfc(rr / (2.0 * np.sqrt(dd * tt))) / (4.0 * math.pi * dd * rr)
+    out[rb <= 0] = np.nan
     return out * FG_UM3_TO_PG_ML * (2.0 if boundary == "half_space" else 1.0)
 
 
@@ -83,7 +90,12 @@ def _solve(A: np.ndarray, y: np.ndarray, weight: str) -> np.ndarray:
             sol = least_squares(lambda q: np.sqrt(np.maximum(A @ q, 0.0)) - ry,
                                 np.maximum(q0, 1e-9), bounds=(0.0, np.inf), x_scale="jac",
                                 max_nfev=5000)
-            return sol.x
+            # 'trf' keeps its iterates strictly inside the bounds, so a rate pinned at 0 comes
+            # back as ~1e-20 and a legend prints "q = 3.54e-20 fg/s"; a lower bound the
+            # solver reports active IS the bound
+            q = np.array(sol.x, dtype=float)
+            q[np.asarray(sol.active_mask) == -1] = 0.0
+            return q
         except (ValueError, RuntimeError):
             return q0
     if weight != "relative":
@@ -208,6 +220,100 @@ def fit(r: np.ndarray, t: np.ndarray, y: np.ndarray, group: np.ndarray, labels: 
     return rec
 
 
+def _ls_runs(Y: np.ndarray, F: np.ndarray, level: bool):
+    """Per run (row of ``Y``/``F``): the non-negative least-squares ``q`` of ``Y ≈ q·F``, or
+    ``(q, b)`` of ``Y ≈ q·F + b`` — the exact two-variable NNLS, picked from the interior
+    solution and the three faces of the orthant by their squared miss."""
+    syf, sff = (Y * F).sum(axis=1), (F * F).sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q1 = np.where(sff > 0, np.maximum(syf / sff, 0.0), 0.0)
+    if not level:
+        return q1, np.zeros_like(q1)
+    n = Y.shape[1]
+    sy, sf, syy = Y.sum(axis=1), F.sum(axis=1), (Y * Y).sum(axis=1)
+
+    def sse(q, b):
+        return syy - 2 * q * syf - 2 * b * sy + q * q * sff + 2 * q * b * sf + n * b * b
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        det = sff * n - sf * sf
+        qu, bu = (syf * n - sf * sy) / det, (sff * sy - sf * syf) / det
+    b0 = np.maximum(sy / n, 0.0)
+    cands = [(qu, bu, np.isfinite(qu) & np.isfinite(bu) & (qu >= 0) & (bu >= 0)),
+             (np.zeros_like(q1), b0, np.ones(q1.shape, bool)),
+             (q1, np.zeros_like(q1), np.ones(q1.shape, bool))]
+    best_q, best_b = np.zeros_like(q1), np.zeros_like(q1)
+    best = sse(best_q, best_b)
+    for q, b, ok in cands:
+        e = np.where(ok, sse(np.where(ok, q, 0.0), np.where(ok, b, 0.0)), np.inf)
+        take = e < best
+        best_q, best_b, best = (np.where(take, q, best_q), np.where(take, b, best_b),
+                                np.where(take, e, best))
+    return best_q, best_b
+
+
+def monte_carlo(r: np.ndarray, t: np.ndarray, y: np.ndarray, y_sd: np.ndarray,
+                group: np.ndarray, n_groups: int, *, D: float, boundary: str = "infinite",
+                background: str = "none", n_runs: int = 100_000, D_sd: float = 10.0,
+                t_sd: float = 600.0, r_sd: float = 50.0, seed: int = MC_SEED,
+                labels: Optional[Sequence[str]] = None,
+                batch: int = 4096) -> Dict[str, np.ndarray]:
+    """The production rate's uncertainty as McGhee et al. 2022 (Appendix B.3) find it: for
+    each group (timepoint) on its own, ``n_runs`` least-squares fits of Eq. 2 (one rate,
+    absolute weighting), each on perturbed inputs — every row's concentration ``y + y_sd·ε``,
+    distance ``r + r_sd·ε`` (the source margin's uncertainty), time ``t + t_sd·ε``, and the
+    run's ``D`` drawn with mean ``D`` and SD ``D_sd``. The paper writes D's draw as normal;
+    here it is LOGNORMAL with that mean and SD, because a normal 20 ± 10 µm²/s puts 2 % of
+    runs at D ≤ 0 and some just above it, where Eq. 2 says nothing has reached the beads yet
+    and a run needs a rate of 10¹⁰⁰ fg/s — one such run sets the mean (Run 4: 10¹²⁰).
+    ``background = uniform`` refits the group's level beside its rate. Both are kept
+    non-negative, as the nominal fit is.
+    Returns per group the mean and SD of ``q`` (fg/s) and of the level (pg/mL), and the run
+    count. Each group's random stream is seeded from ``seed`` and its LABEL (``labels``; else
+    its index), so a timepoint gets the same result whichever other timepoints are fitted
+    beside it, and a rerun repeats exactly."""
+    import zlib
+    n_runs = int(n_runs)
+    level = background == "uniform"
+    gi = np.asarray(group, dtype=int)
+    out = {k: np.full(n_groups, np.nan) for k in ("q_mean", "q_sd", "b_mean", "b_sd")}
+    for g in range(n_groups):
+        ix = np.flatnonzero(gi == g)
+        if not ix.size:
+            continue
+        key = str(labels[g]) if labels is not None and g < len(labels) else str(g)
+        rng = np.random.default_rng([int(seed), zlib.crc32(key.encode("utf-8"))])
+        eps = rng.standard_normal(n_runs)
+        if D_sd > 0 and D > 0:
+            s2 = math.log(1.0 + (float(D_sd) / float(D)) ** 2)
+            Ds = np.exp(math.log(float(D)) - 0.5 * s2 + math.sqrt(s2) * eps)
+        else:
+            Ds = np.full(n_runs, float(D))
+        rg, tg, yg, sg = r[ix], t[ix], y[ix], y_sd[ix]
+        # sums of each run's offset from the FIRST run's value: the SD of runs that all agree
+        # comes out exactly 0, not the rounding residue of Σq² − (Σq)²/n
+        acc = np.zeros(4)                      # Σ(q−q₀), Σ(q−q₀)², Σ(b−b₀), Σ(b−b₀)²
+        ref = None
+        for s in range(0, n_runs, batch):
+            d = Ds[s:s + batch]
+            nb = d.size
+            R = np.maximum(rg + r_sd * rng.standard_normal((nb, ix.size)), 1.0)
+            T = np.maximum(tg + t_sd * rng.standard_normal((nb, ix.size)), 1.0)
+            Y = yg + sg * rng.standard_normal((nb, ix.size))
+            F = unit_response(R, T, d[:, None], boundary)
+            q, b = _ls_runs(Y, F, level)
+            if ref is None:
+                ref = (float(q[0]), float(b[0]))
+            dq, db = q - ref[0], b - ref[1]
+            acc += (dq.sum(), (dq * dq).sum(), db.sum(), (db * db).sum())
+        mq, mb = acc[0] / n_runs, acc[2] / n_runs
+        out["q_mean"][g], out["b_mean"][g] = ref[0] + mq, ref[1] + mb
+        out["q_sd"][g] = math.sqrt(max(acc[1] / n_runs - mq * mq, 0.0))
+        out["b_sd"][g] = math.sqrt(max(acc[3] / n_runs - mb * mb, 0.0))
+    out["n_runs"] = np.asarray(n_runs)
+    return out
+
+
 def predict(r: np.ndarray, t: np.ndarray, rec: Mapping[str, Any],
             label: Optional[str] = None) -> np.ndarray:
     """The fitted model's pg/mL at ``r`` µm and ``t`` s. ``constant`` needs the group
@@ -278,6 +384,6 @@ def rate_rows(rec: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
-__all__ = ["unit_response", "design", "fit", "predict", "group_time", "to_signal",
-           "rate_rows", "RATE_MODELS", "BOUNDARIES", "WEIGHTS", "BACKGROUNDS",
-           "FG_UM3_TO_PG_ML", "D_RANGE"]
+__all__ = ["unit_response", "design", "fit", "monte_carlo", "predict", "group_time",
+           "to_signal", "rate_rows", "RATE_MODELS", "BOUNDARIES", "WEIGHTS", "BACKGROUNDS",
+           "FG_UM3_TO_PG_ML", "D_RANGE", "MC_SEED"]

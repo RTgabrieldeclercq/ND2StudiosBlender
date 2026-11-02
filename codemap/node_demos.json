@@ -67,6 +67,14 @@
         "Wire the image the trial was computed on so the grid and vectors overlay it, or switch Onto to tables_only for the Spreadsheet."
       ]
     },
+    "io.write_table": {
+      "kind": "guide",
+      "features": [
+        "Writes the tables on the wire (everything the Spreadsheet shows) to CSV, Parquet or Arrow each time the graph runs, and passes the Dataset on.",
+        "A pixel table from Measure (Members = pixel) goes to a file of its own; Layout per_table gives every table one.",
+        "Format auto with no extension: the shared table as CSV, a pixel table as Parquet."
+      ]
+    },
     "io.write_figure": {
       "kind": "guide",
       "features": [
@@ -1035,6 +1043,35 @@
         "Links the rows of a table that sit at the same stage position into one object_uid, so a cell or bead imaged by two overlapping positions is counted once.",
         "Numbers each object's sightings in acquisition order (t, then m); Keep first N drops the later ones into a new table.",
         "Shown: nuclei of a 2×2 overlapping stage raster (built with +x = stage +x, hence Measure's Flip X off); keep_first 1 keeps each nucleus once."
+      ]
+    },
+    "table.curate_objects": {
+      "kind": "table",
+      "phantom": "plate_mosaic",
+      "prelude": [
+        "labels2d",
+        {
+          "op": "analysis.measure",
+          "params": {
+            "flip_x": false
+          }
+        },
+        {
+          "op": "table.unique_objects",
+          "params": {
+            "keep_first": 0
+          }
+        }
+      ],
+      "fixed_params": {
+        "table": "unique",
+        "drop": "2",
+        "merge": "4>3"
+      },
+      "features": [
+        "Applies a review to a table of objects by id: Drop removes the objects the review rejected, Merge gives one id to a track that was split when its field drifted.",
+        "Each kept row keeps its measurements and its old id, in object_uid_before.",
+        "Shown: the nuclei of a 2x2 overlapping stage raster after Unique Objects; object 2 is dropped and object 4 merged into object 3."
       ]
     },
     "table.register_positions": {

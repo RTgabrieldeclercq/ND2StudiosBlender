@@ -1455,7 +1455,8 @@ class ViewerPanel(QWidget):
         self._hover_lbl.setToolTip(
             "Under the pointer: pixel position, the same point in microns and on the "
             "stage, and each shown channel's value — the viewed node's number first, the "
-            "unprocessed file value in brackets when they differ.")
+            "unprocessed file value in brackets when they differ — then the region id on "
+            "each label raster (what Measure's `ids` takes).")
         v.addWidget(self._hover_lbl)
 
         # elided: a QLabel's minimum width is its whole string, which would stop the
@@ -4938,12 +4939,41 @@ class ViewerPanel(QWidget):
                 parts.append(f"stage {sx:.1f}, {sy:.1f} µm")
         if vals:
             parts.append(" · ".join(vals))
+        regions = self._label_ids_at(pt)
+        if regions:
+            parts.append(regions)
         fi = getattr(self, "_geo_field", None)
         if fi is not None and self.overlays.field.enabled:
             fv = FV.value_at(fi[0], float(pt[1]), float(pt[0]))
             if fv is not None:
                 parts.append(f"{fi[3]} {fv:.4g}")
         return "  ·  ".join(parts)
+
+    def _label_ids_at(self, pt: Tuple[float, float]) -> str:
+        """The region id under the pointer on each Label raster of the viewed payload —
+        ``label 12``, or ``CELLS 12 · nuclei 3`` when there are several — and nothing over
+        background. It is how a user reads the id to type into Measure's `ids` (Members =
+        pixel) without opening the spreadsheet (2026-11-02). One voxel read per raster per
+        mouse move; a raster whose shape does not match the payload is skipped."""
+        ds = self._dataset
+        if ds is None or not hasattr(ds, "attributes") or self._axes is None:
+            return ""
+        x, y = int(np.floor(pt[0] + 0.5)), int(np.floor(pt[1] + 0.5))
+        m, t, z, c = self._payload_coords()
+        names = sorted({k[2] for k in ds.attributes if k[0] is Domain.VOXEL and k[2]
+                        and ds.structure_zkind(Domain.LABEL, k[2]) is not None})
+        hits: List[str] = []
+        for name in names:
+            raster = ds.get(Domain.VOXEL, name).values
+            if getattr(raster, "ndim", 0) != 6:
+                continue
+            idx = (m, t, z, c if raster.shape[3] > 1 else 0, y, x)
+            if not all(0 <= i < n for i, n in zip(idx, raster.shape)):
+                continue
+            v = int(raster[idx])
+            if v:
+                hits.append(f"{'label' if len(names) == 1 else name} {v}")
+        return " · ".join(hits)
 
     # ── coordinates + probes ──────────────────────────────────────────────────
     def _disp_scale(self) -> Tuple[float, float]:
@@ -5413,9 +5443,18 @@ class ViewerPanel(QWidget):
         """``by_layer`` without the tables a table node wrote (V4.00): a Table Concat holds
         other inputs' rows at positions on THEIR images, a Table Join repeats its left
         table's — drawn over this image they would be detections it does not have. A Points
-        picker naming one still shows it (see :meth:`_point_marks`)."""
+        picker naming one still shows it (see :meth:`_point_marks`).
+
+        Nor a PIXEL table (Measure, Members = pixel, 2026-11-02): its rows are the image's own
+        voxels, up to millions of them, and one marker each would bury the picture it was
+        gathered from and stall every repaint. The spreadsheet shows it as a strip; naming
+        it in the Points picker still draws it."""
         from nodegraph.catalog._shared.table_ops import synthesized
-        skip = synthesized(getattr(self._dataset, "metadata", None) or {}, domain)
+        from nodegraph.tables import pixel_layers
+        md = getattr(self._dataset, "metadata", None) or {}
+        skip = synthesized(md, domain)
+        if domain is Domain.POINT:
+            skip = skip | pixel_layers(md)
         if not skip:
             return by_layer
         return {k: v for k, v in by_layer.items() if str(k) not in skip}
@@ -5725,9 +5764,11 @@ class ViewerPanel(QWidget):
         if ds is None or not hasattr(ds, "attributes"):
             return (None, None)
         m, t, z, c = self._payload_coords()
+        from nodegraph.tables import pixel_layers
+        pixels = pixel_layers(ds.metadata)        # a pixel table is not a detection set
         by_layer: Dict[str, Dict[str, np.ndarray]] = {}
         for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.POINT and layer:
+            if dom is Domain.POINT and layer and str(layer) not in pixels:
                 by_layer.setdefault(str(layer), {})[str(name)] = attr.values
         usable = [(lyr, cols) for lyr, cols in by_layer.items()
                   if "y" in cols and "x" in cols]
@@ -5837,8 +5878,13 @@ class ViewerPanel(QWidget):
         out: Dict[tuple, Dict[str, np.ndarray]] = {}
         if ds is None or not hasattr(ds, "attributes"):
             return out
+        from nodegraph.tables import pixel_layers
+        # a pixel table's rows are voxels, never a track's members — and mapping millions of
+        # them into the palette on every paint is what would stall the Viewer
+        pixels = pixel_layers(ds.metadata)
         for (dom, layer, name), attr in ds.attributes.items():
-            if dom in (Domain.POINT, Domain.LABEL):
+            if dom in (Domain.POINT, Domain.LABEL) and not (
+                    dom is Domain.POINT and str(layer) in pixels):
                 out.setdefault((dom, layer), {})[name] = attr.values
         keep = {k: v for k, v in out.items() if {"id", "y", "x"} <= set(v)}
         for key, cols in keep.items():

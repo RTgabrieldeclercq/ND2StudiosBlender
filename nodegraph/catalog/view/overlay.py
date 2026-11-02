@@ -228,9 +228,11 @@ def _bake_resample(ctx: EvalContext, ds: Dataset, sec: Dataset, entry: dict) -> 
 
     Cost is real and paid once: this reads every overlapping tile of the secondary for every
     (m, t, z) of the primary, which is why the footprint resolves to ``MULTI_VIEW`` in this
-    mode and stays ``TILEABLE`` in the other.
+    mode and stays ``TILEABLE`` in the other. Of each tile it reads only the window the field
+    covers, at level 0, so the baked channel carries the secondary's NATIVE pixels wherever
+    the primary is finer than it (2026-10-29: it used to average large tiles down first).
     """
-    from nodegraph.placement import compose_secondary_plane, paired_t
+    from nodegraph.placement import compose_secondary_plane, paired_t, pixel_window
 
     prov = ds.image
     sprov = sec.image
@@ -264,12 +266,20 @@ def _bake_resample(ctx: EvalContext, ds: Dataset, sec: Dataset, entry: dict) -> 
                     for z_sec, w in _z_pick(entry, sec.metadata, sax, int(hits[0][0]),
                                             ds.metadata, ax, z, z_um):
 
-                        # `_want` (the fractional window the compositor needs) is ignored:
-                        # this already reads level 0, so the whole tile IS the raw data and
-                        # there is nothing a window would buy but a second code path.
+                        # Level 0, and only the window the compositor needs (`_want`, snapped
+                        # out to whole pixels): the secondary is then drawn at its own
+                        # resolution. Reading the whole tile used to let a large tile behind a
+                        # small field be averaged down before it was magnified (a 0.86 µm/px CRC
+                        # tile under a 294 µm TFM field baked at 1.7 µm/px) — and read ~30x the
+                        # pixels it drew.
                         def read_tile(j, _want=None, _t=t_sec, _z=z_sec):
-                            return sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
-                                                    0, sax.y, 0, sax.x)
+                            if _want is None:
+                                return sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
+                                                        0, sax.y, 0, sax.x)
+                            y0, y1, x0, x1 = pixel_window(_want, sax.y, sax.x)
+                            plane = sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
+                                                     y0, y1, x0, x1)
+                            return plane, (y0 / sax.y, y1 / sax.y, x0 / sax.x, x1 / sax.x)
 
                         composed = compose_secondary_plane(
                             entry, (ax.y, ax.x), ds.metadata, ax, m,

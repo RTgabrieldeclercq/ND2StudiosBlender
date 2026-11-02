@@ -97,6 +97,10 @@ running code  >  codemap/gen/*.jsonl  >  codemap/*.md  >  the skills
   the default is now `check`. Old docs may still tell you to pass `check` explicitly; harmless.
 - **A test fixture must never `define_node` a real `op_key`.** `NODES` is process-global, so
   it clobbers the shipped node and causes failures that depend on test order.
+- **Module-level function names must be unique across `nodegraph/catalog/`.** The param-key
+  resolver is keyed by name; a duplicate (two `_target`s) fails the socket-contract test, and
+  `_codemap.py write` swallows the same error and drops `params_read` from EVERY node — the
+  tell is a map diff where every node record changed.
 - **Run the selftest with `-B`.** See the gates block above.
 - The GUI gates run offscreen; they need `QT_QPA_PLATFORM=offscreen` on a headless box.
 - CellSAM's *second* model pull in one process crashes the interpreter — a native heap fault

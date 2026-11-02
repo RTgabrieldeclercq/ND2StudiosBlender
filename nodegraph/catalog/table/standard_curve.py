@@ -15,15 +15,20 @@ from nodegraph.catalog._shared.labels import _resolve_layer, _structure_layers
 from nodegraph.dataset import Dataset
 from nodegraph.domains import Domain, domain_docs
 from nodegraph.engine import EvalContext
-from nodegraph.registry import Granularity, InDataset, InFloat, InString, Mode, OutDataset
+from nodegraph.registry import (Granularity, InDataset, InFloat, InInt, InString, Mode,
+                                OutDataset)
 from nodegraph.structure import StructureTable
 
 _SC_DOMAINS = ("label", "point", "track")
 _STD_DOMAINS = ("label", "point")
 _MODELS = ("langmuir", "linear")
 _CURVES = ("fit", "typed")
+_UNCERTAINTY = ("none", "monte_carlo")
 _DEFAULT_NAME = "concentration"
 FLAG_SUFFIX = "_flag"
+#: the per-row concentration SD a Monte Carlo of the curve writes beside ``name``
+SD_SUFFIX = "_sd"
+_MC_SEED = 20221107
 #: provenance: ``{output column: the curve that made it}``
 CURVE_KEY = "standard_curve"
 #: how many blank standard deviations above the blank mean the detection limit sits
@@ -87,6 +92,75 @@ def standard_points(x: np.ndarray, y: np.ndarray, w: Optional[np.ndarray]
         sd = float(np.std(y[b], ddof=1)) if b.sum() >= 2 else float("nan")
         blank = {"mean": float((ww[b] * y[b]).sum() / ww[b].sum()), "sd": sd, "n": int(b.sum())}
     return pts, blank
+
+
+def point_spreads(x: np.ndarray, y: np.ndarray, w: Optional[np.ndarray]) -> List[float]:
+    """Each standard concentration's spread — the WEIGHTED SD of its rows' signal about the
+    weighted mean :func:`standard_points` uses, in the same order (x > 0 ascending). 0 for a
+    single row."""
+    ww = np.ones(len(x)) if w is None else np.asarray(w, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(ww) & (ww > 0)
+    x, y, ww = x[ok], y[ok], ww[ok]
+    out = []
+    for xv in sorted(set(x[x > 0].tolist())):
+        m = x == xv
+        mean = (ww[m] * y[m]).sum() / ww[m].sum()
+        out.append(float(np.sqrt((ww[m] * (y[m] - mean) ** 2).sum() / ww[m].sum())))
+    return out
+
+
+def calibration_sd(y: np.ndarray, curve: Mapping[str, Any], n_runs: int, x_rel_sd: float,
+                   seed: int = _MC_SEED) -> Tuple[np.ndarray, int]:
+    """Each row's concentration SD from the curve's own uncertainty, as McGhee et al. 2022
+    find theirs (Appendix B.1): ``n_runs`` refits of the curve with every standard's mean
+    signal perturbed by N(0, its rows' SD) and its concentration by N(0, ``x_rel_sd``·x) (the
+    blank too, for a linear curve), each row's signal inverted through every refit. The SD
+    reported is HALF THE 16–84 % RANGE of those concentrations — the SD itself for a normal
+    spread, but not ruled by the tail a Langmuir inversion grows near the curve's top (a refit
+    whose Bmax lands just above the signal gives a near-infinite concentration; Run 4's Config
+    2 rows near the top had plain SDs of 10⁴–10⁶ pg/mL). A run whose Bmax is at or below the
+    signal counts as an infinite concentration. NaN where the 84 % point is infinite or under
+    half the runs give a value. Returns ``(sd, runs that fitted)``."""
+    pts = curve["points"]
+    px = np.asarray([p[0] for p in pts], dtype=float)
+    py = np.asarray([p[1] for p in pts], dtype=float)
+    ps = np.asarray(curve.get("point_sd") or [0.0] * len(pts), dtype=float)
+    blank = curve.get("blank") or None
+    y = np.asarray(y, dtype=float)
+    rng = np.random.default_rng(seed)
+    draws = []
+    for _ in range(int(n_runs)):
+        xx = px * (1.0 + x_rel_sd * rng.standard_normal(px.size))
+        yy = py + ps * rng.standard_normal(px.size)
+        if curve["model"] == "langmuir":
+            f = FIG.xy_langmuir(xx, yy)
+            if f is None:
+                continue
+            c = {"model": "langmuir", "bmax": f["bmax"], "kd": f["kd"]}
+        else:
+            lx, ly = xx, yy
+            if blank is not None:
+                bsd = blank["sd"] if math.isfinite(blank.get("sd", math.nan)) else 0.0
+                lx = np.append(xx, 0.0)
+                ly = np.append(yy, blank["mean"] + bsd * rng.standard_normal())
+            f = FIG.xy_fit(lx, ly)
+            if f is None or not f["slope"]:
+                continue
+            c = {"model": "linear", "slope": f["slope"], "intercept": f["intercept"]}
+        draws.append(invert(y, c))
+    if not draws:
+        return np.full(y.shape, np.nan), 0
+    arr = np.asarray(draws, dtype=float)
+    fin = np.isfinite(arr)
+    # a run that cannot invert a row's signal (its Bmax at or below it) gave that row an
+    # unbounded concentration: +inf, so it lands in the top of the row's spread
+    arr = np.where(fin, arr, np.inf)
+    lo = np.quantile(arr, 0.16, axis=0, method="inverted_cdf")
+    hi = np.quantile(arr, 0.84, axis=0, method="inverted_cdf")
+    with np.errstate(all="ignore"):
+        sd = 0.5 * (hi - lo)
+    ok = (fin.sum(axis=0) >= max(2, 0.5 * len(draws))) & np.isfinite(sd)
+    return np.where(ok, sd, np.nan), len(draws)
 
 
 def invert(y: np.ndarray, curve: Mapping[str, Any]) -> np.ndarray:
@@ -177,6 +251,7 @@ def _fit_curve(ctx: EvalContext, model: str, sig: str) -> Dict[str, Any]:
                  "r2": f["r2"]}
     curve["range"] = [float(px.min()), float(px.max())]
     curve["points"] = [list(p) for p in pts]
+    curve["point_sd"] = point_spreads(x, y, w)
     curve["source"] = {"table": layer, "x": xname, "y": yname, "weight": wname,
                        "where": str(ctx.params.get("std_where", "") or "")}
     if blank is not None:
@@ -214,8 +289,15 @@ def _compute_standard_curve(ctx: EvalContext) -> Dataset:
     * **Inversion** Langmuir ``Kd·y/(Bmax − y)`` (NaN at or above Bmax); linear ``(y − a)/b``.
       **Flags** (text) ``no signal``, ``above Bmax``, ``below LOD``, ``below range`` /
       ``above range`` (extrapolated beyond the lowest / highest standard) or ``in range``.
-    * **Provenance** the curve (points, blank, fit, range, LOD) under ``standard_curve`` in
-      the metadata, keyed by the output column; the new column carries the standards' x unit.
+    * **Uncertainty = monte_carlo** (2026-10-29, Curve = fit only): ``<name>_sd`` beside the
+      concentration, from :func:`calibration_sd` — ``mc_runs`` refits with each standard's
+      weighted mean perturbed by its rows' weighted SD and its concentration by ``x_rel_sd``
+      (McGhee et al. 2022, Appendix B.1), each row inverted through every refit; the SD is half
+      the runs' 16–84 % range (robust to the near-Bmax inversions), NaN where under half the
+      runs give a value or the 84 % point is unbounded.
+    * **Provenance** the curve (points, their SDs, blank, fit, range, LOD) under
+      ``standard_curve`` in the metadata, keyed by the output column; the new column carries
+      the standards' x unit.
     * **Footprint** WHOLE_SERIES, empty kernel_axes: tables only, no axis or calibration
       change.
     """
@@ -237,7 +319,8 @@ def _compute_standard_curve(ctx: EvalContext) -> Dataset:
         raise ValueError(f"Standard Curve: Signal {sig!r} is not a numeric column of the "
                          f"{layer!r} table (it has {sorted(cols)}).")
     name = str(ctx.params.get("name", _DEFAULT_NAME) or _DEFAULT_NAME)
-    for nm in (name, name + FLAG_SUFFIX):
+    mc = how == "fit" and str(modes.get("uncertainty", "none")) == "monte_carlo"
+    for nm in (name, name + FLAG_SUFFIX) + ((name + SD_SUFFIX,) if mc else ()):
         if nm in cols:
             raise ValueError(f"Standard Curve: the {layer!r} table already has a column {nm!r} "
                              f"— choose another Name; a conversion never overwrites a "
@@ -273,6 +356,16 @@ def _compute_standard_curve(ctx: EvalContext) -> Dataset:
     out = dict(cols)
     out[name] = conc
     out[name + FLAG_SUFFIX] = TB.text_column(fl)
+    if mc:
+        n_runs = int(ctx.params.get("mc_runs", 2000) or 0)
+        if n_runs < 2:
+            raise ValueError(f"Standard Curve: Monte Carlo runs must be at least 2, got "
+                             f"{n_runs}.")
+        x_rel = float(ctx.params.get("x_rel_sd", 0.0) or 0.0)
+        sd, fitted = calibration_sd(y, curve, n_runs, x_rel)
+        out[name + SD_SUFFIX] = sd
+        curve["uncertainty"] = {"method": "monte_carlo", "runs": n_runs, "fitted": fitted,
+                                "x_rel_sd": x_rel, "column": name + SD_SUFFIX}
     zk = ds.structure_zkind(dom, layer) or "plane_index"
     res = ds
     for a in list(ds.layers_on(dom)):
@@ -317,8 +410,11 @@ def _sc_columns(params: Mapping[str, Any], modes: Mapping[str, Any],
             cols = [c for d, lyr, c in incoming or () if d is dom and lyr == layer]
         if not layer:
             return ()
-        return tuple((dom, layer, c) for c in dict.fromkeys(list(cols) +
-                                                            [name, name + FLAG_SUFFIX]) if c)
+        new = [name, name + FLAG_SUFFIX]
+        if (str((modes or {}).get("curve", "fit")) == "fit"
+                and str((modes or {}).get("uncertainty", "none")) == "monte_carlo"):
+            new.append(name + SD_SUFFIX)
+        return tuple((dom, layer, c) for c in dict.fromkeys(list(cols) + new) if c)
     except Exception:                                   # noqa: BLE001 — total by contract
         return ()
 
@@ -327,6 +423,7 @@ _sc_columns.wants_inputs = True
 
 _FIT = {"curve": frozenset({"fit"})}
 _TYPED = {"curve": frozenset({"typed"})}
+_FIT_MC = {"curve": frozenset({"fit"}), "uncertainty": frozenset({"monte_carlo"})}
 
 register_node(
     _compute_standard_curve, op_key="table.standard_curve", label="Standard Curve",
@@ -400,6 +497,16 @@ register_node(
                 description="A typed detection limit in signal units: rows under it are "
                             "flagged `below LOD`. 0 flags none. A fitted curve takes its own "
                             "from the blank (mean + 3 SD)."),
+        InInt("mc_runs", "Monte Carlo runs", field=False, default=2000, available_in=_FIT_MC,
+              description="Refits of the curve on perturbed standards. More steadies each "
+                          "row's SD and costs one curve fit each (about a millisecond); a few "
+                          "thousand is plenty for an SD. The seed is fixed."),
+        InFloat("x_rel_sd", "Standards conc. SD", unit="", field=False, default=0.0,
+                available_in=_FIT_MC,
+                description="Relative SD of each standard's concentration — its pipetting "
+                            "error (McGhee et al. 2022's Table 1 is 1.6–2.1 %). 0 takes the "
+                            "concentrations as exact; larger widens every row's SD, most near "
+                            "the curve's top."),
     ],
     outputs=[OutDataset()],
     modes=[
@@ -431,6 +538,20 @@ register_node(
              available_in=_FIT,
              description="Which kind of table on the Standards wire holds the standards.",
              choice_docs=domain_docs(_STD_DOMAINS)),
+        Mode("uncertainty", list(_UNCERTAINTY), default="none", label="Uncertainty",
+             available_in=_FIT,
+             description="Whether each converted row also gets the curve's uncertainty.",
+             choice_docs={
+                 "none": "The concentration only — the curve's parameters taken as exact.",
+                 "monte_carlo": "Also `<name>_sd`: each row's concentration SD from refits of "
+                                "the curve with every standard perturbed by its own beads' "
+                                "SD — McGhee et al. 2022's Appendix B.1 calibration "
+                                "uncertainty, per row (it grows toward the curve's top; half "
+                                "the runs' 16–84 % range, so a few near-infinite inversions "
+                                "do not rule it). "
+                                "Point-Source Fit's Monte Carlo reads it as Value SD. Costs "
+                                "one curve fit per run.",
+             }),
     ],
     granularity=Granularity.WHOLE_SERIES, kernel_axes=frozenset(),
     reads_domains_by_mode={"domain": {"label": frozenset({Domain.LABEL}),

@@ -188,6 +188,9 @@ MODULES: Tuple[str, ...] = (
     "table.join",
     "table.aggregate",
     "table.unique_objects",
+    # 2026-10-30: beside Unique Objects, the review applied to its ids (drop rejected objects,
+    # merge tracks split by field drift; the IL-8 Run 4 bead QC)
+    "table.curate_objects",
     # 2026-10-15: slotted beside Unique Objects, its sibling for a plate re-imaged after it
     # was put back on the stage (the IL-8 beads' fourth and fifth timepoints)
     "table.register_positions",
@@ -236,6 +239,9 @@ MODULES: Tuple[str, ...] = (
     # 2026-10-16: thin an axis to evenly spaced frames (Crop's frames mode by a rule rather
     # than a list), appended for the same reason
     "util.trim",
+    # 2026-11-02: the tables' writer, the sibling of Export TIFF / Figure — appended, not
+    # slotted beside them, for the same reason (the list's order is the link-drag menu's)
+    "io.write_table",
 )
 
 

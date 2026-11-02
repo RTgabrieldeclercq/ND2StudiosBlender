@@ -6638,7 +6638,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"saved {path}")
 
     def file_export(self) -> None:
-        from nodelab_v2.export import export_dataset
+        import os
+        from nodelab_v2.export import export_dataset_files
+        from nodelab_v2.tables import pixel_layers
         ds = self.sheet.dataset
         if ds is None:
             QMessageBox.information(self, "Nothing to export",
@@ -6646,17 +6648,26 @@ class MainWindow(QMainWindow):
                                     "(the Spreadsheet tab shows what's exportable).")
             return
         nid = self.sheet.node_id or "table"
+        # a pixel table defaults to Parquet: a million-row CSV is ~1 GB and past what a
+        # spreadsheet opens (it is written to a file of its own either way)
+        filters = ["CSV (*.csv)", "Parquet (*.parquet)", "Arrow IPC (*.arrow)"]
+        pixels = bool(pixel_layers(getattr(ds, "metadata", None)))
+        if pixels:
+            filters.insert(0, filters.pop(1))
         path, _f = QFileDialog.getSaveFileName(
-            self, "Export structure tables", f"{nid}.csv",
-            "CSV (*.csv);;Parquet (*.parquet);;Arrow IPC (*.arrow)")
+            self, "Export structure tables", f"{nid}{'.parquet' if pixels else '.csv'}",
+            ";;".join(filters))
         if not path:
             return
         try:
-            n = export_dataset(ds, path)
+            files = export_dataset_files(ds, path)
         except (ValueError, OSError, ImportError) as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
-        self.statusBar().showMessage(f"exported {n} rows → {path}")
+        n = sum(k for _p, k in files)
+        where = (path if len(files) == 1 else
+                 ", ".join(os.path.basename(p) for p, _k in files))
+        self.statusBar().showMessage(f"exported {n:,} rows → {where}")
 
     # ── empty canvas / example content ────────────────────────────────────────
     def _sync_welcome(self, *_a) -> None:

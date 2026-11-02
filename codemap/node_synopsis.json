@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 143,
+    "nodes": 145,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 1028,
-    "outputs": 150,
+    "inputs": 1049,
+    "outputs": 152,
     "gui_ops_included": true
   },
   "stages": {
@@ -91,6 +91,7 @@
         "io.load_analysis",
         "io.write_figure",
         "io.write_movie",
+        "io.write_table",
         "io.write_tiff",
         "util.batch",
         "util.merge",
@@ -240,6 +241,7 @@
         "piv.validate",
         "table.aggregate",
         "table.concat",
+        "table.curate_objects",
         "table.join",
         "table.point_source_fit",
         "table.register_positions",
@@ -287,8 +289,8 @@
     "input_output": {
       "label": "Input / output",
       "stage": "acquire_and_organize",
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
-      "count": 6,
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence, figure or table (CSV / Parquet, a pixel table to a file of its own), and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
+      "count": 7,
       "ops": [
         {
           "op": "io.dock",
@@ -314,6 +316,11 @@
           "op": "io.write_movie",
           "label": "Export Movie",
           "summary": "Render the Dataset on this wire to an H.264 MP4, an animated GIF or a numbered PNG/JPEG sequence — the presentation counterpart to Export TIFF. Channels composite by their emission tints, the display window is measured once and held so a timelapse does not pulse, and the acquisition's own calibration is burned into the corners: the frame counter, the elapsed experiment time interpolated from the file's frame interval, a round-number scale bar from the pixel size, and the channel names. With Sweep = 'timeline' it plays the Movie Editor's layout instead: clips from up to three sources in sequence, grids of positions/channels/z/timepoints, z sweeps cut in between timepoints, and label rasters drawn with their ids. Hands the Dataset through unchanged, so it can sit mid-chain."
+        },
+        {
+          "op": "io.write_table",
+          "label": "Export Table",
+          "summary": "Write the tables on this wire — Label, Point and Track tables and the coarse per-frame attributes — to CSV, Parquet or Arrow, a pixel table to a file of its own, and hand the Dataset on unchanged."
         },
         {
           "op": "io.write_tiff",
@@ -768,7 +775,7 @@
     "measurement_and_statistics": {
       "label": "Measurement & statistics",
       "stage": "quantify",
-      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
+      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, every pixel of chosen regions as rows of its own, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
       "count": 6,
       "ops": [
         {
@@ -784,7 +791,7 @@
         {
           "op": "analysis.measure",
           "label": "Measure",
-          "summary": "Measures the image over a structure table's members. On LABEL members: per-region statistics (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops. On POINT members: each detection's physical position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the voxel it sits on. Both branches also report each row's absolute `stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing objects across a multi-position acquisition (NaN when the file carries no placement metadata). Optional `raw` input measures THOSE pixels instead (segment on enhanced, measure on raw); the structure, the labels and the shape metrics always come from the main input."
+          "summary": "Measures the image over a structure table's members. On LABEL members: per-region statistics (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops. On POINT members: each detection's physical position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the voxel it sits on. On PIXEL members: every voxel of chosen regions (or of the volume) as a row of a new Point table — address, `label_id`, µm and stage position, per-channel intensity, optional edge/centroid distance. Every branch also reports each row's absolute `stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing objects across a multi-position acquisition (NaN when the file carries no placement metadata). Optional `raw` input measures THOSE pixels instead (segment on enhanced, measure on raw); the structure, the labels and the shape metrics always come from the main input."
         },
         {
           "op": "analysis.object_field",
@@ -847,8 +854,8 @@
     "table_synthesis": {
       "label": "Table synthesis",
       "stage": "quantify",
-      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N. Register Positions moves a later run's stage positions into a reference run's frame by the objects both contain, for a plate taken off the stage and put back. Standard Curve turns a measured signal into a concentration through a Langmuir or linear curve fitted from standards measured the same way. Point-Source Fit fits Crank's continuous point source to those concentrations against distance and time, for a secreting source's production rate (and the diffusivity).",
-      "count": 7,
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N. Curate Objects applies a review to those ids: it drops the objects the review rejected and merges ids that are one object, a track split when its field drifted. Register Positions moves a later run's stage positions into a reference run's frame by the objects both contain, for a plate taken off the stage and put back. Standard Curve turns a measured signal into a concentration through a Langmuir or linear curve fitted from standards measured the same way. Point-Source Fit fits Crank's continuous point source to those concentrations against distance and time, for a secreting source's production rate (and the diffusivity).",
+      "count": 8,
       "ops": [
         {
           "op": "table.aggregate",
@@ -861,14 +868,19 @@
           "summary": "Stack the Label or Point tables of several inputs (pages, conditions, variants) into one table, each row labelled with its condition, its input and its position group, ids kept unique — the table a plot groups by condition."
         },
         {
+          "op": "table.curate_objects",
+          "label": "Curate Objects",
+          "summary": "Apply a review to a table of objects: drop the ids it rejected and merge the ids that are one object (a track split when its field drifted), keeping each row's original id beside the new one."
+        },
+        {
           "op": "table.join",
           "label": "Table Join",
-          "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame or track — left or inner — as a new joined table."
+          "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame, track, or a pixel's region (label_id) — left or inner — as a new joined table."
         },
         {
           "op": "table.point_source_fit",
           "label": "Point-Source Fit (Crank)",
-          "summary": "Fit Crank's continuous point source (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — for its production rate per timepoint (or per interval) with bootstrap intervals, and the diffusivity if asked; adds the model's value per row and a rates table, and records the fit for Plot XY's and Gradient Map's trend."
+          "summary": "Fit Crank's continuous point source (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — for its production rate per timepoint (or per interval) with bootstrap intervals or the paper's Monte Carlo mean ± SD, and the diffusivity if asked; adds the model's value per row and a rates table, and records the fit for Plot XY's and Gradient Map's trend."
         },
         {
           "op": "table.register_positions",
@@ -1292,6 +1304,7 @@
       "io.load_analysis",
       "io.write_figure",
       "io.write_movie",
+      "io.write_table",
       "io.write_tiff",
       "view.viewer"
     ],
@@ -1321,6 +1334,7 @@
     "table": [
       "table.aggregate",
       "table.concat",
+      "table.curate_objects",
       "table.join",
       "table.point_source_fit",
       "table.register_positions",
@@ -4721,8 +4735,8 @@
       ],
       "module": "nodegraph/catalog/analysis/measure.py",
       "gui_only": false,
-      "summary": "Measures the image over a structure table's members. On LABEL members: per-region statistics (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops. On POINT members: each detection's physical position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the voxel it sits on. Both branches also report each row's absolute `stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing objects across a multi-position acquisition (NaN when the file carries no placement metadata). Optional `raw` input measures THOSE pixels instead (segment on enhanced, measure on raw); the structure, the labels and the shape metrics always come from the main input.",
-      "overview": "Measure the image over the members of a structure table → columns on that table. Two branches, selected by the **``target``** Mode, because the two member kinds are measurable in genuinely different ways rather than by the same code with a switch: * **``label``** (:func:`_measure_labels`) — a region has extent, so it has statistics: per-label ``mean``/``max``/``min``/``sum``/``median`` intensity and a voxel ``count`` via the Voxel→Label bridge, plus optional µm-aware ``regionprops`` geometry. * **``point``** (:func:`_measure_points`) — a detection is dimensionless, so it has a *position* and one *sample*: ``x_um``/``y_um``/``z_um`` and the intensity of the voxel it sits on, via the Voxel→Point bridge's nearest-voxel rule. Both branches also report each row's ABSOLUTE stage position — ``stage_x_um``/ ``stage_y_um``/``stage_z_um``, via :func:`_stage_position_columns` — so objects from different multipoints of the same acquisition land in one comparable physical frame in the spreadsheet, not just their own field's local coordinates. The optional **``raw``** Dataset input serves both: it redirects *which pixels are measured* while the structure keeps coming from the main input — the \"segment on enhanced, measure on raw\" workflow (:func:`_intensity_provider`). Unwired, each branch measures its own image. The image provider is resolved (and refused) HERE, before the branch, because neither branch has anything to measure without one and the `raw` guard is the same question for both.",
+      "summary": "Measures the image over a structure table's members. On LABEL members: per-region statistics (mean/max/min/area) via the Voxel→Label bridge, plus optional µm-aware `shape` geometry columns (eccentricity, perimeter, solidity, …) from regionprops. On POINT members: each detection's physical position (`x_um`/`y_um`/`z_um`) and `mean_intensity`, the value of the voxel it sits on. On PIXEL members: every voxel of chosen regions (or of the volume) as a row of a new Point table — address, `label_id`, µm and stage position, per-channel intensity, optional edge/centroid distance. Every branch also reports each row's absolute `stage_x_um`/`stage_y_um`/`stage_z_um` microscope position, for comparing objects across a multi-position acquisition (NaN when the file carries no placement metadata). Optional `raw` input measures THOSE pixels instead (segment on enhanced, measure on raw); the structure, the labels and the shape metrics always come from the main input.",
+      "overview": "Measure the image over the members of a structure table → columns on that table. Three branches, selected by the **``target``** Mode, because the member kinds are measurable in genuinely different ways rather than by the same code with a switch. The third, **``pixel``** (:func:`_measure_pixels`, 2026-11-02), is the one that does not write onto the table it read: a voxel is a member of a region, and the voxels of chosen regions (or of the whole volume) become a Point table of their own, one row each. The first two: * **``label``** (:func:`_measure_labels`) — a region has extent, so it has statistics: per-label ``mean``/``max``/``min``/``sum``/``median`` intensity and a voxel ``count`` via the Voxel→Label bridge, plus optional µm-aware ``regionprops`` geometry. * **``point``** (:func:`_measure_points`) — a detection is dimensionless, so it has a *position* and one *sample*: ``x_um``/``y_um``/``z_um`` and the intensity of the voxel it sits on, via the Voxel→Point bridge's nearest-voxel rule. Both branches also report each row's ABSOLUTE stage position — ``stage_x_um``/ ``stage_y_um``/``stage_z_um``, via :func:`_stage_position_columns` — so objects from different multipoints of the same acquisition land in one comparable physical frame in the spreadsheet, not just their own field's local coordinates. The optional **``raw``** Dataset input serves both: it redirects *which pixels are measured* while the structure keeps coming from the main input — the \"segment on enhanced, measure on raw\" workflow (:func:`_intensity_provider`). Unwired, each branch measures its own image. The image provider is resolved (and refused) HERE, before the branch, because neither branch has anything to measure without one and the `raw` guard is the same question for both.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -4744,6 +4758,9 @@
               "label",
               "voxel"
             ],
+            "pixel": [
+              "voxel"
+            ],
             "point": [
               "point"
             ]
@@ -4760,13 +4777,34 @@
           "label": "Members",
           "choices": [
             "label",
-            "point"
+            "point",
+            "pixel"
           ],
           "default": "label",
-          "description": "Which members are measured — the REGIONS of a Label table or the DETECTIONS of a Point table. It selects the live source socket and, because the two member kinds are measurable in different ways, which columns come out: a region has extent, so it has statistics and geometry; a point is dimensionless, so it has a position and one sample. Both write onto the table they read, and both honour the `raw` input.",
+          "description": "Which members are measured — the REGIONS of a Label table, the DETECTIONS of a Point table, or the single PIXELS (voxels) of chosen regions. It selects the live source socket and, because the member kinds are measurable in different ways, which columns come out: a region has extent, so it has statistics and geometry; a point is dimensionless, so it has a position and one sample; a pixel has its own address and value. Regions and points write onto the table they read; pixels make a new table. All three honour the `raw` input.",
           "choice_docs": {
             "label": "Measure the regions of a Label table (Segmentation / Connected Components): per-region intensity statistics over every voxel the region owns, plus optional µm regionprops geometry, plus each region's `x_um`/`y_um`/`z_um` centroid and absolute `stage_x_um`/`stage_y_um`/`stage_z_um` position. This is the branch `stats` and `shape` belong to; it needs a raster whose ids divide the foreground into objects, not a bare mask.",
-            "point": "Measure the detections of a Point table (Spot / Particle Detection, Label to Points): writes `x_um`/`y_um`/`z_um` — the physical position, which the invariant pixel `x`/`y`/`z` columns are not — `mean_intensity`, the value of the single voxel each detection sits on, and absolute `stage_x_um`/`stage_y_um`/`stage_z_um`. `stats` and `shape` are hidden here: there is no region to reduce over or fit an ellipse to."
+            "point": "Measure the detections of a Point table (Spot / Particle Detection, Label to Points): writes `x_um`/`y_um`/`z_um` — the physical position, which the invariant pixel `x`/`y`/`z` columns are not — `mean_intensity`, the value of the single voxel each detection sits on, and absolute `stage_x_um`/`stage_y_um`/`stage_z_um`. `stats` and `shape` are hidden here: there is no region to reduce over or fit an ellipse to.",
+            "pixel": "Write every PIXEL (voxel) of chosen regions — or of the whole volume — as a row of a new Point table (`Pixel table`): its `m t c z y x` address, `label_id`, µm and absolute stage position, `intensity` plus one column per channel, `time_s` when the file has a clock, and optional edge / centroid distances. For the distribution INSIDE an object (rim vs core, colocalization, a histogram), which the per-region stats summarise away. The spreadsheet shows it as a strip of pixels; it can be millions of rows, so `max_rows` caps it."
+          }
+        },
+        {
+          "name": "pixels_of",
+          "label": "Pixels of",
+          "choices": [
+            "regions",
+            "volume"
+          ],
+          "default": "regions",
+          "available_in": {
+            "target": [
+              "pixel"
+            ]
+          },
+          "description": "Which voxels Members = pixel writes: those inside regions, or every voxel of the volume.",
+          "choice_docs": {
+            "regions": "The voxels inside the regions of the raster `Label layer` names — a segmentation's labels, a threshold mask, a drawn region — all of them, or only the region ids typed in `ids`. Background voxels are left out, so the row count is the regions' total area.",
+            "volume": "Every voxel of the volume, background included — m × t × z × y × x rows (times the raster's channels). `label_id` still names the region a voxel is in when a raster is named (0 = background); with none, it is 0 everywhere. Use it on a cropped or one-frame stream: a whole series is easily past `max_rows`."
           }
         }
       ],
@@ -4812,11 +4850,12 @@
           "default": "labels",
           "available_in": {
             "target": [
-              "label"
+              "label",
+              "pixel"
             ]
           },
           "layer_in": "voxel",
-          "description": "Which label raster defines the regions to measure — the output of Connected Components or Segmentation. One row is produced per label id, so this choice fixes both WHAT gets measured and how many rows come out. It always comes from the MAIN input, even when a `raw` Dataset is wired: `raw` redirects only the pixels being measured."
+          "description": "Which label raster defines the regions to measure — the output of Connected Components or Segmentation. One row is produced per label id, so this choice fixes both WHAT gets measured and how many rows come out. With Members = pixel it may also name a plain mask or a drawn region (its voxels' value becomes `label_id`); with Pixels of = volume it only fills `label_id` and may name nothing. It always comes from the MAIN input, even when a `raw` Dataset is wired: `raw` redirects only the pixels being measured."
         },
         {
           "name": "points",
@@ -4896,6 +4935,76 @@
             "solidity": "Region area divided by its convex hull's. 1 means convex; clearly below 1 means concave, branched, or two touching cells merged into one label — which makes this the cheapest detector of under-segmentation. Works in 2D and 3D."
           },
           "description": "Per-region GEOMETRY columns, comma-separated — empty (the default) computes none. `eccentricity` (0 = circle, →1 = elongated; this is the one Cell-Tracker reports), `perimeter` and `axis_major`/`axis_minor` in µm, `orientation` in radians, `solidity` (region area / its convex hull's — below 1 means concave or clumped) and `extent` (region area / bounding box). These read the LABEL RASTER only, never the pixels, so a wired `raw` input does not affect them. Lengths use pixel_size_um (and z_step_um in 3D) so they are physical, not pixel counts. eccentricity, perimeter and orientation are 2-D-only in skimage and are refused on a 3D Label table; the other four work in both. Costs a second walk over the raster, which is why it is opt-in."
+        },
+        {
+          "name": "pixels",
+          "label": "Pixel table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "pixels",
+          "available_in": {
+            "target": [
+              "pixel"
+            ]
+          },
+          "layer_out": [
+            "point"
+          ],
+          "description": "Name of the Point table the pixels are written to — a new table beside the regions', which are left as they were. Re-running replaces an earlier pixel table of this name whole; a name that is already a detection table (spots, particles) is refused rather than overwritten."
+        },
+        {
+          "name": "ids",
+          "label": "ids",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "pixels_of": [
+              "regions"
+            ],
+            "target": [
+              "pixel"
+            ]
+          },
+          "description": "Which regions' pixels to write, by label id — `12, 40, 100-120`. Blank writes every region's. Fewer ids is the main way to keep a pixel table small; an id that is not a region is skipped, and a list matching none is refused with the ids the raster does hold. Hover a region in the Viewer to read its id."
+        },
+        {
+          "name": "geometry",
+          "label": "Pixel geometry",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "target": [
+              "pixel"
+            ]
+          },
+          "vocab": [
+            "edge_dist",
+            "centroid_dist"
+          ],
+          "choice_docs": {
+            "centroid_dist": "→ `centroid_dist_um`: distance from the region's centroid (the mean position of its pixels). The axis for radial profiles; unlike `edge_dist` it keeps rising past the core of an elongated cell. On a plain mask every pixel shares one id, so the centroid is the whole foreground's in that plane.",
+            "edge_dist": "→ `edge_dist_um`: distance to the nearest pixel OUTSIDE the region — one pixel on the rim, largest at the core. Touching regions count as outside each other, and so does the image edge. The axis for rim-versus-core profiles (membrane vs cytoplasm). Needs a raster; NaN with Pixels of = volume and none named."
+          },
+          "description": "Per-pixel distance columns, comma-separated — empty (the default) adds none. Both are in µm (pixel_size_um, z_step_um for a 3D Label table), measured within the region's own geometry (per plane, or the volume for a 3D table), and NaN on a background pixel. Each is an extra pass over the gathered pixels."
+        },
+        {
+          "name": "max_rows",
+          "label": "Max rows",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 5000000,
+          "available_in": {
+            "target": [
+              "pixel"
+            ]
+          },
+          "description": "The most rows the pixel table may have. Counted before a pixel is read: past it the node stops and says how many rows it would have written. 0 = no limit. A row costs ~60 bytes in memory plus ~8 per channel, so the default (5 million) is about 0.3-0.5 GB. It never thins the table — every chosen pixel is written, or none."
         }
       ],
       "outputs": [
@@ -4917,7 +5026,11 @@
         "__modes__",
         "flip_x",
         "flip_y",
+        "geometry",
+        "ids",
         "labels",
+        "max_rows",
+        "pixels",
         "points",
         "shape",
         "stats"
@@ -16678,6 +16791,124 @@
         "white"
       ]
     },
+    "io.write_table": {
+      "op": "io.write_table",
+      "label": "Export Table",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/io/write_table.py",
+      "gui_only": false,
+      "summary": "Write the tables on this wire — Label, Point and Track tables and the coarse per-frame attributes — to CSV, Parquet or Arrow, a pixel table to a file of its own, and hand the Dataset on unchanged.",
+      "overview": "Write the tables on this wire, and hand the Dataset on unchanged. Resolved spec (2026-11-02, `build-node-v2`): * writes exactly what the spreadsheet shows and the GUI's Export… writes — :func:`nodegraph.tables.all_tables` through :mod:`nodegraph.table_export` — so a graph writes its tables on every run, per file of a batch, without anyone clicking; * ``layout`` auto: the ordinary tables share one long file; a PIXEL table (Measure, Members = pixel) or one longer than a spreadsheet opens gets a file of its own, ``<stem>_<layer><ext>``. per_table: every table its own file; * ``format`` auto: the extension typed decides; with none, the shared file is CSV and the own files Parquet. csv / parquet / arrow force every file, adding the extension or refusing one that names another format; * ``path`` required (empty refused, as Export TIFF/Figure do); ``existing`` refuse checks EVERY file before writing any; each file is written to ``<stem>.part<ext>`` and moved into place when complete; a pass-through tap.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "format",
+          "label": "Format",
+          "choices": [
+            "auto",
+            "csv",
+            "parquet",
+            "arrow"
+          ],
+          "default": "auto",
+          "description": "The file format. CSV opens in any spreadsheet; Parquet and Arrow are compact, typed and fast to read back in Python, R or MATLAB.",
+          "choice_docs": {
+            "auto": "Decided by the extension typed in File. With none, the shared table file is CSV and a pixel table's own file is Parquet — a million-row CSV is about a gigabyte and past what Excel opens.",
+            "csv": "Every file as comma-separated text — readable anywhere, but large and slow for a pixel table, and Excel stops at 1,048,576 rows.",
+            "parquet": "Every file as Parquet: columnar and compressed, typically a tenth of the CSV, read by pandas, polars, R (arrow) and MATLAB (parquetread). Needs pyarrow.",
+            "arrow": "Every file as Arrow IPC (Feather v2): uncompressed and the fastest to load back into Python. Needs pyarrow."
+          }
+        },
+        {
+          "name": "layout",
+          "label": "Layout",
+          "choices": [
+            "auto",
+            "per_table"
+          ],
+          "default": "auto",
+          "description": "How the tables on the wire are spread over files.",
+          "choice_docs": {
+            "auto": "The ordinary tables share one file, each row tagged with its `domain` and `layer` — the GUI Export's layout. A pixel table, or any table longer than a spreadsheet opens, gets a file of its own.",
+            "per_table": "Every table gets a file of its own, `<name>_<table>` — plain columns, no `domain`/`layer` tags, ready for a script that reads one kind of table."
+          }
+        },
+        {
+          "name": "existing",
+          "label": "Existing",
+          "choices": [
+            "overwrite",
+            "refuse"
+          ],
+          "default": "overwrite",
+          "description": "What to do when a file is already at a path this node writes.",
+          "choice_docs": {
+            "overwrite": "Replace it — the default, since this node only runs again when the tables changed. The old file is replaced only once the new one is complete.",
+            "refuse": "Raise instead of touching any existing file — checked for every file before the first is written, so a refused export writes nothing."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose tables are written — every Label, Point and Track table and every coarse per-frame / per-position attribute the spreadsheet shows. It is handed on unchanged."
+        },
+        {
+          "name": "path",
+          "label": "File",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "path_kind": "save_file",
+          "path_filter": "CSV (*.csv);;Parquet (*.parquet);;Arrow IPC (*.arrow);;All files (*)",
+          "path_hint": "Browse… to choose where the tables are written",
+          "description": "Where the tables are written. There is no default and an empty value is refused. A pixel table (and with Layout per_table, every table) goes to a file of its own beside it, named `<this name>_<table>`; nothing else in the folder is touched."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_write_table",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "path"
+      ]
+    },
     "io.write_tiff": {
       "op": "io.write_tiff",
       "label": "Export TIFF",
@@ -21528,6 +21759,142 @@
         "table"
       ]
     },
+    "table.curate_objects": {
+      "op": "table.curate_objects",
+      "label": "Curate Objects",
+      "category": "table",
+      "role": "table_synthesis",
+      "stage": "quantify",
+      "pages": [
+        "process",
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/table/curate_objects.py",
+      "gui_only": false,
+      "summary": "Apply a review to a table of objects: drop the ids it rejected and merge the ids that are one object (a track split when its field drifted), keeping each row's original id beside the new one.",
+      "overview": "Drop the objects a review rejected and merge the ids a tracker split, by id. Resolved spec (2026-10-30, `build-node-v2`): * reads one table (``domain`` label / point, ``table``) and its integer ``id_column`` (blank: ``object_uid``, which Unique Objects writes — blank rather than that name as the socket default, because no structure producer declares it and a closed dropdown would show it as an orphan); * ``drop`` lists ids (comma list, ``a-b`` ranges) whose rows are removed; it is matched against the ORIGINAL ids, before any merge, because a review names the ids it saw; * ``merge`` lists ``from>to`` pairs: the rows of ``from`` take id ``to`` (chains resolve, a cycle or an id sent two ways is refused). A pair whose target is dropped is refused, since the merged rows would carry an id the review rejected; * listed ids the table does not carry are skipped and counted in the progress line (a subset of passes need not contain every reviewed object); * the kept rows keep every column, in the input's row order, plus ``<id_column>_before``, the id each row had before the merge; * ``name`` blank writes the result back over the table it reads — allowed only for a table a table node wrote (Table Concat's, Unique Objects', ...), never a measured table whose raster still indexes the rows; otherwise the result is a NEW table ``name``; * WHOLE_SERIES, tables only; no axis or calibration change.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {
+          "domain": {
+            "label": [
+              "label"
+            ],
+            "point": [
+              "point"
+            ]
+          }
+        },
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "domain",
+          "label": "Domain",
+          "choices": [
+            "label",
+            "point"
+          ],
+          "default": "label",
+          "description": "Which kind of table holds the objects.",
+          "choice_docs": {
+            "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
+            "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset whose table is curated; it is passed on with that table rewritten (blank Name) or a new one."
+        },
+        {
+          "name": "table",
+          "label": "Table",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "layer_in_mode": "domain",
+          "description": "Which table of the chosen kind holds the objects. Blank uses the only one on the wire, and asks when there are several."
+        },
+        {
+          "name": "id_column",
+          "label": "Id column",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "The integer column naming each object, the ids Drop and Merge refer to. Blank uses `object_uid`, the id Unique Objects writes. If anything upstream renumbers it — a new tolerance, another input — the lists here point at different objects: review them again."
+        },
+        {
+          "name": "drop",
+          "label": "Drop",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Ids to remove, comma separated, with `a-b` for a range, e.g. `4, 7, 16-18`. Every row of each id leaves the table, so it leaves every count, fit and plot downstream. Matched against the ids BEFORE Merge. Blank drops nothing."
+        },
+        {
+          "name": "merge",
+          "label": "Merge",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Ids that are one object, as `from>to` pairs, comma separated, e.g. `32>31`: the rows of 32 take id 31. For a track split when its field drifted further than the linking tolerance. Chains resolve (`a>b, b>c` sends a to c). Rows keep their measurements; only the id changes, and the old one is kept in `<id column>_before`. Blank merges nothing."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Blank (the default) writes the curated rows back over the table it reads, so every node downstream sees them without a change — allowed only for a table a table node wrote (Table Concat, Unique Objects, ...). A name writes a NEW table of the same kind and leaves the input whole."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_curate_objects",
+      "meta_transform": null,
+      "extra_layers": "_co_layers",
+      "adds_columns": true,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "drop",
+        "id_column",
+        "merge",
+        "name",
+        "table"
+      ]
+    },
     "table.join": {
       "op": "table.join",
       "label": "Table Join",
@@ -21540,8 +21907,8 @@
       ],
       "module": "nodegraph/catalog/table/join.py",
       "gui_only": false,
-      "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame or track — left or inner — as a new joined table.",
-      "overview": "A table with another table's columns added, matched row by row on a key. Resolved spec (V4.00 step 9, `build-node-v2`): * the LEFT table is ``table`` (of ``domain``) on ``data``; the OTHER is ``other_table`` (of ``other_domain``) on the ``other`` input — or on ``data`` itself when ``other`` is unwired, to join two tables of one wire; * ``on`` picks the key: ``id_m_t`` (the same object in the same position and frame — two measurements of one segmentation), ``id`` (globally unique ids), ``m_t`` (a per-frame table onto every object of that frame), ``track`` (``track_id`` and ``t`` — a Track table's per-frame columns onto the tracked objects; untracked ``track_id`` 0 never matches). The batch member ``b`` joins the key when both tables carry it; * the OTHER table may hold each key once (else the match is ambiguous and is refused — aggregate it first); the left may repeat a key (many-to-one); * ``how`` left keeps every left row (unmatched: NaN numbers, empty text); inner keeps only the matched ones, in left order; * the other's columns are added as ``prefix`` + name — all but the key and its coordinates (``id, m, t, c, z, y, x``, ``b``), which only repeat the matched object; a name the left already has is refused rather than overwritten; * the output is ``data``'s Dataset plus the ``name`` table on the left's domain, with the left's 2D/3D kind; WHOLE_SERIES, tables only.",
+      "summary": "Add another table's columns to a Label, Point or Track table, matching rows on id+position+frame, id, position+frame, track, or a pixel's region (label_id) — left or inner — as a new joined table.",
+      "overview": "A table with another table's columns added, matched row by row on a key. Resolved spec (V4.00 step 9, `build-node-v2`): * the LEFT table is ``table`` (of ``domain``) on ``data``; the OTHER is ``other_table`` (of ``other_domain``) on the ``other`` input — or on ``data`` itself when ``other`` is unwired, to join two tables of one wire; * ``on`` picks the key: ``id_m_t`` (the same object in the same position and frame — two measurements of one segmentation), ``id`` (globally unique ids), ``m_t`` (a per-frame table onto every object of that frame), ``track`` (``track_id`` and ``t`` — a Track table's per-frame columns onto the tracked objects; untracked ``track_id`` 0 never matches), ``label`` (the left's ``label_id`` against the other's ``id``, plus ``m`` and ``t`` — a pixel table onto its regions, 2026-11-02). The batch member ``b`` joins the key when both tables carry it; * the OTHER table may hold each key once (else the match is ambiguous and is refused — aggregate it first); the left may repeat a key (many-to-one); * ``how`` left keeps every left row (unmatched: NaN numbers, empty text); inner keeps only the matched ones, in left order; * the other's columns are added as ``prefix`` + name — all but the key and its coordinates (``id, m, t, c, z, y, x``, ``b``), which only repeat the matched object; a name the left already has is refused rather than overwritten; * the output is ``data``'s Dataset plus the ``name`` table on the left's domain, with the left's 2D/3D kind; WHOLE_SERIES, tables only.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -21610,7 +21977,8 @@
             "id_m_t",
             "id",
             "m_t",
-            "track"
+            "track",
+            "label"
           ],
           "default": "id_m_t",
           "description": "Which columns must agree for two rows to match.",
@@ -21618,7 +21986,8 @@
             "id_m_t": "The same object id in the same position and frame — two measurements of ONE segmentation (another channel, a second Measure). The safe default: per-plane ids repeat across frames.",
             "id": "The object id alone — only for ids unique across the whole series (3D or tracked labels); on per-frame ids it would match objects of different frames.",
             "m_t": "Position and frame — a per-frame table (one row per frame, e.g. a background level) onto every object of that frame.",
-            "track": "track_id and frame — a Track table's per-frame columns onto the tracked objects; an untracked object (track_id 0) never matches."
+            "track": "track_id and frame — a Track table's per-frame columns onto the tracked objects; an untracked object (track_id 0) never matches.",
+            "label": "The left row's `label_id` against the other row's `id`, in the same position and frame — a PIXEL table (Measure, Members = pixel) on the left, its regions' Label table as Other, so every pixel carries its object's area, shape and mean. Background pixels (label_id 0) find no region."
           }
         },
         {
@@ -21727,8 +22096,8 @@
       ],
       "module": "nodegraph/catalog/table/point_source_fit.py",
       "gui_only": false,
-      "summary": "Fit Crank's continuous point source (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — for its production rate per timepoint (or per interval) with bootstrap intervals, and the diffusivity if asked; adds the model's value per row and a rates table, and records the fit for Plot XY's and Gradient Map's trend.",
-      "overview": "Fit Crank's continuous point source to concentrations measured round a source. Resolved spec (2026-10-16, `build-node-v2`): * **Kind** table → ``table.point_source_fit``: one table in (``domain`` label / point / track), passed on with the model's value at every row added IN PLACE (``name``), and a new Label table ``<name>_rates`` (one row per rate). Tables only. * **Model** :mod:`nodegraph.catalog._shared.point_source`: ``C = q/(4πDr)·erfc(r/2√(Dt))`` (McGhee et al. 2022 Eq. 2, after Crank), ×2 under ``boundary = half_space`` (a source on an impermeable floor). ``rate = constant``: one ``q`` per group (each timepoint's average since the source started — the paper's per-timepoint fit); ``piecewise``: one per interval between successive group times, all groups fitted together by superposition. ``diffusivity = fit`` profiles ``D`` (one, shared) over 0.5–500 µm²/s; ``fixed`` uses ``D`` (default 20, the paper's IL-8 value). * **Columns** ``distance`` (µm to the source), ``value`` (concentration, pg/mL — the model's unit), ``group`` (one time each; blank = ``t``), ``time`` read by ``time_kind``: ``clock`` a Julian date (Table Concat's ``time_jd``, each row's own acquisition clock), the source started ``start_h`` hours before the EARLIEST row; ``hours`` / ``seconds`` elapsed, plus ``start_h``. Rows with a non-finite or non-positive distance or time, or a value under ``fit_floor`` (or ≤ 0 under ``relative``), are not fitted; every row with a distance and time still gets the model's value. * **Weight** ``relative`` fits ``ln C`` (every bead weighs by its relative miss), ``sqrt`` fits ``√C`` (between the two), ``absolute`` fits pg/mL. R² is in the space fitted. * **Background** ``uniform`` (2026-10-16) adds one non-negative level per group to the point source — the far field of a FINITE well, whose walls return what an unbounded Eq. 2 lets escape, so the profile levels off instead of falling to 0; reported as ``background_pg_ml`` and part of the model every reader draws. * **Uncertainty** ``bootstrap`` resamples (rows within each group, fixed seed) give each rate's 95 % interval, conditional on the fitted D. * **Provenance** the fit under ``point_source_fit`` in the metadata, keyed by the value column, with the standard curve that made that column (``standard_curve``), so Plot XY and Gradient Map can draw the model in the signal's units too. * **Footprint** WHOLE_SERIES, empty kernel_axes. Numpy + scipy.",
+      "summary": "Fit Crank's continuous point source (McGhee et al. 2022, Eq. 2) to concentrations measured round a secreting source — capture beads round a spheroid — for its production rate per timepoint (or per interval) with bootstrap intervals or the paper's Monte Carlo mean ± SD, and the diffusivity if asked; adds the model's value per row and a rates table, and records the fit for Plot XY's and Gradient Map's trend.",
+      "overview": "Fit Crank's continuous point source to concentrations measured round a source. Resolved spec (2026-10-16, `build-node-v2`): * **Kind** table → ``table.point_source_fit``: one table in (``domain`` label / point / track), passed on with the model's value at every row added IN PLACE (``name``), and a new Label table ``<name>_rates`` (one row per rate). Tables only. * **Model** :mod:`nodegraph.catalog._shared.point_source`: ``C = q/(4πDr)·erfc(r/2√(Dt))`` (McGhee et al. 2022 Eq. 2, after Crank), ×2 under ``boundary = half_space`` (a source on an impermeable floor). ``rate = constant``: one ``q`` per group (each timepoint's average since the source started — the paper's per-timepoint fit); ``piecewise``: one per interval between successive group times, all groups fitted together by superposition. ``diffusivity = fit`` profiles ``D`` (one, shared) over 0.5–500 µm²/s; ``fixed`` uses ``D`` (default 20, the paper's IL-8 value). * **Columns** ``distance`` (µm to the source), ``value`` (concentration, pg/mL — the model's unit), ``group`` (one time each; blank = ``t``), ``time`` read by ``time_kind``: ``clock`` a Julian date (Table Concat's ``time_jd``, each row's own acquisition clock), the source started ``start_h`` hours before the EARLIEST row; ``hours`` / ``seconds`` elapsed, plus ``start_h``. Rows with a non-finite or non-positive distance or time, or a value under ``fit_floor`` (or ≤ 0 under ``relative``), are not fitted; every row with a distance and time still gets the model's value. * **Weight** ``relative`` fits ``ln C`` (every bead weighs by its relative miss), ``sqrt`` fits ``√C`` (between the two), ``absolute`` fits pg/mL. R² is in the space fitted. * **Background** ``uniform`` (2026-10-16) adds one non-negative level per group to the point source — the far field of a FINITE well, whose walls return what an unbounded Eq. 2 lets escape, so the profile levels off instead of falling to 0; reported as ``background_pg_ml`` and part of the model every reader draws. * **Fit span** (2026-10-29) ``low, high`` µm, each a number or a column's median: rows outside are not fitted (they still get the model's value) — the paper's Eq. 2 holds beyond one spheroid diameter of the centre. * **Uncertainty** ``bootstrap`` resamples (rows within each group, fixed seed) give each rate's 95 % interval, conditional on the fitted D. ``monte_carlo`` (2026-10-29) is the paper's Appendix B.3 (:func:`point_source.monte_carlo`): ``mc_runs`` least-squares refits with each row's value, distance and time perturbed by N(0, ``value_sd`` column or ``value_rel_sd``·value), N(0, ``r_sd``), N(0, ``t_sd``) and one D per run of mean D and SD ``D_sd`` (lognormal: the paper's normal reaches D ≤ 0, where the mean diverges), each timepoint on its own with a stream seeded by its label (so it gives the same result whatever is fitted beside it); the reported rate and level are the runs' MEAN (the plain fit stays in the record as ``q_nominal_fg_s``), ``q_lo``/``q_hi`` mean ∓ 1 SD and ``q_ci`` the SD; R² is recomputed for that model. Needs ``absolute`` weighting and ``constant`` rates, else refused. Both write ``q_sd_fg_s`` and ``background_sd_pg_ml``. * **Provenance** the fit under ``point_source_fit`` in the metadata, keyed by the value column, with the standard curve that made that column (``standard_curve``), so Plot XY and Gradient Map can draw the model in the signal's units too. * **Footprint** WHOLE_SERIES, empty kernel_axes. Numpy + scipy.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -21849,6 +22218,20 @@
           }
         },
         {
+          "name": "uncertainty",
+          "label": "Uncertainty",
+          "choices": [
+            "bootstrap",
+            "monte_carlo"
+          ],
+          "default": "bootstrap",
+          "description": "How each rate's uncertainty is found.",
+          "choice_docs": {
+            "bootstrap": "Resample the beads within each timepoint and refit at the fitted D: a 95 % interval on the rate from the beads' scatter alone. Works with every weighting and rate model; D, distances and the curve are taken as exact.",
+            "monte_carlo": "McGhee et al. 2022's Appendix B.3: refit many times with every concentration, distance and time perturbed and D drawn around D (± D SD); the rate reported is the runs' MEAN, ± 1 SD. Carries D's and the curve's uncertainty into the rate. Needs Weighting = absolute and Rate = constant (the paper's fit)."
+          }
+        },
+        {
           "name": "time_kind",
           "label": "Time kind",
           "choices": [
@@ -21962,13 +22345,116 @@
           "description": "Values below this (in the value's units) are not fitted — readings at the noise floor, which on a log fit would weigh like a hundred-fold miss. They still get the model's value. 0 keeps every positive value."
         },
         {
+          "name": "fit_span",
+          "label": "Fit span",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Fit only rows whose distance lies in 'low, high' — each side blank, a distance in µm, or a column whose median is the bound (`spheroid_diameter_um,`: the paper's Eq. 2 holds beyond one diameter of the spheroid's centre). Rows outside still get the model's value. Blank fits every distance; raising the low bound drops the near beads that pin the rate most."
+        },
+        {
           "name": "bootstrap",
           "label": "Bootstrap",
           "type": "int",
           "role": "parameter",
           "is_field": false,
           "default": 200,
+          "available_in": {
+            "uncertainty": [
+              "bootstrap"
+            ]
+          },
           "description": "Resamples (beads within each timepoint) for each rate's 95 % interval, at the fitted D. 0 skips it; more steadies the interval and costs a refit each."
+        },
+        {
+          "name": "mc_runs",
+          "label": "Monte Carlo runs",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 100000,
+          "available_in": {
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Refits on perturbed inputs per timepoint — McGhee et al. 2022 used 10⁵. Fewer runs are faster and leave the mean and SD noisier; the seed is fixed, so a run repeats exactly."
+        },
+        {
+          "name": "D_sd",
+          "label": "D SD",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um2/s",
+          "default": 10.0,
+          "available_in": {
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Each run's D has mean D and this SD — the paper's 20 ± 10 µm²/s — drawn LOGNORMAL so it stays positive (a normal one puts 2 % of runs at D ≤ 0, where no rate fits and the mean diverges). Far from the source the rate scales almost directly with D, so this is usually the largest part of the rate's SD. 0 holds D fixed."
+        },
+        {
+          "name": "t_sd",
+          "label": "Time SD",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "s",
+          "default": 600.0,
+          "available_in": {
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Each row's time is perturbed by N(0, this) — the paper's ± 10 min, half its volume's scan time. Matters only for early timepoints; it does not cover an uncertain Source started."
+        },
+        {
+          "name": "r_sd",
+          "label": "Distance SD",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "um",
+          "default": 50.0,
+          "available_in": {
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Each row's distance is perturbed by N(0, this) — the paper's ± 50 µm, how far its spheroid's margin is from round. An irregular group of spheroids deserves its own (the SD of its outline's distance from the centroid). Larger widens the near beads' influence on the SD."
+        },
+        {
+          "name": "value_sd",
+          "label": "Value SD",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "available_in": {
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "column_in_mode": "domain",
+          "column_from": "table",
+          "description": "A column holding each row's concentration SD, in the value's units — Standard Curve's `<name>_sd` with its Monte Carlo on, the paper's calibration uncertainty carried per bead. Blank uses Value relative SD for every row; a row whose SD is not finite takes the relative one too. Beware a saturating curve: near its top a few rows' SDs run to 10⁴–10⁵ and take over the least squares in some runs (the paper's one relative SD is steadier)."
+        },
+        {
+          "name": "value_rel_sd",
+          "label": "Value relative SD",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.117,
+          "available_in": {
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Each row's concentration is perturbed by N(0, this × value) when Value SD is blank — the paper's 11.7 %, its standard curve's uncertainty. Larger widens the rate's SD, not its mean."
         },
         {
           "name": "name",
@@ -21997,16 +22483,23 @@
       "kernel_doc": "",
       "params_read": [
         "D",
+        "D_sd",
         "__modes__",
         "bootstrap",
         "distance",
         "fit_floor",
+        "fit_span",
         "group",
+        "mc_runs",
         "name",
+        "r_sd",
         "start_h",
+        "t_sd",
         "table",
         "time",
-        "value"
+        "value",
+        "value_rel_sd",
+        "value_sd"
       ]
     },
     "table.register_positions": {
@@ -22238,7 +22731,7 @@
       "module": "nodegraph/catalog/table/standard_curve.py",
       "gui_only": false,
       "summary": "Turn a measured signal (a bead's MFI) into a concentration through a standard curve — Langmuir or linear, fitted from standards measured the same way and wired in, or typed — with each row flagged in range, extrapolated, under the detection limit or past the curve.",
-      "overview": "A signal column (a bead's background-subtracted MFI) turned into a concentration by a standard curve — fitted here from standards measured the same way, or typed. Resolved spec (2026-10-15, `build-node-v2`): * **Kind** table → ``table.standard_curve``: one table in (``domain`` label / point / track, ``table``), the same table out with two columns added IN PLACE (``name`` and ``<name>_flag``), so its raster and overlays still match. A Name the table already has is refused — a conversion must never overwrite a measurement. * **Curve = fit** (default): the ``standards`` input's table (``std_domain``, ``std_table``) — one row per standard bead, its known concentration ``std_x`` and its signal ``std_y`` (blank = the converted column's own name; ``std_x`` blank = Table Concat's ``condition_value``), optionally weighted by ``std_weight`` (a pixel count: the weighted mean of bead means IS the mean of every pooled pixel, which is what the IL-8 report fitted) — filtered by ``std_where`` (``column=value`` clauses, all must hold: ``sighting=0`` keeps first imagings). One point per concentration > 0: the weighted mean. ``model`` langmuir fits ``Bmax·x / (Kd + x)`` through those points in data units (:func:`figure.xy_langmuir`, the fit Plot XY draws); linear fits ``a + b·x`` through them AND the blank. The blank rows (x <= 0) give the detection limit, mean + 3 SD of the blank rows' signal. * **Curve = typed**: ``bmax`` / ``kd`` or ``slope`` / ``intercept``, and an optional ``lod_signal``; no range is known, so no range flags. * **Inversion** Langmuir ``Kd·y/(Bmax − y)`` (NaN at or above Bmax); linear ``(y − a)/b``. **Flags** (text) ``no signal``, ``above Bmax``, ``below LOD``, ``below range`` / ``above range`` (extrapolated beyond the lowest / highest standard) or ``in range``. * **Provenance** the curve (points, blank, fit, range, LOD) under ``standard_curve`` in the metadata, keyed by the output column; the new column carries the standards' x unit. * **Footprint** WHOLE_SERIES, empty kernel_axes: tables only, no axis or calibration change.",
+      "overview": "A signal column (a bead's background-subtracted MFI) turned into a concentration by a standard curve — fitted here from standards measured the same way, or typed. Resolved spec (2026-10-15, `build-node-v2`): * **Kind** table → ``table.standard_curve``: one table in (``domain`` label / point / track, ``table``), the same table out with two columns added IN PLACE (``name`` and ``<name>_flag``), so its raster and overlays still match. A Name the table already has is refused — a conversion must never overwrite a measurement. * **Curve = fit** (default): the ``standards`` input's table (``std_domain``, ``std_table``) — one row per standard bead, its known concentration ``std_x`` and its signal ``std_y`` (blank = the converted column's own name; ``std_x`` blank = Table Concat's ``condition_value``), optionally weighted by ``std_weight`` (a pixel count: the weighted mean of bead means IS the mean of every pooled pixel, which is what the IL-8 report fitted) — filtered by ``std_where`` (``column=value`` clauses, all must hold: ``sighting=0`` keeps first imagings). One point per concentration > 0: the weighted mean. ``model`` langmuir fits ``Bmax·x / (Kd + x)`` through those points in data units (:func:`figure.xy_langmuir`, the fit Plot XY draws); linear fits ``a + b·x`` through them AND the blank. The blank rows (x <= 0) give the detection limit, mean + 3 SD of the blank rows' signal. * **Curve = typed**: ``bmax`` / ``kd`` or ``slope`` / ``intercept``, and an optional ``lod_signal``; no range is known, so no range flags. * **Inversion** Langmuir ``Kd·y/(Bmax − y)`` (NaN at or above Bmax); linear ``(y − a)/b``. **Flags** (text) ``no signal``, ``above Bmax``, ``below LOD``, ``below range`` / ``above range`` (extrapolated beyond the lowest / highest standard) or ``in range``. * **Uncertainty = monte_carlo** (2026-10-29, Curve = fit only): ``<name>_sd`` beside the concentration, from :func:`calibration_sd` — ``mc_runs`` refits with each standard's weighted mean perturbed by its rows' weighted SD and its concentration by ``x_rel_sd`` (McGhee et al. 2022, Appendix B.1), each row inverted through every refit; the SD is half the runs' 16–84 % range (robust to the near-Bmax inversions), NaN where under half the runs give a value or the 84 % point is unbounded. * **Provenance** the curve (points, their SDs, blank, fit, range, LOD) under ``standard_curve`` in the metadata, keyed by the output column; the new column carries the standards' x unit. * **Footprint** WHOLE_SERIES, empty kernel_axes: tables only, no axis or calibration change.",
       "overview_source": "compute",
       "dimensionality": {
         "supports_2d": true,
@@ -22329,6 +22822,25 @@
           "choice_docs": {
             "label": "Per segmented region — one row per labelled object, from Segmentation or Connected Components. Columns here are per-cell measurements: area, mean intensity, shape.",
             "point": "Per detection — one row per sub-pixel point from Spot/Particle Detection. Positions are fractional, and a point has a location but no extent."
+          }
+        },
+        {
+          "name": "uncertainty",
+          "label": "Uncertainty",
+          "choices": [
+            "none",
+            "monte_carlo"
+          ],
+          "default": "none",
+          "available_in": {
+            "curve": [
+              "fit"
+            ]
+          },
+          "description": "Whether each converted row also gets the curve's uncertainty.",
+          "choice_docs": {
+            "none": "The concentration only — the curve's parameters taken as exact.",
+            "monte_carlo": "Also `<name>_sd`: each row's concentration SD from refits of the curve with every standard perturbed by its own beads' SD — McGhee et al. 2022's Appendix B.1 calibration uncertainty, per row (it grows toward the curve's top; half the runs' 16–84 % range, so a few near-infinite inversions do not rule it). Point-Source Fit's Monte Carlo reads it as Value SD. Costs one curve fit per run."
           }
         }
       ],
@@ -22537,6 +23049,40 @@
             ]
           },
           "description": "A typed detection limit in signal units: rows under it are flagged `below LOD`. 0 flags none. A fitted curve takes its own from the blank (mean + 3 SD)."
+        },
+        {
+          "name": "mc_runs",
+          "label": "Monte Carlo runs",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 2000,
+          "available_in": {
+            "curve": [
+              "fit"
+            ],
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Refits of the curve on perturbed standards. More steadies each row's SD and costs one curve fit each (about a millisecond); a few thousand is plenty for an SD. The seed is fixed."
+        },
+        {
+          "name": "x_rel_sd",
+          "label": "Standards conc. SD",
+          "type": "float",
+          "role": "parameter",
+          "is_field": false,
+          "default": 0.0,
+          "available_in": {
+            "curve": [
+              "fit"
+            ],
+            "uncertainty": [
+              "monte_carlo"
+            ]
+          },
+          "description": "Relative SD of each standard's concentration — its pipetting error (McGhee et al. 2022's Table 1 is 1.6–2.1 %). 0 takes the concentrations as exact; larger widens every row's SD, most near the curve's top."
         }
       ],
       "outputs": [
@@ -22560,6 +23106,7 @@
         "intercept",
         "kd",
         "lod_signal",
+        "mc_runs",
         "name",
         "signal",
         "slope",
@@ -22568,7 +23115,8 @@
         "std_where",
         "std_x",
         "std_y",
-        "table"
+        "table",
+        "x_rel_sd"
       ]
     },
     "table.unique_objects": {

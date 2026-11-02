@@ -50,8 +50,8 @@
       "label": "Input / output",
       "stage": "acquire_and_organize",
       "pages": ["input"],
-      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence or figure, and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
-      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure", "io.load_analysis"]
+      "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence, figure or table (CSV / Parquet, a pixel table to a file of its own), and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
+      "ops": ["io.load", "io.dock", "io.write_tiff", "io.write_movie", "io.write_figure", "io.load_analysis", "io.write_table"]
     },
     "dataset_and_channel_organization": {
       "label": "Dataset & channel organization",
@@ -134,7 +134,7 @@
       "label": "Measurement & statistics",
       "stage": "quantify",
       "pages": ["process"],
-      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
+      "description": "Numbers from objects: per-region and per-point intensity and shape measurements, every pixel of chosen regions as rows of its own, derived per-object kinematics and neighbour metrics, gridded Eulerian object fields, a value measured at scattered objects interpolated round a point source along the exponential decay it follows (Gradient Map), point clustering, and reduction of any layer or column to one Global scalar.",
       "ops": ["analysis.measure", "analysis.object_metrics", "analysis.object_field", "analysis.gradient_map", "analysis.cluster_points", "analysis.reduce_scalar"]
     },
     "arithmetic": {
@@ -155,8 +155,8 @@
       "label": "Table synthesis",
       "stage": "quantify",
       "pages": ["process", "analyze"],
-      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N. Register Positions moves a later run's stage positions into a reference run's frame by the objects both contain, for a plate taken off the stage and put back. Standard Curve turns a measured signal into a concentration through a Langmuir or linear curve fitted from standards measured the same way. Point-Source Fit fits Crank's continuous point source to those concentrations against distance and time, for a secreting source's production rate (and the diffusivity).",
-      "ops": ["table.concat", "table.join", "table.aggregate", "table.unique_objects", "table.register_positions", "table.standard_curve", "table.point_source_fit"]
+      "description": "Build new tables out of measured ones: Table Concat stacks the tables of several pages or variants with a condition column, Table Join adds another table's columns row by row on a shared key, Table Aggregate summarises a column per group (mean, sem, count, ...), and Unique Objects links the rows that are one physical object seen from overlapping positions or again in later frames, numbering its sightings and keeping the first N. Curate Objects applies a review to those ids: it drops the objects the review rejected and merges ids that are one object, a track split when its field drifted. Register Positions moves a later run's stage positions into a reference run's frame by the objects both contain, for a plate taken off the stage and put back. Standard Curve turns a measured signal into a concentration through a Langmuir or linear curve fitted from standards measured the same way. Point-Source Fit fits Crank's continuous point source to those concentrations against distance and time, for a secreting source's production rate (and the diffusivity).",
+      "ops": ["table.concat", "table.join", "table.aggregate", "table.unique_objects", "table.curate_objects", "table.register_positions", "table.standard_curve", "table.point_source_fit"]
     },
     "tracking": {
       "label": "Tracking",
@@ -221,6 +221,7 @@
     "io.write_tiff": ["analyze"],
     "io.write_movie": ["analyze"],
     "io.write_figure": ["analyze"],
+    "io.write_table": ["analyze"],
     "io.load_analysis": ["input", "analyze"],
     "channel.select": ["input", "refine", "process", "analyze"],
     "page.input": ["refine", "process", "analyze"],

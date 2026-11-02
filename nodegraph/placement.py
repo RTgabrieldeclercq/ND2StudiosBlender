@@ -50,7 +50,8 @@ import numpy as np
 __all__ = [
     "FieldBox", "SECONDS_PER_DAY", "field_box", "z_um_of_slice", "lateral_extent_um",
     "overlap_fraction", "axis_map", "translate", "ALIGN_KEY", "tiles_covering", "pair_timepoints",
-    "PlacementPlan", "plan_placement", "compose_secondary_plane", "field_rect01", "paired_t",
+    "PlacementPlan", "plan_placement", "compose_secondary_plane", "pixel_window", "field_rect01",
+    "paired_t",
     "context_extent", "sub_field_box", "source_window",
     "secondary_z_index", "ZGrid", "merge_z_grid", "Z_GRID_BLOWUP",
     "paired_t_frac", "map_t", "secondary_z_weights", "plan_time", "frame_interval_s",
@@ -454,6 +455,24 @@ def source_window(out_box: FieldBox, src_box: FieldBox, *, flip_y: bool = False,
     if ry is None or rx is None:
         return None
     return (ry[0], ry[1], rx[0], rx[1])
+
+
+def pixel_window(want: Tuple[float, float, float, float], ny: int,
+                 nx: int) -> Tuple[int, int, int, int]:
+    """``want`` (fractions of a tile's pixel grid, from :func:`source_window`) as whole pixel
+    bounds ``(y0, y1, x0, x1)`` of an ``(ny, nx)`` tile, snapped OUTWARD.
+
+    Outward because a pixel that is only partly inside the window still holds the sample an
+    edge output pixel lands on; one extra row costs nothing, one missing row is a seam.
+    Never empty: at least one pixel per axis.
+    """
+    fy0, fy1, fx0, fx1 = (float(v) for v in want)
+    ny, nx = int(ny), int(nx)
+    y0 = min(max(int(np.floor(fy0 * ny)), 0), ny - 1)
+    x0 = min(max(int(np.floor(fx0 * nx)), 0), nx - 1)
+    y1 = max(min(int(np.ceil(fy1 * ny)), ny), y0 + 1)
+    x1 = max(min(int(np.ceil(fx1 * nx)), nx), x0 + 1)
+    return y0, y1, x0, x1
 
 
 #: Minify by area-averaging once the source is more than this many samples per output sample.
@@ -875,6 +894,10 @@ def compose_secondary_plane(entry: Dict[str, Any],
       of handing back a decimated whole plane. The window it returns need not be the one
       asked for — it will have been snapped out to whole pixels of whichever level it chose.
 
+    A whole tile is cut down to ``want`` (:func:`pixel_window`) before anything else, so both
+    answers sample identically: the secondary is drawn at its own resolution wherever the
+    output is finer than it, and area-averaged only where the output really is coarser.
+
     ``None`` when the field cannot be placed or no tile covers it, which the caller shows as
     "no overlay here" rather than as a black plane.
     """
@@ -962,6 +985,18 @@ def compose_secondary_plane(entry: Dict[str, Any],
         if plane.ndim != 2 or plane.size == 0:
             continue
         n_sy, n_sx = plane.shape
+        if cover is None:
+            # A WHOLE tile came back, but only `want` of it lands in the output. Keep that
+            # window (snapped out to whole pixels) — what a windowed reader would have served —
+            # so the minification test below weighs the pixels actually drawn against the output
+            # samples they fill. Weighing the whole tile instead block-averaged a large tile
+            # behind a small field and then magnified the result: a 0.86 µm/px CRC tile under a
+            # 294 µm TFM field came out at 1.7 µm/px.
+            y0, y1, x0, x1 = pixel_window(want, n_sy, n_sx)
+            if (y0, y1, x0, x1) != (0, n_sy, 0, n_sx):
+                plane = plane[y0:y1, x0:x1]
+                cover = (y0 / n_sy, y1 / n_sy, x0 / n_sx, x1 / n_sx)
+                n_sy, n_sx = plane.shape
         if cover is None:                      # whole tile: its extent IS the tile's box
             r_lo, r_hi, c_lo, c_hi = s_y0, s_y1, s_x0, s_x1
         else:

@@ -2028,6 +2028,56 @@ def main(argv) -> int:
     except ImportError:
         _ok("Export: Parquet SKIPPED (pyarrow absent)")
 
+    # E1c: a PIXEL table (Measure, Members = pixel) opens in the spreadsheet as a strip of
+    # its pixels — sortable by any column, a rounded card per hovered pixel, a Pixels/Table
+    # toggle — and the wrap follows the panel's width (2026-11-02)
+    from PySide6.QtCore import QPoint as _QP, Qt as _Qt
+    from PySide6.QtGui import QMouseEvent as _QME
+    from nodegraph.structure import StructureTable as _PST
+    from nodelab_v2.tables import mark_pixel_table as _mark_px
+    _n = 500
+    _rng = np.arange(_n)
+    _pcols = {"id": _rng + 1, "m": np.zeros(_n, np.int32), "t": np.zeros(_n, np.int32),
+              "c": np.zeros(_n, np.int32), "z": np.zeros(_n, np.int32),
+              "y": (_rng // 25).astype(np.int32), "x": (_rng % 25).astype(np.int32),
+              "label_id": 1 + _rng // 250, "intensity": ((_rng * 37) % 500).astype(np.float32)}
+    _pds = _mark_px(sds.with_structure(_PST(_Dom.POINT, _pcols, layer="pixels",
+                                            z_kind="plane_index")), "pixels")
+    win.sheet.show_dataset("pixels-test", _pds)
+    win.sheet._pick.setCurrentIndex(next(
+        i for i in range(win.sheet._pick.count())
+        if win.sheet._pick.itemData(i) == ("point", "pixels")))
+    app.processEvents()
+    _strip = win.sheet._strip
+    assert win.sheet._stack.currentWidget() is _strip, "a pixel table must open as the strip"
+    assert not win.sheet._view_row.isHidden(), "the Pixels/Table toggle shows for a pixel table"
+    assert _strip.data.n == _n and _strip.data.sort_by == "intensity"
+    _iv = _pcols["intensity"][_strip.data.order]
+    assert np.all(np.diff(_iv) >= 0), "sorted ascending by intensity"
+    _strip.sort_box.setCurrentText("label_id")
+    _strip.order_btn.click()
+    app.processEvents()
+    assert _pcols["label_id"][_strip.data.order][0] == 2, "descending by label_id"
+    _cv = _strip.canvas
+    assert _cv._cols == max(1, _cv.width() // _cv.cell), "the strip wraps at the panel width"
+    _title, _rows, _sw = _strip.card_content(0)
+    assert "label 2" in _title and dict(_rows)["label_id"] == 2, _title
+    _cv.mouseMoveEvent(_QME(_QME.Type.MouseMove, QPointF(3, 3),
+                            QPointF(_cv.mapToGlobal(_QP(3, 3))), _Qt.NoButton,
+                            _Qt.NoButton, _Qt.NoModifier))
+    app.processEvents()
+    assert _strip.card.isVisible(), "hovering a pixel must show its card"
+    _cv.leaveEvent(None)
+    assert not _strip.card.isVisible()
+    win.sheet._view_btns.button(1).click()
+    app.processEvents()
+    assert win.sheet._stack.currentWidget() is win.sheet._table
+    assert win.sheet._model.rowCount() == _n
+    win.sheet._view_btns.button(0).click()               # leave the default for later probes
+    win.sheet.show_dataset("spots-test", sds)
+    _ok(f"Export: a pixel table opens as a strip of {_n} pixels — sorted, wrapped at "
+        f"{_cv._cols} columns, a hover card per pixel, Pixels/Table toggle")
+
     # (the file-bundle export column is covered by nodegraph.selftest's
     # test_bundle_source_file_column — tables/export are Qt-free, so they belong on the
     # Qt-free gate rather than in the middle of a GUI timing sequence.)
