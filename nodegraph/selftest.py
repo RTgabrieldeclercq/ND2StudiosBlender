@@ -36775,8 +36775,336 @@ def main() -> int:
     test_point_source_fit()
     test_measure_pixels()
     test_table_export_split()
+    test_figure_core()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
+
+
+def test_figure_core() -> None:
+    """The Qt-free core of the Figure Editor (V5.00 step 1, ``nodegraph/figure``): the
+    document schema (defaults, every error naming its path, canonical JSON, digests, twin
+    inheritance), the read plans and the zoom box a popout's stage metadata resolves to
+    on its parent, the derived arrays (reslice, coded projections, kymograph, profile,
+    MSD, survival, colocalisation), the new series kinds, the statistics, the chart
+    geometry of every chart kind, the page checks, the generated legend sentence, and the
+    overlay-maths shim. The design record is ``CodeLog/ClaudesPlan/V5.00_figure_editor.md``;
+    the fixture here is its §4.2 example — a montage of a plate, a popout placed by stage
+    metadata, a twin with a normalised speed layer, an MSD chart."""
+    import json as _json
+    import math as _math
+    import numpy as _np
+    from nodegraph.dataset import AxisSizes as _AX
+    from nodegraph.figure import bind as B, charts as C, derive as D, layout as L
+    from nodegraph.figure import legend_text as LT, schema as S, series as SR, stats as ST
+
+    # ── schema ────────────────────────────────────────────────────────────────
+    doc = S.new_document("overlay", "double_column")
+    doc["sources"] = [{"id": "s_plate", "source": "pg1:plate", "label": "plate"},
+                      {"id": "s_close", "source": "pg2:closeup"},
+                      {"id": "s_tr", "source": "pg3:cells"}]
+    doc["items"] = [
+        {"id": "overview", "kind": "montage", "rect_mm": [0, 0, 120, 80], "letter": "A",
+         "image": {"source": "s_plate", "channels": [{"c": 0, "rgb": "#ffffff"}],
+                   "decor": {"scale_bar_um": 50}},
+         "montage": {"tile_by": "m", "columns": 2}},
+        {"id": "zoom1", "kind": "image", "rect_mm": [124, 0, 56, 40], "letter": "B",
+         "image": {"source": "s_close", "frame": {"t": "cursor", "z": "max"},
+                   "region": {"from": "placement"},
+                   "channels": [{"c": 0, "rgb": "#ffffff", "mode": "auto_pct"}],
+                   "decor": {"scale_bar_um": 20, "time_stamp": "elapsed"}}},
+        {"id": "zoom2", "kind": "image", "rect_mm": [124, 42, 56, 40], "letter": "C",
+         "image": {"layers": [{"domain": "track", "layer": "cells", "kind": "field",
+                               "column": "speed",
+                               "limits": {"mode": "normalized", "vmax": 0.8}}]}},
+        {"id": "cb1", "kind": "colorbar", "rect_mm": [124, 84, 56, 6],
+         "of": {"item": "zoom2", "layer": 0}, "label": "v / v_max"},
+        {"id": "msd", "kind": "chart", "rect_mm": [0, 84, 100, 36], "letter": "D",
+         "chart": {"kind": "msd", "source": "s_tr", "table": "cells",
+                   "group_by": "condition",
+                   "axes": {"x_label": "lag (s)", "y_label": "MSD (µm²)"}}},
+    ]
+    doc["links"] = [
+        {"kind": "zoom", "parent": "overview", "child": "zoom1"},
+        {"kind": "twin", "a": "zoom1", "b": "zoom2", "share": ["region", "frame", "channels"]},
+        {"kind": "lut_share", "items": ["zoom1", "zoom2"]},
+        {"kind": "cursor", "items": ["overview", "zoom1", "zoom2"], "axes": ["t"]},
+    ]
+    nd = S.normalize(doc)
+    assert nd["items"][1]["image"]["frame"]["z"] == "max"
+    assert nd["page"]["width_mm"] == 180.0 and nd["items"][3]["orientation"] == "horizontal"
+    eff = S.effective_image(nd, "zoom2")
+    assert eff["source"] == "s_close" and eff["region"]["from"] == "placement" \
+        and eff["layers"][0]["column"] == "speed" and eff["decor"] == {}
+    cj = S.canonical_json(nd)
+    assert cj == S.canonical_json(S.normalize(_json.loads(cj)))
+    d1 = S.digest(nd)
+    nd2 = _json.loads(cj)
+    nd2["items"][0]["rect_mm"][0] = 1.0
+    assert S.digest(nd2) != d1 and S.item_digest(nd, "zoom2") != S.item_digest(nd2, "overview")
+    bad = _json.loads(cj)
+    bad["items"][1]["image"]["channels"][0]["rgb"] = "red"
+    try:
+        S.normalize(bad)
+        raise AssertionError("a bad colour normalized")
+    except S.FigureError as e:
+        assert e.path == "items[1].image.channels[0].rgb", e.path
+    bad = _json.loads(cj)
+    bad["links"].append({"kind": "zoom", "parent": "zoom1", "child": "zoom1"})
+    try:
+        S.normalize(bad)
+        raise AssertionError
+    except S.FigureError as e:
+        assert "cannot zoom into itself" in str(e)
+    bad = _json.loads(cj)
+    bad["links"].append({"kind": "twin", "a": "zoom2", "b": "zoom1"})
+    try:
+        S.normalize(bad)
+        raise AssertionError
+    except S.FigureError as e:
+        assert "cycle" in str(e)
+    assert S.check({"items": [{"id": "x", "kind": "nope", "rect_mm": [0, 0, 1, 1]}]})[0] \
+        .startswith("items[0].kind")
+    _ok("figure schema: defaults, paths in errors, canonical JSON, digest, twin inheritance")
+
+    # ── layout and page checks ────────────────────────────────────────────────
+    chk = L.page_checks(nd)
+    codes = {(c["code"], c["item"]) for c in chk}
+    assert ("scale_bar", "zoom2") in codes and ("scale_bar", "zoom1") not in codes, codes
+    assert not any(c["code"] == "letter_order" for c in chk)
+    assert L.letters(28)[-2:] == ["AA", "AB"] and L.letters(2, "(A)") == ["(A)", "(B)"]
+    assert L.snap_mm(10.4, 1.0) == 10.0 and L.snap_mm(10.4, 0.0) == 10.4
+    assert L.align([(0, 0, 10, 5), (3, 8, 4, 4)], "left")[1][0] == 0
+    dd = L.distribute([(0, 0, 10, 5), (30, 0, 10, 5), (12, 0, 10, 5)], "x")
+    xs = sorted(r[0] for r in dd)
+    assert abs((xs[1] - xs[0]) - (xs[2] - xs[1])) < 1e-9
+    rg = _json.loads(cj)
+    rg["items"][0]["image"]["channels"] = [{"c": 0, "rgb": "#ff0000"}, {"c": 1, "rgb": "#00ff00"}]
+    assert any(c["code"] == "red_green" for c in L.page_checks(S.normalize(rg)))
+    _ok("figure layout: letters, snap, align, distribute; checks flag a bar-less twin and "
+        "a red/green merge")
+
+    # ── bind: placement by stage metadata ─────────────────────────────────────
+    pmd = {"pixel_size_um": 1.0, "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]}
+    pax = _AX(m=2, t=3, z=1, c=1, y=100, x=100)
+    cmd = {"pixel_size_um": 0.25, "origin_um": [[0.0, 10.0, 120.0]]}
+    cax = _AX(m=1, t=3, z=5, c=1, y=20, x=20)
+    envs = {"s_plate": (pax, pmd), "s_close": (cax, cmd), "s_tr": (cax, cmd)}
+    zb = B.zoom_box(nd, nd["links"][0], envs)
+    assert zb["refusal"] == "" and zb["parent_m"] == 1 and abs(zb["coverage"] - 1.0) < 1e-9, zb
+    assert all(abs(a - b) < 1e-6 for a, b in zip(zb["rect_px"], (10, 15, 20, 25))), zb["rect_px"]
+    plans = B.read_plans(nd, envs, cursor={"t": 2})
+    assert plans["zoom1"].t == 2 and plans["zoom1"].z == "max" \
+        and plans["zoom2"].source == "s_close" and plans["zoom2"].t == 2
+    assert plans["overview"].channels == (0,) and plans["overview"].window is None
+    doc_r = _json.loads(cj)
+    doc_r["items"][1]["image"]["region"] = {"from": "rect_um", "rect_um": [11, 13, 121, 123]}
+    rp = B.region_plan(S.normalize(doc_r), "zoom1", envs)
+    assert rp.ok and all(abs(a - b) < 1e-6 for a, b in zip(rp.window, (0.2, 0.6, 0.2, 0.6))), rp
+    assert B.window_px(rp.window, 20, 20) == (4, 12, 4, 12)
+    tables = {("label", "cells"): {"id": _np.array([1, 2]), "m": _np.array([0, 0]),
+                                   "t": _np.array([0, 0]), "y": _np.array([10.0, 5.0]),
+                                   "x": _np.array([10.0, 5.0]),
+                                   "area": _np.array([_math.pi * 4, _math.pi])}}
+    doc_o = _json.loads(cj)
+    doc_o["items"][1]["image"]["region"] = {"from": "object", "object": 1, "margin_um": 0.5}
+    rp = B.region_plan(S.normalize(doc_o), "zoom1", envs, tables=tables)
+    assert rp.ok and abs(rp.window[0] - 0.3) < 1e-6 and abs(rp.window[1] - 0.7) < 1e-6, rp
+    rp = B.region_plan(S.normalize(doc_o), "zoom1", envs, tables=None)
+    assert not rp.ok and "no tables" in rp.refusal
+    zb2 = B.zoom_box(nd, nd["links"][0], {"s_plate": (pax, {}), "s_close": (cax, cmd)})
+    assert zb2["refusal"] and zb2["rect_px"] is None
+    far = dict(cmd, origin_um=[[0.0, 500.0, 500.0]])
+    zb3 = B.zoom_box(nd, nd["links"][0], {"s_plate": (pax, pmd), "s_close": (cax, far)})
+    assert "does not overlap" in zb3["refusal"]
+    _ok("figure bind: a popout's box lands on the parent tile its stage origin says, "
+        "µm and object regions become plane windows, unplaceable sources are refused")
+
+    # ── derive ────────────────────────────────────────────────────────────────
+    stack = _np.zeros((4, 8, 8))
+    stack[2, 3, :] = 5.0
+    xz = D.reslice(stack, "xz", 3)
+    assert xz.shape == (4, 8) and xz[2].max() == 5 and xz[1].max() == 0
+    assert D.reslice(stack, "xz", 3, z_step_um=2.0, pixel_size_um=1.0).shape[0] == 7
+    assert D.reslice(stack, "yz", 0).shape == (4, 8)
+    code, mx = D.coded_projection(stack)
+    assert code[3, 0] == 2 and mx[3, 0] == 5 and code[0, 0] == 0
+    rgb = D.coded_rgb(code, mx, n=4)
+    assert rgb.shape == (8, 8, 3) and rgb.dtype == _np.uint8 and rgb[3, 0].max() > 0 \
+        and rgb[0, 0].max() == 0
+    T, H, W = 6, 10, 20
+    mov = _np.zeros((T, H, W))
+    for t in range(T):
+        mov[t, 5, 3 + t] = 1.0
+    ky = D.kymograph(mov, (5, 0), (5, 19))
+    assert ky.shape == (6, 20) and all(int(_np.argmax(ky[t])) == 3 + t for t in range(T))
+    s, prof = D.profile(mov[0], (5, 0), (5, 19), pixel_size_um=0.5)
+    assert prof.shape == (20,) and abs(s[-1] - 9.5) < 1e-9 and int(_np.argmax(prof)) == 3
+    assert D.profile(_np.stack([mov[0], mov[1]]), (5, 0), (5, 19))[1].shape == (2, 20)
+    tid = _np.repeat([1, 2], 10)
+    tt = _np.tile(_np.arange(10), 2)
+    yy = _np.zeros(20)
+    xx = _np.concatenate([_np.arange(10), _np.arange(10)]).astype(float)
+    r = D.msd(tid, tt, yy, xx, dt=1.0, max_lag=4)
+    assert r["lag"] == [1, 2, 3, 4] and [round(v, 6) for v in r["msd"]] == [1, 4, 9, 16]
+    assert abs(D.power_fit(r["lag"], r["msd"])["alpha"] - 2) < 1e-9
+    t_, s_ = D.survival([3, 5, 5, 8])
+    assert list(t_) == [0, 3, 5, 8] and abs(s_[1] - 0.75) < 1e-12 and abs(s_[2] - 0.25) < 1e-12 \
+        and s_[-1] == 0
+    cl = D.coloc(_np.arange(100.0), _np.arange(100.0) * 2 + 1)
+    assert abs(cl["pearson"] - 1) < 1e-9 and cl["n"] == 100
+    _ok("figure derive: reslice (resampled to square), depth/time code, kymograph, profile, "
+        "MSD (α = 2 for constant velocity), Kaplan–Meier, Pearson/Manders")
+
+    # ── series ────────────────────────────────────────────────────────────────
+    bs = SR.bar_series(["a", "b", "a", "b"], [1, 2, 3, 4], ["g1", "g1", "g2", "g2"])
+    assert bs[0]["categories"] == ["a", "b"] and bs[0]["y"] == [1.0, 2.0] and bs[1]["y"] == [3.0, 4.0]
+    st_ = SR.strip_series([1, 2, 3], None, jitter=0.2)
+    assert len(st_[0]["offsets"]) == 3 and max(abs(o) for o in st_[0]["offsets"]) <= 0.2
+    assert st_ == SR.strip_series([1, 2, 3], None, jitter=0.2)          # deterministic
+    sp = SR.superplot_series([1, 2, 3, 4], ["c"] * 4, ["r1", "r1", "r2", "r2"])
+    assert [m["mean"] for m in sp[0]["means"]] == [1.5, 3.5]
+    ro = SR.rose_series([0, 10, 350, 95], bins=4)
+    assert ro[0]["counts"] == [2.0, 1.0, 0.0, 1.0]
+    sv = SR.survival_series([3, 5, 5, 8], dt=2.0)
+    assert sv[0]["t"][-1] == 16.0 and sv[0]["median"] == 10.0
+    ms = SR.msd_series(tid, tt, yy, xx, dt=1.0, max_lag=4)
+    assert ms[0]["tracks"] == 2 and abs(ms[0]["fit"]["alpha"] - 2) < 1e-9
+    rng = _np.random.default_rng(0)
+    hb = SR.hexbin_series(rng.normal(size=500), rng.normal(size=500), gridsize=10)
+    assert sum(hb["counts"]) == 500 and len(hb["hex"]) == 6
+    nz = SR.normalize_series([{"label": "", "x": [0, 1, 2], "y": [2, 4, 6],
+                               "err": [0.2, 0.2, 0.2]}], "first")
+    assert nz[0]["y"] == [1.0, 2.0, 3.0] and abs(nz[0]["err"][0] - 0.1) < 1e-12
+    assert SR.xy_series is __import__("nodegraph.catalog._shared.figure",
+                                      fromlist=["xy_series"]).xy_series
+    _ok("figure series: bars, strips, SuperPlots, roses, survival, MSD, hexbins, "
+        "normalisation; the plot nodes' helpers are the same objects")
+
+    # ── stats ─────────────────────────────────────────────────────────────────
+    rng = _np.random.default_rng(3)
+    res = ST.compare({"a": rng.normal(0, 1, 40), "b": rng.normal(2, 1, 40)}, test="welch")
+    assert res[0]["p"] < 1e-4 and res[0]["stars"] == "***" and res[0]["n_a"] == 40
+    res = ST.compare({"a": rng.normal(0, 1, 40), "b": rng.normal(2, 1, 40),
+                      "c": rng.normal(0, 1, 40)}, test="tukey")
+    assert len(res) == 3
+    res = ST.compare({"a": [1, 2, 3], "b": [2, 3, 4], "c": [3, 4, 5]}, test="kruskal")
+    assert res[0]["a"] == "all" and _math.isfinite(res[0]["p"])
+    res = ST.compare({"a": [1.0], "b": [2.0, 3.0]}, test="welch")
+    assert _math.isnan(res[0]["p"]) and res[0]["stars"] == "n/a"
+    assert ST.bracket_levels([(0, 1), (1, 2), (0, 2)]) == [0, 1, 2]
+    assert ST.bracket_levels([(0, 1), (2, 3)]) == [0, 0]
+    assert ST.stars(0.03) == "*" and ST.p_text(0.0004) == "p < 0.001"
+    assert ST.correlation([1, 2, 3, 4], [2, 4, 6, 8.5])["r"] > 0.99
+    _ok("figure stats: Welch, Tukey, Kruskal, a too-small pair is NaN not an exception, "
+        "bracket levels never cross")
+
+    # ── charts ────────────────────────────────────────────────────────────────
+    style = {"font_pt": 8, "line_width": 1, "marker_size": 3, "palette": "colorblind",
+             "grid": False, "dark": False}
+    ch = S.chart_defaults()
+    ch.update(kind="xy")
+    ch["axes"].update(x_label="t (s)", y_label="area (µm²)")
+    ch["draw"].update(mode="line_markers", error="sem", error_style="band")
+    ch["fit"]["model"] = "linear"
+    ser = SR.xy_series([0, 0, 1, 1, 2, 2], [1, 3, 2, 4, 3, 5], ["a"] * 6, "sem")
+    g = C.chart_geometry(ch, ser, rect_mm=[0, 0, 85, 65], style=style)
+    ax = g["axes_mm"]
+    assert 0 < ax[0] and ax[0] + ax[2] <= 85 and ax[1] > 0 and ax[1] + ax[3] <= 65, ax
+    roles = [m["role"] for m in g["marks"]]
+    assert "series" in roles and "band" in roles and "fit" in roles, roles
+    ml = [m for m in g["marks"] if m["kind"] == "markers"][0]["pts_mm"]
+    assert len(ml) == 3 and ml[0][0] < ml[1][0] < ml[2][0] and ml[0][1] > ml[1][1] > ml[2][1]
+    assert g["legend"] and "R²" in g["legend"]["entries"][0]["label"]
+    assert any(t["role"] == "y_label" and t["rotate"] == -90.0 for t in g["texts"])
+    hit = C.nearest_mark(g, ml[1][0], ml[1][1])
+    assert hit and hit["index"] == 1
+    da = C.data_at(g, ml[1][0], ml[1][1])
+    assert da["inside"] and abs(da["x"] - 1) < 0.05 and abs(da["y"] - 3) < 0.1, da
+    ch2 = S.chart_defaults()
+    ch2.update(kind="xy")
+    ch2["axes"].update(log_x=True, log_y=True)
+    g2 = C.chart_geometry(ch2, SR.xy_series([1, 10, 100, 1000], [1, 10, 100, 1000]),
+                          rect_mm=[0, 0, 85, 65], style=style)
+    labs = [t["label"] for t in g2["x"]["ticks"]]
+    assert "10²" in labs and g2["x"]["scale"] == "log", labs
+    gb = C.chart_geometry(dict(S.chart_defaults(), kind="bar"), bs, rect_mm=[0, 0, 85, 65],
+                          style=style)
+    rects = [m for m in gb["marks"] if m["kind"] == "rects"]
+    assert len(rects) == 2 and len(rects[0]["rects_mm"]) == 2 and gb["x"]["categories"] == ["a", "b"]
+    assert gb["y"]["lim"][0] == 0.0
+    for sub in ("histogram", "kde", "box", "violin", "ecdf", "strip"):
+        ch3 = S.chart_defaults()
+        ch3.update(kind="distribution", sub_kind=sub)
+        vals = list(rng.normal(0, 1, 50)) + list(rng.normal(1, 1, 50))
+        grp = ["a"] * 50 + ["b"] * 50
+        ser3 = SR.strip_series(vals, grp) if sub == "strip" else SR.distribution_series(vals, grp)
+        if sub in ("box", "violin", "strip"):
+            ch3["stats"] = {"test": "mann_whitney", "pairs": []}
+        g3 = C.chart_geometry(ch3, ser3, rect_mm=[0, 0, 85, 65], style=style)
+        assert g3["marks"], sub
+        if sub in ("box", "violin", "strip"):
+            assert any(m["kind"] == "bracket" for m in g3["marks"]) and g3["stats"], sub
+            assert g3["x"]["categories"] == ["a", "b"]
+        if sub == "histogram":
+            assert sum(len(m["rects_mm"]) for m in g3["marks"] if m["kind"] == "rects") > 0
+    rows, cols, mat = SR.heatmap_grid([0, 0, 1, 1], [0, 1, 0, 1], [1, 2, 3, 4])
+    gh = C.chart_geometry(dict(S.chart_defaults(), kind="heatmap"), (rows, cols, mat),
+                          rect_mm=[0, 0, 85, 65], style=style)
+    cells = [m for m in gh["marks"] if m["kind"] == "cells"][0]["cells"]
+    assert len(cells) == 4 and gh["colorbar"]["lo"] == 1.0 and gh["colorbar"]["hi"] == 4.0
+    top = min(c["rect_mm"][1] for c in cells)
+    assert all(c["rect_mm"][1] == top for c in cells if c["row"] == 0)   # row 0 at the top
+    gx = C.chart_geometry(dict(S.chart_defaults(), kind="hexbin"), hb, rect_mm=[0, 0, 85, 65],
+                          style=style)
+    assert gx["colorbar"] and any(m["role"] == "hexbin" for m in gx["marks"])
+    gr = C.chart_geometry(dict(S.chart_defaults(), kind="rose"), ro, rect_mm=[0, 0, 65, 65],
+                          style=style)
+    assert any(m["kind"] == "wedge" and len(m["wedges"]) == 3 for m in gr["marks"])
+    gs = C.chart_geometry(dict(S.chart_defaults(), kind="survival"), sv,
+                          rect_mm=[0, 0, 85, 65], style=style)
+    assert gs["y"]["lim"][0] == 0.0 and any(m["role"] == "series" for m in gs["marks"])
+    gm = C.chart_geometry(dict(S.chart_defaults(), kind="msd"), ms, rect_mm=[0, 0, 85, 65],
+                          style=style)
+    assert gm["x"]["scale"] == "log" and any(m["role"] == "fit" for m in gm["marks"])
+    cht = S.chart_defaults()
+    cht.update(kind="timeseries")
+    gt = C.chart_geometry(cht, SR.xy_series([0, 60, 120, 180], [1, 2, 3, 4]),
+                          rect_mm=[0, 0, 85, 65], style=style)
+    assert gt["x"]["scale"] == "time" and gt["x"]["ticks"][0]["label"].count(":") == 1
+    assert C.fmt_number(0.25, 0.05) == "0.25" and C.fmt_number(1500000) == "1.5×10⁶" \
+        and C.fmt_time(3725) == "1:02 h" and C.fmt_log(1000) == "10³"
+    _ok("figure charts: xy with band + linear fit, log ticks, bars, every distribution "
+        "kind with brackets, heatmap (row 0 on top), hexbin, rose, survival, MSD, time "
+        "axis; hover maps page mm back to data")
+
+    # ── legend text ───────────────────────────────────────────────────────────
+    md = dict(cmd, acquisition_info=[
+        ["Objective", [["Objective", "Plan Apo 20x"], ["Numerical aperture", "0.75"],
+                       ["Immersion refractive index", "1.0"]]],
+        ["Confocal", [["Pinhole", "30 µm"], ["Zoom", "1.0"], ["Modality", "confocal"]]]],
+        channel_names=["GFP"], channel_acquisition=[[["Excitation", "488 nm"],
+                                                     ["Emission", "525 nm"]]],
+        z_step_um=1.0, dt_s=30.0)
+    envs2 = dict(envs)
+    envs2["s_close"] = (cax, md)
+    txt = LT.legend_sentence(nd, envs2, lut_windows={"zoom1": [(0, 110, 2400)]})
+    for needle in ("Plan Apo 20x", "NA 0.75", "pinhole 30 µm", "size 0.25 µm", "z step 1 µm",
+                   "frames every 30 s", "GFP (excitation 488 nm / emission 525 nm)",
+                   "Scale bars 50 µm, 20 µm", "maximum intensity projection", "110–2400",
+                   "speed as a colour map, 0–1 of 0.8", "mean squared displacement",
+                   "per condition"):
+        assert needle in txt, (needle, txt)
+    assert LT.legend_sentence(S.new_document(), {}) == ""
+    _ok("figure legend text: objective, NA, pinhole, sampling, channels, scale bars, "
+        "projection, display range, overlays and charts from the envelopes alone")
+
+    # ── overlay maths moved down ──────────────────────────────────────────────
+    from nodelab_v2 import overlay_render as _OR
+    from nodegraph.catalog._shared import overlay_math as _OM
+    assert _OR.colormap_lut is _OM.colormap_lut and _OR.COLORMAPS is _OM.COLORMAPS \
+        and _OR.scalar_rgba is _OM.scalar_rgba
+    _ok("overlay maths: nodelab_v2.overlay_render is a shim over "
+        "nodegraph.catalog._shared.overlay_math")
 
 
 if __name__ == "__main__":
