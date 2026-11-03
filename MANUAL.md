@@ -2911,6 +2911,14 @@ print(report.summary(), report.removed, report.added)
   names its page with `"page"` (id or name; absent = the active page) and the worker runs
   that page **composed** with every page it reads from — its knob and target ids are the run
   ids `<page>/<node>`. The window shows every page through the page switcher (§2, **Pages**).
+* **V5.00 — an Analysis page is a figure page** (step 2, 2026-11-03). Its page record
+  carries a `figure` object beside its `graph`: the figure document (sources, items,
+  links) that the Figure Editor edits, while the graph holds one hidden Page Input per
+  figure source — what a run composes. The format stays `3.0`, so an older build opens
+  the file and simply ignores the figure. A **V4 file's Analysis page that holds nodes**
+  opens as a **Free** page named `<name> (graph)` (its linked pages with it): page ids
+  never rebind, so every page that read its Outputs still does. An empty one opens as
+  an empty figure page.
 
 ### 13b. Saved analysis trials, and running analyses across every core (2026-10-09)
 

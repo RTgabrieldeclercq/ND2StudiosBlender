@@ -1411,6 +1411,7 @@
 {"dst":"nodelab_v2.demo_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.figure_document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.graph_layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.lablink","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1542,6 +1543,9 @@
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.edge_item"}
 {"dst":"nodegraph.table_export","k":"imp","lazy":false,"src":"nodelab_v2.export"}
 {"dst":"nodegraph.tables","k":"imp","lazy":false,"src":"nodelab_v2.export"}
+{"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_document"}
+{"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_document"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.figure_document"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2.multilink","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
@@ -1871,6 +1875,8 @@
 {"dst":"nodelab_v2.welcome","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.workspace","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
+{"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
+{"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodegraph.iterate","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodegraph.memo","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
@@ -1879,6 +1885,7 @@
 {"dst":"nodegraph.serialize","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
+{"dst":"nodelab_v2.figure_document","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.linked_document","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.ops","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}
 {"dst":"nodelab_v2.version","k":"imp","lazy":false,"src":"nodelab_v2.workspace"}

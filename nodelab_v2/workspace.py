@@ -57,11 +57,13 @@ from nodegraph import roles as R
 from nodegraph.graph import Graph, NodeInstance
 from nodegraph.iterate import OWNER_KEY
 from nodegraph.memo import digest
+from nodegraph.figure import schema as FS
 from nodegraph.metadata import MetaEnvelope
 from nodegraph.serialize import (
     is_workspace_dict, page_from_dict, to_workspace_dict, workspace_pages)
 from nodegraph.sockets import SocketType
 from nodelab_v2.document import GraphDocument, NodeRecord, is_driver_edge
+from nodelab_v2.figure_document import FigureDocument
 from nodelab_v2.linked_document import LinkedDocument, check_overrides, check_structure
 from nodelab_v2.ops import (
     DEFAULT_OUTPUT_BASE, LOAD_OP, PAGE_CONDITION_AUTO_KEY, PAGE_CONDITION_KEY,
@@ -77,6 +79,10 @@ RUN_SEP = "/"
 PAGE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 #: The kind a pre-V4 file opens as (re-exported from :mod:`nodegraph.roles`).
 FREE = R.FREE_PAGE
+#: The page kind that is a FIGURE page since V5.00 (step 2): an Analysis page carries a
+#: :class:`~nodelab_v2.figure_document.FigureDocument` beside its graph document. The kind
+#: key and label are unchanged, so the roles file, the page tabs and the file keep working.
+FIGURE_KIND = "analyze"
 #: Default name of a one-page workspace (:meth:`Workspace.single`; a pre-V4 file with no
 #: path opens under it).
 DEFAULT_PAGE_NAME = "Graph"
@@ -156,6 +162,10 @@ class Page:
     #: only that frame's nodes follow the master, and the tab owns the Page Inputs and
     #: Outputs at the frame's ports. ``None`` for a page linked whole, and for a plain page.
     region: Optional[str] = None
+    #: The FIGURE of an Analysis page (V5.00 step 2): the figure document beside the graph
+    #: document, which is then its SHADOW graph — one hidden Page Input per figure source,
+    #: kept in step by :meth:`FigureDocument.sync_shadow`. ``None`` on every other kind.
+    figure: Optional[FigureDocument] = None
 
 
 class OutlineRow(NamedTuple):
@@ -258,6 +268,8 @@ class Workspace:
         #: each page's ``page.output`` node ids as of its last change — so a DELETED Output
         #: is still recognized as one when its page publishes the change
         self._out_ids: Dict[str, FrozenSet[str]] = {}
+        #: per figure page: the listener installed on its FigureDocument (V5.00 step 2)
+        self._fig_hooks: Dict[str, Callable[[], None]] = {}
 
     # ── construction ──────────────────────────────────────────────────────────
     @classmethod
@@ -364,6 +376,8 @@ class Workspace:
             raise ValueError(f"duplicate page id {pid!r}")
         name = self._unique_name(name or kind_label(kind))
         page = Page(pid, name, kind, doc or GraphDocument())
+        if kind == FIGURE_KIND:                 # an Analysis page is a figure page (V5.00)
+            page.figure = FigureDocument()
         if doc is None:
             page.doc.path = self.path
         self._insert(page, index)
@@ -439,6 +453,9 @@ class Workspace:
         src = self.pages[page_id]
         order = list(self.pages)
         if dependent:
+            if src.figure is not None:
+                raise ValueError(f"page {src.name!r} is an Analysis figure page and cannot "
+                                 f"be linked; duplicate it as a unique copy")
             root_id = src.master or page_id
             root = self.pages[root_id]
             linked_src = src.master and isinstance(src.doc, LinkedDocument)
@@ -459,6 +476,8 @@ class Workspace:
                              index=order.index(page_id) + 1)
         self.load_page_body(page.id, src.doc.to_page_dict(), meta_seeds=src.doc.meta_seeds)
         self.dedupe_outputs(page.id)         # a copy's variables are names of their own
+        if src.figure is not None and page.figure is not None:
+            page.figure.replace(src.figure.to_dict())     # its own figure, same content
         return page
 
     def dependents_of(self, page_id: str) -> List[str]:
@@ -618,6 +637,10 @@ class Workspace:
         page = self.pages[page_id]
         if page.master:
             raise ValueError(f"page {page.name!r} is linked to a master; make it unique first")
+        if page.figure is not None and on:
+            raise ValueError(f"page {page.name!r} is an Analysis figure page; a figure has no "
+                             f"parameters a linked page could override, so it cannot be a "
+                             f"master")
         if page.is_master == bool(on):
             return
         page.is_master = bool(on)
@@ -688,6 +711,8 @@ class Workspace:
             page.doc.load_page(dict(body))
             if meta_seeds:
                 page.doc.meta_seeds.update(meta_seeds)
+            if page.figure is not None:
+                page.figure.sync_shadow(page.doc)     # a body may lack the shadow inputs
             page.doc.repropagate()
         finally:
             self._quiet = False
@@ -716,6 +741,8 @@ class Workspace:
         # window answers by re-reading every page's name and kind
         keep.name, keep.kind, keep.master, keep.overrides = kind_label(head), head, None, {}
         keep.is_master = False
+        self._unhook_figure(keep)
+        keep.figure = None                  # the kept page is Image Input now, not a figure
         keep.doc.page_kind = head
         self.active = keep.id
         for kind in kinds[1:]:
@@ -776,9 +803,39 @@ class Workspace:
         doc.on_change(listener, first=True)      # before the canvas, the editors, anyone
         self._hooks[pid] = (listener, hook)
         self._out_ids[pid] = self._output_ids(pid)
+        self._hook_figure(page)
+
+    def _hook_figure(self, page: Page) -> None:
+        """Listen to a figure page's FigureDocument: every accepted figure edit re-syncs the
+        shadow graph and publishes a page-level change (V5.00 step 2)."""
+        if page.figure is None or page.id in self._fig_hooks:
+            return
+
+        def fig_listener(pid=page.id) -> None:
+            self._on_figure_change(pid)
+
+        page.figure.on_change(fig_listener)
+        self._fig_hooks[page.id] = fig_listener
+
+    def _unhook_figure(self, page: Page) -> None:
+        fn = self._fig_hooks.pop(page.id, None)
+        if fn is not None and page.figure is not None:
+            page.figure.off_change(fn)
+
+    def _on_figure_change(self, page_id: str) -> None:
+        if self._quiet or page_id not in self.pages:
+            return
+        page = self.pages[page_id]
+        if page.figure is None:
+            return
+        # the shadow sync edits the graph document, whose own listener publishes what a run
+        # can see; the figure itself is seen by no run, so this publishes "nothing"
+        page.figure.sync_shadow(page.doc)
+        self._notify(())
 
     def _detach(self, page: Page) -> None:
         doc = page.doc
+        self._unhook_figure(page)
         listener, hook = self._hooks.pop(page.id, (None, None))
         if listener is not None:
             doc.off_change(listener)
@@ -1042,6 +1099,8 @@ class Workspace:
         page = self.pages.get(page_id)
         if page is None or page.doc.nodes or page.master:
             return None
+        if page.figure is not None:              # a figure names its sources itself
+            return None
         if not getattr(page.doc, "editable_topology", True):
             return None
         if not R.op_in_page(PAGE_INPUT_OP, page.kind) or not self.default_source(page_id):
@@ -1263,6 +1322,25 @@ class Workspace:
                 nid, depth, role, title, detail, kind, name, bool(rec.muted),
                 doc.pass_through_reason(nid), nid in own,
                 bool(linked and doc.is_overridden(nid, "muted"))))
+        if page.figure is not None:                # the figure's items, after its sources
+            src_labels = page.figure.source_labels(self, page_id)
+            fdoc = page.figure.document
+            for it in page.figure.items:
+                ikind = str(it.get("kind") or "")
+                detail = ""
+                if ikind in ("image", "montage"):
+                    sid = FS.effective_image(fdoc, it["id"]).get("source")
+                    detail = src_labels.get(sid, "") if sid else "(no source)"
+                elif ikind == "chart":
+                    ch = it.get("chart") or {}
+                    detail = str(ch.get("kind") or "")
+                    sid = ch.get("source")
+                    if sid in src_labels:
+                        detail = f"{detail} · {src_labels[sid]}"
+                letter = str(it.get("letter") or "")
+                rows.append(OutlineRow(
+                    str(it["id"]), 0, "node", f"{letter} · {ikind}" if letter else ikind,
+                    detail, page.kind, "", False, "a figure item has no switch", False, False))
         return rows
 
     def _outputs_in_order(self, page_id: str) -> List[Tuple[str, str]]:
@@ -1660,6 +1738,8 @@ class Workspace:
                 rec["is_master"] = True     # only when set: older files stay byte-identical
             if p.region:
                 rec["region"] = p.region    # a region tab: the master's frame it mirrors
+            if p.figure is not None:
+                rec["figure"] = p.figure.to_dict()   # an Analysis page's figure (V5.00)
             if p.master:
                 rec["overrides"] = (p.doc.overrides_dict()
                                     if isinstance(p.doc, LinkedDocument) else
@@ -1689,6 +1769,28 @@ class Workspace:
         # Everything is parsed and checked BEFORE anything changes: a file that fails to open
         # must leave the open workspace — and the canvas bound to it — exactly as it was.
         parsed: Dict[str, Tuple[Any, Any, Any]] = {}
+        figures: Dict[str, Dict[str, Any]] = {}
+        # LEGACY (V5.00 step 2): an Analysis page of a V4 file is a node graph, not a
+        # figure — it has nodes and no "figure" record. It opens as a Free page named
+        # "<name> (graph)", its Outputs still addressable (page ids never rebind); a page
+        # linked to it follows it. An empty one is simply a figure page.
+        legacy = {r["id"] for r in recs
+                  if not r.get("master") and (r.get("kind") or FREE) == FIGURE_KIND
+                  and r.get("figure") is None and bool((r.get("graph") or {}).get("nodes"))}
+        for rec in recs:
+            fig_raw = rec.get("figure")
+            if fig_raw is not None:
+                if rec.get("master"):
+                    raise ValueError(f"page {rec['id']!r} is linked and cannot carry a figure")
+                try:
+                    figures[rec["id"]] = FS.normalize(fig_raw)
+                except FS.FigureError as exc:
+                    raise ValueError(f"page {rec['id']!r} figure: {exc}") from None
+            if rec.get("master") and rec["master"] not in legacy:
+                m = next((r for r in recs if r["id"] == rec["master"]), None)
+                if m is not None and (m.get("kind") or FREE) == FIGURE_KIND:
+                    raise ValueError(f"page {rec['id']!r} is linked to {rec['master']!r}, an "
+                                     f"Analysis figure page, which cannot be linked")
         for rec in recs:
             if not PAGE_ID_RE.match(str(rec["id"])):
                 raise ValueError(f"page id {rec['id']!r} may contain only letters, digits "
@@ -1737,8 +1839,13 @@ class Workspace:
                 name = rec.get("name") or ""
                 if not name:
                     name = self._name_from_path() if not is_ws else rec["id"]
-                page = Page(rec["id"], name, rec.get("kind") or FREE, doc,
+                kind = rec.get("kind") or FREE
+                if rec["id"] in legacy:
+                    kind, name = FREE, self._unique_name(f"{name} (graph)")
+                page = Page(rec["id"], name, kind, doc,
                             is_master=bool(rec.get("is_master", False)))
+                if kind == FIGURE_KIND:
+                    page.figure = FigureDocument(figures.get(rec["id"]))
                 self.pages[page.id] = page
                 self._attach(page)
             # active BEFORE any page loads: a listener reacting to the load (the canvas,
@@ -1749,6 +1856,10 @@ class Workspace:
             for rec in sorted(plain, key=lambda r: self.pages[r["id"]].doc is keep):
                 graph, zones, groups = parsed[rec["id"]]
                 self.pages[rec["id"]].doc._load_parsed(graph, zones, groups, rec.get("ui"))
+            for rec in plain:                      # a figure's shadow inputs, if the file lacks them
+                fp = self.pages[rec["id"]]
+                if fp.figure is not None:
+                    fp.figure.sync_shadow(fp.doc)
             # then the LINKED pages, over their loaded masters, in file order
             for rec in [r for r in recs if r.get("master")]:
                 doc = LinkedDocument(self.pages[rec["master"]].doc,
@@ -1756,8 +1867,10 @@ class Workspace:
                                      structure=rec.get("structure"),
                                      region=rec.get("region") or None)
                 doc.path = self.path
-                page = Page(rec["id"], rec.get("name") or rec["id"],
-                            rec.get("kind") or FREE, doc, master=rec["master"],
+                lkind, lname = rec.get("kind") or FREE, rec.get("name") or rec["id"]
+                if rec["master"] in legacy:        # its master became "<name> (graph)"
+                    lkind, lname = FREE, self._unique_name(f"{lname} (graph)")
+                page = Page(rec["id"], lname, lkind, doc, master=rec["master"],
                             region=rec.get("region") or None)
                 self.pages[page.id] = page
                 self._attach(page)
@@ -1819,7 +1932,8 @@ def _editable(self: Page) -> bool:
 Page.editable_topology_doc = _editable      # a plain page's document can be reused on load
 
 
-__all__ = ["RUN_SEP", "FREE", "DEFAULT_PAGE_NAME", "qualify", "split_run_id", "doc_id_of",
+__all__ = ["RUN_SEP", "FREE", "FIGURE_KIND", "DEFAULT_PAGE_NAME", "qualify", "split_run_id",
+           "doc_id_of",
            "local_ids", "kind_label", "Page", "ComposedGraph", "GraphSource", "Workspace",
            "DEFAULT_OUTPUT_BASE", "standard_kinds", "sanitize_output_name", "build_example",
            "OutlineRow", "REROUTE_OP"]
