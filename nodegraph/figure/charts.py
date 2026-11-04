@@ -316,7 +316,9 @@ def chart_geometry(chart: Mapping[str, Any], series: Any, *, rect_mm: Sequence[f
     dark = bool(style.get("dark", False))
     fg = "#e6e6e6" if dark else "#111111"
     grid_on = bool(style.get("grid", False))
-    colors = list(PALETTES.get(str(style.get("palette", "colorblind")), PALETTES["colorblind"]))
+    from nodegraph.figure.layout import effective_palette
+    colors = effective_palette(PALETTES.get(str(style.get("palette", "colorblind")),
+                                            PALETTES["colorblind"]), dark=dark)
     log_x = bool(axes_cfg.get("log_x", False))
     log_y = bool(axes_cfg.get("log_y", False))
     units = units or {}

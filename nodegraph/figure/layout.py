@@ -247,3 +247,198 @@ def page_checks(doc: Mapping[str, Any]) -> List[Dict[str, Any]]:
     sev = {"warn": 0, "hint": 1}
     out.sort(key=lambda c: (sev.get(c["severity"], 2), c["code"], c["item"]))
     return out
+
+
+# ── step 5: style presets, re-lettering, style sync, palette validation ──────────────
+#: the page style presets: what *Style sync* applies to the page and to every item's
+#: own override. Points for type, points for lines and markers.
+STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "paper": {"font_pt": 8.0, "line_width": 1.0, "marker_size": 3.0, "dark": False,
+              "doc": "Journal figure: 8 pt type, 1 pt lines."},
+    "talk": {"font_pt": 14.0, "line_width": 1.5, "marker_size": 4.5, "dark": False,
+             "doc": "A slide: 14 pt type, heavier lines."},
+    "poster": {"font_pt": 18.0, "line_width": 2.0, "marker_size": 6.0, "dark": False,
+               "doc": "A poster panel: 18 pt type, 2 pt lines."},
+    "dark": {"font_pt": 8.0, "line_width": 1.0, "marker_size": 3.0, "dark": True,
+             "doc": "A dark page (talks); the chart palette avoids black."},
+}
+
+LIGHT_PAGE = "#ffffff"        #: the page colour of a light figure
+DARK_PAGE = "#1c1f24"         #: the page colour of a dark figure (the scene paints this)
+DARK_INK = "#e6e6e6"          #: ink on a dark page
+LIGHT_INK = "#111111"         #: ink on a light page
+
+#: the item kinds that are PANELS — lettered, in reading order
+PANEL_KINDS = ("image", "montage", "picture", "chart", "table", "kymograph", "ortho",
+               "profile")
+
+
+def reading_order(items: Sequence[Mapping[str, Any]]) -> List[str]:
+    """Item ids in reading order: rows top to bottom, left to right within a row. An item
+    joins the row above when its top is above that row's lowest bottom by more than half
+    its own height (panels of one row rarely share an exact top)."""
+    recs = []
+    for it in items:
+        x, y, w, h = (float(v) for v in it.get("rect_mm") or (0, 0, 0, 0))
+        recs.append((y, x, h, str(it.get("id"))))
+    recs.sort()
+    rows: List[List[Tuple[float, float, float, str]]] = []
+    bottoms: List[float] = []
+    for y, x, h, iid in recs:
+        if rows and y < bottoms[-1] - 0.5 * h:
+            rows[-1].append((y, x, h, iid))
+            bottoms[-1] = max(bottoms[-1], y + h)
+        else:
+            rows.append([(y, x, h, iid)])
+            bottoms.append(y + h)
+    out: List[str] = []
+    for row in rows:
+        out.extend(iid for _y, x, _h, iid in sorted(row, key=lambda r: (r[1], r[0])))
+    return out
+
+
+def reletter(doc: Mapping[str, Any]) -> Dict[str, str]:
+    """``{item id: letter}`` for every panel of ``doc`` in reading order, in the page's
+    letter style — a popout (the child of a zoom link) is part of its parent's panel and
+    gets none; a non-panel item keeps whatever it had. A blank letter means *clear*."""
+    page = doc.get("page") or {}
+    items = list(doc.get("items") or [])
+    children = {str(ln.get("child")) for ln in doc.get("links") or []
+                if ln.get("kind") == "zoom"}
+    panels = [it for it in items if it.get("kind") in PANEL_KINDS
+              and str(it.get("id")) not in children]
+    order = reading_order(panels)
+    style = str(page.get("letters") or "A")
+    labels = letters(len(order), style) if style != "none" else [""] * len(order)
+    out = dict(zip(order, labels))
+    for iid in children:
+        out[iid] = ""
+    return out
+
+
+def style_sync(doc: Mapping[str, Any], style: Optional[str] = None) -> Dict[str, Any]:
+    """A copy of ``doc`` with the page preset ``style`` (default: the page's own) applied
+    everywhere: the page's type size, line width and dark flag, and every item's own
+    override cleared back to the page — text and letters to the page size, shapes, lines
+    and arrows to the page line width, every overlay layer's line to it. What *Style sync*
+    does; the user restyles single items afterwards."""
+    import copy as _copy
+    d = _copy.deepcopy(dict(doc))
+    page = d.setdefault("page", {})
+    name = str(style or page.get("style") or "paper")
+    preset = STYLE_PRESETS.get(name, STYLE_PRESETS["paper"])
+    page["style"] = name if name in STYLE_PRESETS else "paper"
+    page["font_pt"] = float(preset["font_pt"])
+    page["line_width"] = float(preset["line_width"])
+    page["marker_size"] = float(preset["marker_size"])
+    page["dark"] = bool(preset["dark"])
+    lw = float(preset["line_width"])
+    for it in d.get("items") or []:
+        kind = it.get("kind")
+        if kind in ("text", "letter", "table", "legend"):
+            it["pt"] = None
+        elif kind in ("shape", "line", "arrow", "measure_line"):
+            it["width_pt"] = lw
+        elif kind in ("image", "montage"):
+            for L in (it.get("image") or {}).get("layers") or []:
+                look = L.setdefault("look", {}) if isinstance(L.get("look"), dict) or \
+                    L.get("look") is None else L["look"]
+                if isinstance(look, dict) and "line_width" in look:
+                    look["line_width"] = lw
+    for ln in d.get("links") or []:
+        if ln.get("kind") == "zoom" and isinstance(ln.get("box"), dict):
+            ln["box"]["width_pt"] = max(0.5, lw * 0.75)
+    return d
+
+
+# ── colour: sRGB → CIE Lab, ΔE76, and the palette validator ───────────────────────
+def _srgb_to_lab(hex_color: str) -> Tuple[float, float, float]:
+    rgb = _hex_rgb(hex_color)
+    if rgb is None:
+        return (0.0, 0.0, 0.0)
+
+    def lin(c: float) -> float:
+        c = c / 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(float(v)) for v in rgb)
+    x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+    y = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 1.00000
+    z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+
+    def f(t: float) -> float:
+        return t ** (1.0 / 3.0) if t > 0.008856 else 7.787 * t + 16.0 / 116.0
+    fx, fy, fz = f(x), f(y), f(z)
+    return (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+
+
+def delta_e(a: str, b: str) -> float:
+    """CIE76 colour difference between two ``#rrggbb`` colours (≈ 2.3 is a just-noticeable
+    difference; series colours want 15 or more, and more against the page)."""
+    la, lb = _srgb_to_lab(a), _srgb_to_lab(b)
+    return float(sum((p - q) ** 2 for p, q in zip(la, lb)) ** 0.5)
+
+
+#: two series colours must differ by at least this ΔE; a series colour and the page by
+#: :data:`PALETTE_MIN_PAGE_DELTA_E` (a mark must stand off the paper, not merely differ)
+PALETTE_MIN_DELTA_E = 12.0
+PALETTE_MIN_PAGE_DELTA_E = 25.0
+
+
+def palette_report(colors: Sequence[str], *, background: str = LIGHT_PAGE,
+                   min_delta: float = PALETTE_MIN_DELTA_E,
+                   min_page_delta: float = PALETTE_MIN_PAGE_DELTA_E) -> List[str]:
+    """The problems of a categorical palette on a page of colour ``background``: a pair
+    of colours too alike to tell apart, a colour too close to the page to see. Empty
+    when the palette passes."""
+    out: List[str] = []
+    cols = [str(c) for c in colors]
+    for i, a in enumerate(cols):
+        d = delta_e(a, background)
+        if d < min_page_delta:
+            out.append(f"{a} is within ΔE {d:.1f} of the page {background}")
+        for b in cols[i + 1:]:
+            d = delta_e(a, b)
+            if d < min_delta:
+                out.append(f"{a} and {b} are within ΔE {d:.1f} of each other")
+    return out
+
+
+def _lab_to_hex(L: float, a: float, b: float) -> str:
+    fy = (L + 16.0) / 116.0
+    fx, fz = fy + a / 500.0, fy - b / 200.0
+
+    def finv(t: float) -> float:
+        return t ** 3 if t ** 3 > 0.008856 else (t - 16.0 / 116.0) / 7.787
+    x, y, z = finv(fx) * 0.95047, finv(fy) * 1.00000, finv(fz) * 1.08883
+    r = 3.2406 * x - 1.5372 * y - 0.4986 * z
+    g = -0.9689 * x + 1.8758 * y + 0.0415 * z
+    bl = 0.0557 * x - 0.2040 * y + 1.0570 * z
+
+    def gam(c: float) -> int:
+        c = max(0.0, min(1.0, c))
+        c = 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+        return int(round(max(0.0, min(1.0, c)) * 255))
+    return "#%02x%02x%02x" % (gam(r), gam(g), gam(bl))
+
+
+def effective_palette(colors: Sequence[str], *, dark: bool,
+                      min_page_delta: float = PALETTE_MIN_PAGE_DELTA_E) -> List[str]:
+    """The palette as drawn on a light or dark page. A grey ramp is re-spaced in lightness
+    to the page (black … mid-grey on white; white … mid-grey on a dark page), so every
+    step stays a step; a chromatic colour the page would swallow (black on a dark page)
+    keeps its hue and is lifted (or lowered) to a legible lightness. Order is kept, so a
+    series keeps its colour index across pages of both kinds."""
+    page = DARK_PAGE if dark else LIGHT_PAGE
+    cols = [str(c) for c in colors]
+    labs = [_srgb_to_lab(c) for c in cols]
+    n = len(cols)
+    if n > 1 and all(abs(a) < 3.0 and abs(b) < 3.0 for _L, a, b in labs):
+        lo, hi = (100.0, 40.0) if dark else (0.0, 72.0)
+        return [_lab_to_hex(lo + (hi - lo) * k / (n - 1), 0.0, 0.0) for k in range(n)]
+    out: List[str] = []
+    for c, (L, a, b) in zip(cols, labs):
+        if delta_e(c, page) < min_page_delta:
+            out.append(_lab_to_hex(45.0 if dark else 60.0, a, b))
+        else:
+            out.append(c)
+    return out

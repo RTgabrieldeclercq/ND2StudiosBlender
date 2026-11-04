@@ -29,8 +29,7 @@ GOALS: Tuple[Tuple[str, str, str, str], ...] = (
 )
 
 #: goals the editor can start in this build (the others name the step that adds them)
-AVAILABLE = {"overlay": "", "montage": "", "composite": "", "plot": "",
-             "table": "tables arrive in step 5",
+AVAILABLE = {"overlay": "", "montage": "", "composite": "", "plot": "", "table": "",
              "movie": "the movie hand-off arrives in step 7"}
 
 

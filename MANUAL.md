@@ -492,9 +492,34 @@ journal-sized page you place things on. What it can show is whatever the pages b
    page's hidden graph as real nodes (Table Concat for pooled sources → If/Else → Table
    Aggregate) and is fetched by *Compute sources* like a source — nothing is computed
    until you ask, and the memo keeps what was.
-7. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
+7. **Tables and legends** (V5.00 step 5). The *Table* goal — or *Reads* on a new table
+   item — places a **summary table** of a source's table or a data entry: the columns you
+   name (blank = every measured one) reduced per value of *Group by* with n, mean, SD,
+   SEM, median, min, max or sum, formatted for print (*Fit to content* sizes it to its
+   rows). **Legend** on an image adds a shared legend of its channels (a swatch in each
+   colour) and layers (an outline, a marker, a line, a colour-map ramp with its limits).
+   The Viewer's **→ Page** button (*Capture view → page*) places what the Viewer shows —
+   its frame, its visible region, its active channels with the windows and colours you
+   set there — as an image on the figure page below (one is added when the workspace has
+   none). The node must be published as a Page Output; the figure reads only those.
+8. **Paper-readiness.** The page form lists the **checks** (a missing scale bar, an inset
+   with no box, a red / green merge, twins that do not share a display range, an
+   unlabelled colour bar, type under 6 pt, letters out of order) with a button that
+   selects the item. **Re-letter panels** letters every panel in reading order (a popout
+   is part of its parent's panel); **Style sync** applies the page preset — *paper* (8 pt,
+   1 pt lines), *talk* (14 pt), *poster* (18 pt), *dark* — to the page and clears every
+   item's own type size and line width back to it. Chart palettes are validated: on a dark
+   page black is lifted and a grey ramp re-spaced, so every series stays visible.
+9. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
    paths) or PDF (fonts embedded). The preview and the export are one set of lines.
-8. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
+   **Bundle** writes the PNG and an SVG plus, beside them, `<stem>.figure.json` (the
+   document), `<stem>.legend.txt` (the generated legend paragraph — objective, pixel
+   size, z step, interval, channels, scale bars, display ranges, what each panel shows),
+   `<stem>.provenance.json` (each source as `<page>:<name>` with its run id, lineage,
+   the file it came from with size and mtime, the display windows, the app version, the
+   figure digest) and `<stem>.data/` with a CSV of the values every chart, table and heat
+   layer drew.
+10. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
    the paper-readiness checks (a missing scale bar, an inset with no box, a red / green
    merge, twins that do not share a display range, an unlabelled colour bar). A V4 file's
    Analysis page that held nodes opens as a Free page named *(graph)*.

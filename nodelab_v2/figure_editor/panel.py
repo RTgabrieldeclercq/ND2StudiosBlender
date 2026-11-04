@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -30,15 +31,17 @@ from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QMenu, QPushButto
                                QSpinBox, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
 from nodegraph.figure import bind as B
+from nodegraph.figure import bundle as FB
 from nodegraph.figure import layout as FL
 from nodegraph.figure import schema as S
+from nodegraph.figure import tables as FT
 from nodelab_v2 import theme as T
 from nodelab_v2.figure_editor import charts_data as CD
 from nodelab_v2.figure_editor import links as LK
 from nodelab_v2.figure_editor import render as R
 from nodelab_v2.figure_editor.items import (ChartItem, ColorbarItem, FigureItem, HistogramItem,
-                                            ImageItem, LeaderItem, MeasureLineItem,
-                                            MontageItem, ScaleBarItem, make_item)
+                                            ImageItem, LeaderItem, LegendItem, MeasureLineItem,
+                                            MontageItem, ScaleBarItem, TableItem, make_item)
 from nodelab_v2.figure_editor.properties import PropertiesPanel, get_path, set_path
 from nodelab_v2.figure_editor.scene import MM, FigureScene, FigureView, mm, to_mm
 from nodelab_v2.figure_editor.sources import SourcesPanel, describe_envelope
@@ -216,7 +219,9 @@ class FigureEditorPanel(QWidget):
         self._export_btn = QPushButton("Export ▾")
         menu = QMenu(self._export_btn)
         for fmt, text in (("png", "PNG at the page dpi"), ("tiff", "TIFF at the page dpi"),
-                          ("svg", "SVG (text stays text)"), ("pdf", "PDF (fonts embedded)")):
+                          ("svg", "SVG (text stays text)"), ("pdf", "PDF (fonts embedded)"),
+                          ("bundle", "Bundle — PNG + SVG, the data drawn (CSV), the legend "
+                                     "text, the provenance record")):
             menu.addAction(text, lambda f=fmt: self.export_dialog(f))
         self._export_btn.setMenu(menu)
         bar.addWidget(self._export_btn)
@@ -538,7 +543,8 @@ class FigureEditorPanel(QWidget):
                  size_mm: Optional[Sequence[float]] = None, **spec: Any) -> str:
         sizes = {"colorbar": (30.0, 6.0), "histogram": (30.0, 14.0), "scale_bar": (20.0, 5.0),
                  "text": (40.0, 8.0), "letter": (8.0, 6.0), "arrow": (12.0, 8.0),
-                 "line": (12.0, 8.0), "shape": (20.0, 15.0), "measure_line": (15.0, 6.0)}
+                 "line": (12.0, 8.0), "shape": (20.0, 15.0), "measure_line": (15.0, 6.0),
+                 "legend": (30.0, 12.0), "table": (60.0, 22.0)}
         w, h = (float(size_mm[0]), float(size_mm[1])) if size_mm else sizes.get(kind, (20.0, 10.0))
         pos = list(pos_mm) if pos_mm else self._free_pos(w, h)
         iid = self._new_item_id(kind.replace("_", ""))
@@ -643,11 +649,21 @@ class FigureEditorPanel(QWidget):
                     set_path(d, path, value)
         self.commit(_mutated(self._doc, mut))
 
+    @staticmethod
+    def _block_key(spec: Mapping[str, Any]) -> str:
+        """The block of an item that names what it reads: ``chart`` or ``table``."""
+        return "table" if spec.get("kind") == "table" else "chart"
+
+    @staticmethod
+    def _reads_block(spec: Mapping[str, Any]) -> Dict[str, Any]:
+        return dict(spec.get("table" if spec.get("kind") == "table" else "chart") or {})
+
     def set_chart_reads(self, item_id: str, what: str, ref: str) -> None:
-        """Point a chart at a source (``what="source"``) or a data entry (``"data"``);
-        the table and the columns are cleared when the domain of what it reads differs."""
+        """Point a chart (or a table item) at a source (``what="source"``) or a data entry
+        (``"data"``); the table is cleared when the domain of what it reads differs."""
         def mut(dd):
-            ch = S.item(dd, item_id).setdefault("chart", {})
+            it = S.item(dd, item_id)
+            ch = it.setdefault(self._block_key(it), {})
             if what == "data":
                 ch["data"], ch["table"] = ref, ""
                 entry = next((d for d in dd.get("data", []) if d["id"] == ref), None)
@@ -661,9 +677,296 @@ class FigureEditorPanel(QWidget):
         """One commit for both: a table lives on a domain."""
         def mut(dd):
             it = S.item(dd, item_id)
-            it.setdefault("chart", {})["domain"] = domain
-            it["chart"]["table"] = table
+            ch = it.setdefault(self._block_key(it), {})
+            ch["domain"] = domain
+            ch["table"] = table
         self.commit(_mutated(self._doc, mut))
+
+    # ── tables, legends, letters, style, the bundle (step 5) ───────────────────
+    def add_table(self, source: Optional[str] = None, *, data: Optional[str] = None,
+                  columns: Sequence[str] = (), group_by: str = "",
+                  stats: Sequence[str] = ("n", "mean", "sem"), domain: str = "",
+                  table: str = "", pos_mm: Optional[Sequence[float]] = None,
+                  size_mm: Optional[Sequence[float]] = None) -> str:
+        """A summary-table item of a source (a Page Output value or source id) or a data
+        entry: ``columns`` (blank = every measured column) reduced by ``stats`` per value of
+        ``group_by`` (blank = one row)."""
+        sid = None
+        if data is None:
+            if not source:
+                raise ValueError("add_table: name a source or a data entry")
+            sid = self.source_id_for(source) or self.add_source(source)
+        key = str(data or sid)
+        tables = self._envelope_tables(key)
+        if data is not None:
+            entry = next((e for e in self._doc.get("data", []) if e["id"] == data), None)
+            if entry is None:
+                raise ValueError(f"add_table: unknown data entry {data!r}")
+            domain = domain or str(entry.get("domain") or "label")
+            if self._fig is not None:
+                table = table or self._fig.data_table_name(data)
+        if not table and tables:
+            pick = next((t for t in tables if not domain or t[0] == domain), tables[0])
+            domain, table = pick[0], pick[1]
+        page = self._doc.get("page", {})
+        w = float(size_mm[0]) if size_mm else min(70.0, float(page.get("width_mm", 85)) * 0.8)
+        h = float(size_mm[1]) if size_mm else 22.0
+        pos = list(pos_mm) if pos_mm else self._free_pos(w, h)
+        iid = self._new_item_id("table")
+        item = {"id": iid, "kind": "table", "rect_mm": [pos[0], pos[1], w, h],
+                "letter": self._next_letter(),
+                "table": {"source": sid, "data": data, "domain": domain or "label",
+                          "table": table, "columns": list(columns), "group_by": group_by,
+                          "stats": list(stats), "decimals": -1}}
+
+        def mut(dd):
+            dd.setdefault("items", []).append(item)
+        self.commit(_mutated(self._doc, mut))
+        self.select([iid])
+        return iid
+
+    def fit_table(self, item_id: str) -> None:
+        """Size a table item to its rows and columns."""
+        item = self._items.get(item_id)
+        if isinstance(item, TableItem) and item.header:
+            w, h = item.natural_size_mm()
+            r = S.item(self._doc, item_id)["rect_mm"]
+            self.set_geometry(item_id, [r[0], r[1], round(w, 2), round(h, 2)])
+
+    def add_legend_for(self, item_id: str, pos_mm: Optional[Sequence[float]] = None) -> str:
+        """A legend item of image ``item_id``: its channels and layers, one row each."""
+        parent = S.item(self._doc, item_id)
+        pr = parent["rect_mm"]
+        pos = list(pos_mm) if pos_mm else [pr[0], pr[1] + pr[3] + 2.0]
+        return self.add_item("legend", pos, (max(20.0, pr[2] * 0.6), 12.0),
+                             of={"item": item_id}, title="")
+
+    def reletter(self) -> Dict[str, str]:
+        """Letter every panel in reading order (a popout gets none); returns the map."""
+        new = FL.reletter(self._doc)
+        if not new:
+            return {}
+
+        def mut(dd):
+            for it in dd.get("items", []):
+                if it["id"] in new:
+                    it["letter"] = new[it["id"]]
+        self.commit(_mutated(self._doc, mut))
+        return new
+
+    def sync_style(self, style: Optional[str] = None) -> None:
+        """Apply the page preset (``paper`` / ``talk`` / ``poster`` / ``dark``) to the page
+        and clear every item's own override back to it."""
+        self.commit(FL.style_sync(self._doc, style))
+
+    def _lut_windows(self) -> Dict[str, List[Tuple[int, float, float]]]:
+        """``{item id: [(c, lo, hi), …]}`` — the windows every image was drawn with."""
+        out: Dict[str, List[Tuple[int, float, float]]] = {}
+        for iid, (_k, r) in self._renders.items():
+            if isinstance(r, list):
+                r = next((t[1] for t in r if t[1] is not None), None)
+            if isinstance(r, R.Rendered) and r.clims:
+                out[iid] = [(int(c), float(lo), float(hi)) for c, (lo, hi) in
+                            sorted(r.clims.items())]
+        return out
+
+    def _layer_csv(self, spec: Mapping[str, Any], layer: Mapping[str, Any]) -> str:
+        """The values a heat (field / voxels) layer drew: the layer's table column with
+        the row coordinates."""
+        img = S.effective_image(self._doc, spec["id"])
+        rid = self._run_ids.get(img.get("source") or "", "")
+        payload = self._payloads.get(rid)
+        if payload is None:
+            return ""
+        tables = self._tables_of(rid, payload)
+        got = CD.pick_table(tables, str(layer.get("domain") or "point"), str(layer.get("layer") or ""))
+        if got is None:
+            return ""
+        cols = got[1]
+        column = str(layer.get("column") or "")
+        if not column or column not in cols:
+            skip = {"id", "m", "t", "c", "z", "y", "x", "b"}
+            column = next((c for c in sorted(cols) if c not in skip
+                           and CD._numeric(cols[c])), "")
+        if not column:
+            return ""
+        keep = [c for c in ("id", "m", "t", "z", "y", "x") if c in cols] + [column]
+        n = len(cols[column])
+        rows = [[str(cols[c][i].item() if hasattr(cols[c][i], "item") else cols[c][i])
+                 for c in keep] for i in range(n)]
+        return FT.table_csv(keep, rows)
+
+    def export_bundle(self, path: str, fmt: str = "png", dpi: Optional[int] = None) -> List[str]:
+        """The picture as ``fmt`` at ``path`` plus an SVG, and beside them the bundle
+        (:mod:`nodegraph.figure.bundle`): ``<stem>.figure.json``, ``<stem>.legend.txt``,
+        ``<stem>.provenance.json`` (sources, run ids, lineage, files, display windows, app
+        version, digest) and ``<stem>.data/`` with the CSV of every chart, table and heat
+        layer. Returns every path written."""
+        out = self.export(path, fmt, dpi)
+        stem = os.path.splitext(out)[0]
+        written = [out]
+        if fmt.lower() not in ("svg", "pdf"):
+            written.append(self.export(stem + ".svg", "svg", dpi))
+        data_files: Dict[str, str] = {}
+        for spec in self._doc.get("items", []):
+            iid = str(spec["id"])
+            tag = f"{spec.get('letter') or ''}_{iid}".strip("_")
+            kind = spec.get("kind")
+            if kind == "chart":
+                csv = self.chart_csv(iid)
+                if csv:
+                    data_files[f"{tag}_chart"] = csv
+            elif kind == "table":
+                item = self._items.get(iid)
+                if isinstance(item, TableItem) and item.header:
+                    data_files[f"{tag}_table"] = FT.table_csv(item.header, item.rows)
+            elif kind in ("image", "montage"):
+                img = S.effective_image(self._doc, iid)
+                for L in img.get("layers") or []:
+                    if L.get("kind") in ("field", "voxels"):
+                        csv = self._layer_csv(spec, L)
+                        if csv:
+                            data_files[f"{tag}_{L.get('layer') or 'layer'}_{L.get('column') or 'value'}"] = csv
+        lineage = {}
+        for sid, rid in self._run_ids.items():
+            try:
+                lineage[sid] = str(self._host.lineage(rid) or "")
+            except Exception:              # noqa: BLE001 — provenance never blocks an export
+                lineage[sid] = ""
+        try:
+            version = str(self._host.app_version())
+        except Exception:                  # noqa: BLE001
+            version = ""
+        files = FB.bundle_files(self._doc, self._envs, data_files=data_files,
+                                run_ids=self._run_ids, lineage=lineage,
+                                lut_windows=self._lut_windows(), app_version=version)
+        written += FB.write_bundle(stem, files)
+        self._host.status(f"bundle written: {out} + {len(written) - 1} files")
+        return written
+
+    def capture_view(self, source: str, *, coords: Sequence[int], channels: Sequence[int],
+                     rect01: Sequence[float], display: Mapping[int, Mapping[str, Any]]) -> str:
+        """The Viewer's *Capture view → page*: an image item of Page Output ``source``
+        showing the Viewer's frame (``coords`` = m, t, z, c), its visible region
+        (``rect01`` = x0, y0, x1, y1 of the plane, a region only when it is not the whole),
+        its active ``channels`` with the windows and colours the Viewer holds
+        (``display``: ``{c: {"lo", "hi", "gamma", "rgb"}}``; a channel without a user
+        window stays auto)."""
+        iid = self.add_image(source)
+        m, t, z = (int(v) for v in list(coords)[:3])
+        x0, y0, x1, y1 = (float(v) for v in rect01)
+        whole = x0 <= 0.001 and y0 <= 0.001 and x1 >= 0.999 and y1 >= 0.999
+
+        def mut(dd):
+            it = S.item(dd, iid)
+            img = it["image"]
+            img["frame"] = {"m": m, "t": t, "z": z}
+            if not whole and x1 > x0 and y1 > y0:
+                img["region"] = {"from": "rect_frac", "rect_frac": [y0, y1, x0, x1]}
+            have = {int(ch.get("c", 0)): ch for ch in img.get("channels") or []}
+            chans = []
+            for c in channels:
+                c = int(c)
+                st = dict(display.get(c) or {})
+                base = dict(have.get(c) or {"c": c, "rgb": "#ffffff", "mode": "auto_pct",
+                                            "label": ""})
+                base["c"] = c
+                if st.get("rgb"):
+                    base["rgb"] = str(st["rgb"])
+                if st.get("lo") is not None and st.get("hi") is not None:
+                    base.update(mode="manual", lo=float(st["lo"]), hi=float(st["hi"]))
+                if st.get("gamma") is not None:
+                    base["gamma"] = float(st["gamma"])
+                chans.append(base)
+            if chans:
+                img["channels"] = chans
+        self.commit(_mutated(self._doc, mut))
+        self.select([iid])
+        return iid
+
+    def _legend_entries(self, src: ImageItem, r: Any) -> List[Dict[str, Any]]:
+        """The rows of a legend of image ``src``: a swatch per channel in its colour, a
+        glyph per layer (outline, marker, line) and a colour-map ramp with its limits for
+        a heat layer."""
+        img = S.effective_image(self._doc, src.item_id)
+        md = dict(getattr(self._envs.get(img.get("source") or ""), "metadata", None) or {})
+        names = list(md.get("channel_names") or [])
+        out: List[Dict[str, Any]] = []
+        for ch in img.get("channels") or []:
+            c = int(ch.get("c", 0))
+            nm = ch.get("label") or (names[c] if c < len(names) and names[c] else f"ch{c + 1}")
+            out.append({"kind": "swatch", "color": str(ch.get("rgb") or "#ffffff"), "label": nm})
+        for k, L in enumerate(img.get("layers") or []):
+            kind = str(L.get("kind") or "labels")
+            look = dict(L.get("look") or {})
+            label = str(L.get("layer") or kind)
+            if kind == "labels":
+                out.append({"kind": "outline", "color": str(look.get("color") or "#ffd400"),
+                            "label": label})
+            elif kind == "points":
+                out.append({"kind": "marker", "color": str(look.get("color") or "#ff4d4d"),
+                            "label": label})
+            elif kind in ("tracks", "vectors", "mesh", "grid"):
+                out.append({"kind": "line", "color": str(look.get("color") or "#4dd2ff"),
+                            "label": f"{label} ({kind})"})
+            elif kind in ("field", "voxels"):
+                lo, hi, cmap = None, None, str(L.get("cmap") or "viridis")
+                flabel = str(L.get("column") or label)
+                lim = dict(L.get("limits") or {})
+                if isinstance(r, R.Rendered) and r.geometry is not None \
+                        and r.geometry.field is not None and kind == "field":
+                    _fr, lims, cmap, fl = r.geometry.field
+                    lo, hi = lims
+                    flabel = flabel or fl
+                if lim.get("mode") == "normalized" and lim.get("vmax"):
+                    out.append({"kind": "ramp", "cmap": cmap, "lo": 0.0, "hi": 1.0,
+                                "label": f"{flabel} / {float(lim['vmax']):g}"})
+                else:
+                    out.append({"kind": "ramp", "cmap": cmap if cmap != "auto" else "viridis",
+                                "lo": lo, "hi": hi, "label": flabel})
+        return out
+
+    def _refresh_tables(self) -> None:
+        """Resolve every table item from the payload it reads (synchronously, like charts)."""
+        for spec in self._doc.get("items", []):
+            if spec.get("kind") != "table":
+                continue
+            iid = spec["id"]
+            item = self._items.get(iid)
+            if not isinstance(item, TableItem):
+                continue
+            blk = dict(spec.get("table") or {})
+            rid, payload, _env = self._chart_payload(blk)
+            if payload is None:
+                what = blk.get("data") or blk.get("source")
+                item.set_table([], [], ("pick a source or a data entry" if not what else
+                                        f"{what!r} is not bound" if not rid else
+                                        "not computed yet — Compute sources"))
+                self._renders.pop(iid, None)
+                continue
+            key = S.digest({"table": blk, "payload": id(payload), "rid": rid})
+            have = self._renders.get(iid)
+            if have is not None and have[0] == key:
+                continue
+            name = self._chart_table_name(blk)
+            got = CD.pick_table(self._tables_of(rid, payload), str(blk.get("domain") or "label"),
+                                name)
+            if got is None:
+                item.set_table([], [], f"no {blk.get('domain') or 'label'} table"
+                                       + (f" named {name!r}" if name else ""))
+                self._renders.pop(iid, None)
+                continue
+            try:
+                header, rows = FT.summary_table(
+                    got[1], list(blk.get("columns") or []),
+                    group_by=str(blk.get("group_by") or ""),
+                    stats=list(blk.get("stats") or ("n", "mean", "sem")),
+                    decimals=int(blk.get("decimals", -1) if blk.get("decimals") is not None
+                                 else -1))
+                item.set_table(header, rows)
+            except Exception as exc:           # noqa: BLE001 — a table that cannot build says why
+                item.set_table([], [], f"{type(exc).__name__}: {exc}")
+            self._renders[iid] = (key, "table")
 
     def promote_chart_data(self, item_id: str, *, aggregate: Optional[Mapping[str, Any]] = None,
                            where: Optional[Sequence[Sequence[Any]]] = None) -> str:
@@ -708,9 +1011,10 @@ class FigureEditorPanel(QWidget):
         return name
 
     def chart_tables_of(self, spec: Mapping[str, Any]) -> List[Tuple[str, str]]:
-        """``[(domain, table)]`` a chart item may read, from the payload in hand, else the
-        envelope of its source (a data entry's summary, when its envelope is not in yet)."""
-        chart = spec.get("chart") or {}
+        """``[(domain, table)]`` a chart (or table) item may read, from the payload in hand,
+        else the envelope of its source (a data entry's summary, when its envelope is not
+        in yet)."""
+        chart = self._reads_block(spec)
         rid, payload, _env = self._chart_payload(chart)
         if payload is not None:
             keys = sorted(self._tables_of(rid, payload))
@@ -728,9 +1032,10 @@ class FigureEditorPanel(QWidget):
         return out
 
     def chart_columns(self, spec: Mapping[str, Any]) -> List[str]:
-        """The columns of the table a chart reads: the payload's when in hand, else the
-        envelope's, else (a data entry not computed yet) what its stages will produce."""
-        chart = spec.get("chart") or {}
+        """The columns of the table a chart (or table item) reads: the payload's when in
+        hand, else the envelope's, else (a data entry not computed yet) what its stages
+        will produce."""
+        chart = self._reads_block(spec)
         rid, payload, _env = self._chart_payload(chart)
         name = self._chart_table_name(chart)
         dom = str(chart.get("domain") or "label")
@@ -1243,6 +1548,9 @@ class FigureEditorPanel(QWidget):
         elif goal == "plot":
             if tabs:
                 self.add_chart(str(tabs[0]["value"]))
+        elif goal == "table":
+            if tabs:
+                self.add_table(str(tabs[0]["value"]))
         elif goal == "composite":
             if imgs:
                 self.add_image(str(imgs[0]["value"]))
@@ -1358,6 +1666,7 @@ class FigureEditorPanel(QWidget):
             fn = self._render_fn(iid, img, payload, rid)
             self._worker.request(iid, gen, fn)
         self._refresh_charts()
+        self._refresh_tables()
         self._feed_dependents()
         self._update_leaders()
 
@@ -1552,6 +1861,11 @@ class FigureEditorPanel(QWidget):
                     pr = src.picture_rect()
                     units = pr.width() / max(1, r.plane_shape[1]) / float(r.pixel_size_um)
                 item.set_scale(units)
+            elif isinstance(item, LegendItem):
+                if isinstance(src, ImageItem):
+                    item.set_entries(self._legend_entries(src, r))
+                else:
+                    item.set_entries([], "legend: pick an image")
 
     def _update_leaders(self) -> None:
         if self._rebuilding:
@@ -1666,10 +1980,14 @@ class FigureEditorPanel(QWidget):
         return out
 
     def export_dialog(self, fmt: str) -> None:
-        path = self._host.export_path(fmt)
+        bundle = fmt == "bundle"
+        path = self._host.export_path("png" if bundle else fmt)
         if path:
             try:
-                self.export(path, fmt)
+                if bundle:
+                    self.export_bundle(path, "png")
+                else:
+                    self.export(path, fmt)
             except Exception as exc:           # noqa: BLE001 — told, never raised into Qt
                 self._status.setText(f"export failed: {exc}")
 

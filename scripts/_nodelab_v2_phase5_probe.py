@@ -497,6 +497,38 @@ def _probe_figure_editor(win, app) -> None:
     app.processEvents()                                    # the chart + data forms build
     ed.select([])
 
+    # ── tables, legend, letters, style (V5.00 step 5) ─────────────────────────
+    from nodelab_v2.figure_editor.items import LegendItem as _LegendItem
+    from nodelab_v2.figure_editor.items import TableItem as _TableItem
+    tb = ed.add_table(f"{pids['process']}:cells", columns=["area"], group_by="t")
+    app.processEvents()
+    ti = ed._items[tb]
+    assert isinstance(ti, _TableItem) and ti.header[:2] == ["t", "n"] and len(ti.rows) == 3, (
+        ti.header, ti.rows, ti.note)
+    ed.fit_table(tb)
+    assert _FS.item(ed.document, tb)["rect_mm"][2] < 60.0, _FS.item(ed.document, tb)["rect_mm"]
+    lg = ed.add_legend_for(iid)
+    app.processEvents()
+    li = ed._items[lg]
+    assert isinstance(li, _LegendItem) and len(li.entries) >= 3 \
+        and li.entries[0]["kind"] == "swatch" \
+        and any(e["kind"] == "outline" for e in li.entries), li.entries
+    letters_before = {it["id"]: it.get("letter") for it in ed.document["items"]}
+    new = ed.reletter()
+    assert new.get(zid) == "" and new.get(iid) and new.get(cid) and new.get(tb), new
+    got = {it["id"]: it.get("letter") for it in ed.document["items"] if it["id"] in new}
+    assert got == new and got != letters_before, (got, letters_before)
+    ed.edit_item(tb, "pt", 11.0)
+    ed.sync_style("talk")
+    page = ed.document["page"]
+    assert page["font_pt"] == 14.0 and page["style"] == "talk" \
+        and _FS.item(ed.document, tb)["pt"] is None, (page, _FS.item(ed.document, tb))
+    ed.sync_style("paper")
+    assert ed.document["page"]["font_pt"] == 8.0
+    ed.select([])
+    app.processEvents()                                    # the page form with its checks
+    assert ed.props._lay.count() > 2
+
     tmp = _tempfile.mkdtemp(prefix="nd2sb_figure_")
     png = ed.export(_os.path.join(tmp, "f.png"), "png")
     png2 = ed.export(_os.path.join(tmp, "g.png"), "png")
@@ -514,6 +546,25 @@ def _probe_figure_editor(win, app) -> None:
     pdf = ed.export(_os.path.join(tmp, "f.pdf"), "pdf")
     with open(pdf, "rb") as f:
         assert f.read(4) == b"%PDF" and _os.path.getsize(pdf) > 1000
+    # the bundle (step 5): picture + SVG + document + legend + provenance + data CSVs
+    import json as _json
+    written = ed.export_bundle(_os.path.join(tmp, "b.png"), "png")
+    names = sorted(_os.path.relpath(p, tmp).replace("\\", "/") for p in written)
+    assert "b.png" in names and "b.svg" in names and "b.figure.json" in names \
+        and "b.legend.txt" in names and "b.provenance.json" in names, names
+    assert any(n.startswith("b.data/") and n.endswith("_chart.csv") for n in names) \
+        and any(n.startswith("b.data/") and n.endswith("_table.csv") for n in names), names
+    with open(_os.path.join(tmp, "b.provenance.json"), encoding="utf8") as f:
+        prov = _json.load(f)
+    assert prov["sources"][0]["run_id"] == ed._run_ids[sid] \
+        and prov["figure_digest"] == ed._fig.digest() and prov["app_version"] \
+        and iid in prov["lut_windows"] and len(prov["lut_windows"][iid]) == 2, prov
+    with open(_os.path.join(tmp, "b.legend.txt"), encoding="utf8") as f:
+        legend = f.read()
+    assert "Images show" in legend and "pixel size" in legend.lower() \
+        and "Display ranges" in legend, legend
+    with open(_os.path.join(tmp, "b.figure.json"), encoding="utf8") as f:
+        assert _json.load(f) == _FS.normalize(ed.document)
 
     if _stop(4):
         return
@@ -543,10 +594,30 @@ def _probe_figure_editor(win, app) -> None:
     app.processEvents()
     assert ed.bound() == pids["analyze"] and len(ed.document["items"]) == n_items
     assert wait(lambda: not ed.busy(), 60), "the render thread never went idle"
+    # Capture view → page (step 5): the Viewer's frame, region and channels as an image
+    win._show_page(c, pids["process"])
+    app.processEvents()
+    win.pull_node("lab")
+    assert wait(lambda: win.viewer.binding == (pids["process"], "lab") and win.viewer.has_image(),
+                120), (win.viewer.binding, win.viewer.has_image())
+    win.viewer.set_cursor(1, 2, 1)
+    app.processEvents()
+    m0, t0, z0, _c0 = win.viewer.coords()
+    n_before = len(an.figure.items)                # the editor is unbound while away
+    cap = win.capture_view_to_page()
+    app.processEvents()
+    assert cap and c.is_figure() and ed.bound() == pids["analyze"], (cap, c.is_figure())
+    assert len(ed.document["items"]) == n_before + 1
+    cimg = _FS.effective_image(ed.document, cap)
+    assert ed.document["sources"][[s["id"] for s in ed.document["sources"]].index(cimg["source"])]["source"] \
+        == f"{pids['process']}:cells", cimg
+    assert cimg["frame"] == {"m": m0, "t": t0, "z": z0}, (cimg["frame"], (m0, t0, z0))
+    assert [ch["c"] for ch in cimg["channels"]] == list(win.viewer.channels()), cimg["channels"]
+    assert ed.selected_ids() == [cap]
     win._show_page(c, pids["input"])
     app.processEvents()
     _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
-    _ok("Figure Editor (V5.00 steps 3–4): the Analysis page shows the editor bound to it with "
+    _ok("Figure Editor (V5.00 steps 3–5): the Analysis page shows the editor bound to it with "
         "the start card; the Sources panel lists the feeder outputs from envelopes; an image "
         "compiles one hidden Page Input; Compute sources fetches without touching the "
         "Viewer; the image renders with a window per channel and draws a labels layer; a "
@@ -554,9 +625,13 @@ def _probe_figure_editor(win, app) -> None:
         "LUT share its windows; colour bar, histogram and text land; a chart draws a "
         "histogram of the label table, an XY hover rings the object on the image, a column "
         "drop sets Y, a data entry (filter → summary) compiles, fetches and draws bars per "
-        "frame; PNG at the page's size and identical twice, SVG with paths and text, a PDF; "
-        "undo/redo; the file carries the figure; checks name the bar-less twin; edits commit; "
-        "a graph page unbinds, coming back rebinds")
+        "frame; a summary table per frame fits to its rows, a legend lists channels and "
+        "layers, re-letter orders the panels and unletters the popout, style sync applies "
+        "the preset and clears overrides; PNG at the page's size and identical twice, SVG "
+        "with paths and text, a PDF, the bundle with SVG, document, legend, provenance and "
+        "CSVs; undo/redo; the file carries the figure; checks name the bar-less twin; edits "
+        "commit; a graph page unbinds, coming back rebinds; Capture view → page places the "
+        "Viewer's frame and channels as an image")
 
 
 def main(argv) -> int:

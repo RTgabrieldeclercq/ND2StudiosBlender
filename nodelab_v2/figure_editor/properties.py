@@ -166,6 +166,16 @@ KIND_FIELDS: Dict[str, List[Field]] = {
                      ("color", "color", "Colour", {}),
                      ("width_pt", "float", "Line (pt)", {"lo": 0.1, "hi": 20, "step": 0.25,
                                                          "dec": 2})],
+    "table": [("table.source", "chart_source", "Reads", {}),
+              ("table.table", "chart_table", "Table", {}),
+              ("table.columns", "list", "Columns (blank = all)", {}),
+              ("table.group_by", "column", "Group by", {}),
+              ("table.stats", "list", "Statistics", {"hint": "n, mean, sd, sem, median, min, "
+                                                             "max, sum"}),
+              ("table.decimals", "int", "Decimals (-1 = auto)", {"lo": -1, "hi": 8}),
+              ("pt", "float", "Size (pt, 0 = page)", {"lo": 0, "hi": 72, "step": 0.5, "dec": 1})],
+    "legend": [("of.item", "item", "Of image", {"kinds": ("image", "montage")}),
+               ("title", "text", "Title", {})],
 }
 
 CHART_KIND_LABELS = [("xy", "XY — scatter / line"), ("timeseries", "time series"),
@@ -423,6 +433,48 @@ class PropertiesPanel(QScrollArea):
         lab = QLabel(f"Goal: {goal or 'not chosen'}")
         lab.setProperty("role", "muted")
         self._lay.addWidget(lab)
+        row = QHBoxLayout()
+        b = QPushButton("Re-letter panels")
+        b.setToolTip("Letter every panel in reading order (rows top to bottom, left to "
+                     "right); a popout is part of its parent's panel")
+        b.clicked.connect(lambda _=False: self._panel.reletter())
+        row.addWidget(b)
+        b = QPushButton("Style sync")
+        b.setToolTip("Apply the page preset (paper / talk / poster / dark) to the page and "
+                     "clear every item's own type size and line width back to it")
+        b.clicked.connect(lambda _=False: self._panel.sync_style())
+        row.addWidget(b)
+        self._lay.addLayout(row)
+        self._build_checks()
+
+    def _build_checks(self) -> None:
+        """The paper-readiness checks of the page, each with a jump to its item."""
+        checks = list(self._panel.checks())
+        box = QGroupBox(f"Checks ({len(checks)})" if checks else "Checks")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(3)
+        if not checks:
+            lab = QLabel("nothing to flag — scale bars, letters, colour bars, merges and "
+                         "display ranges all pass")
+            lab.setWordWrap(True)
+            lab.setProperty("role", "muted")
+            lay.addWidget(lab)
+        for c in checks:
+            row = QHBoxLayout()
+            sev = "⚠" if c.get("severity") == "warn" else "·"
+            lab = QLabel(f"{sev} {c.get('message')}")
+            lab.setWordWrap(True)
+            lab.setToolTip(str(c.get("code") or ""))
+            row.addWidget(lab, 1)
+            if c.get("item"):
+                go = QToolButton()
+                go.setText(str(c["item"]))
+                go.setToolTip("select this item")
+                go.clicked.connect(lambda _=False, i=str(c["item"]): self._panel.select([i]))
+                row.addWidget(go)
+            lay.addLayout(row)
+        self._lay.addWidget(box)
 
     def _build_multi(self, doc: Mapping[str, Any], ids: Sequence[str]) -> None:
         self._title(f"{len(ids)} items")
@@ -499,6 +551,15 @@ class PropertiesPanel(QScrollArea):
             row.addWidget(b)
             b = QPushButton("Histogram")
             b.clicked.connect(lambda _=False: self._panel.add_histogram_for(iid))
+            row.addWidget(b)
+        if kind in ("image", "montage"):
+            b = QPushButton("Legend")
+            b.setToolTip("A legend of this image's channels and layers")
+            b.clicked.connect(lambda _=False: self._panel.add_legend_for(iid))
+            row.addWidget(b)
+        if kind == "table":
+            b = QPushButton("Fit to content")
+            b.clicked.connect(lambda _=False: self._panel.fit_table(iid))
             row.addWidget(b)
         if kind == "chart" and not (it.get("chart") or {}).get("data"):
             b = QPushButton("Filter / summarise")
@@ -813,6 +874,14 @@ class PropertiesPanel(QScrollArea):
             w.setCurrentIndex(max(0, idx))
             w.currentIndexChanged.connect(lambda i, c=w: on_set(c.itemData(i)))
             return w
+        if kind == "list":
+            vals = value if isinstance(value, (list, tuple)) else ([value] if value else [])
+            w = QLineEdit(", ".join(str(v) for v in vals))
+            if opt.get("hint"):
+                w.setPlaceholderText(str(opt["hint"]))
+            w.editingFinished.connect(
+                lambda e=w: on_set([s.strip() for s in e.text().split(",") if s.strip()]))
+            return w
         if kind == "chart_source":
             w = _NoWheelCombo()
             doc = self._panel.document
@@ -820,7 +889,7 @@ class PropertiesPanel(QScrollArea):
                 w.addItem(f"{s.get('label') or s['source']}", ("source", s["id"]))
             for d in doc.get("data", []):
                 w.addItem(f"data: {d['id']}", ("data", d["id"]))
-            chart = (ctx or {}).get("chart") or {}
+            chart = (ctx or {}).get("chart") or (ctx or {}).get("table") or {}
             cur = ("data", chart["data"]) if chart.get("data") else ("source", chart.get("source"))
             idx = next((i for i in range(w.count()) if w.itemData(i) == cur), -1)
             w.setCurrentIndex(max(0, idx))
@@ -830,7 +899,7 @@ class PropertiesPanel(QScrollArea):
             return w
         if kind == "chart_table":
             w = _NoWheelCombo()
-            chart = (ctx or {}).get("chart") or {}
+            chart = (ctx or {}).get("chart") or (ctx or {}).get("table") or {}
             w.addItem("the only table on the domain", (str(chart.get("domain") or "label"), ""))
             for dom, name in (self._panel.chart_tables_of(ctx) if ctx is not None else []):
                 w.addItem(f"{dom}: {name}", (dom, name))

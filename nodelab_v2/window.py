@@ -435,6 +435,20 @@ class _FigureHost:
             path += f".{fmt}"
         return path
 
+    def lineage(self, run_id: str) -> str:
+        """The session-stable identity of what ``run_id`` computes (the bundle's provenance),
+        blank when the runner holds no engine for it."""
+        eng = getattr(self._w.runner, "_engine", None)
+        try:
+            if eng is not None and run_id in eng.graph.nodes:
+                return str(eng.lineage(run_id))
+        except Exception:              # noqa: BLE001 — provenance never blocks an export
+            pass
+        return ""
+
+    def app_version(self) -> str:
+        return f"{PRODUCT} {APP_VERSION}"
+
     def status(self, text: str) -> None:
         self._w.statusBar().showMessage(text, 6000)
 
@@ -849,6 +863,8 @@ class MainWindow(QMainWindow):
         part = functools.partial
         slots = {
             "request_changed": part(self._on_view_request, viewer=v),
+            # Capture view → page (V5.00 step 5): what this viewer shows, as a figure item
+            "capture_page": part(self.capture_view_to_page, viewer=v),
             "selection_changed": part(self._on_frame_selection, viewer=v),
             "region_changed": part(self._on_region_changed, viewer=v),
             "iteration_changed": part(self._on_iteration_changed, viewer=v),
@@ -1740,6 +1756,59 @@ class MainWindow(QMainWindow):
     def page_is_figure(self, page_id: str) -> bool:
         page = self.workspace.pages.get(page_id or "")
         return page is not None and page.figure is not None
+
+    def capture_view_to_page(self, viewer: Optional[ViewerPanel] = None) -> Optional[str]:
+        """*Capture view → page* (V5.00 step 5): place what ``viewer`` (default: the active
+        one) shows on a figure page — its frame, visible region, active channels and the
+        windows and colours it holds — as an image item, and show that page. The viewed
+        node must be published as a Page Output (a figure reads only those); the figure
+        page is the first one that can read it, else a new Analysis page. Returns the new
+        item's id, or ``None`` with a status message saying why."""
+        from nodelab_v2.workspace import FIGURE_KIND
+        v = viewer if viewer is not None else self._active_viewer()
+        full = self._binding_full(v) if v is not None else None
+        if v is None or full is None:
+            self.statusBar().showMessage("Capture view → page: the Viewer shows nothing yet")
+            return None
+        pid, nid = split_run_id(full)
+        ws = self.workspace
+        page = ws.pages.get(pid)
+        if page is None:
+            return None
+        name = None
+        for rec in page.doc.nodes.values():
+            if rec.op_key != PAGE_OUTPUT_OP:
+                continue
+            edge = page.doc.edge_into(rec.id, "data")
+            if (rec.id == nid or (edge is not None and edge[0] == nid)) \
+                    and str(rec.params.get(PAGE_NAME_KEY) or "").strip():
+                name = str(rec.params[PAGE_NAME_KEY]).strip()
+                break
+        if name is None:
+            self.statusBar().showMessage(
+                "Capture view → page: publish this node first — wire it into a Page Output "
+                "with a name; a figure reads only what a page publishes", 8000)
+            return None
+        value = f"{pid}:{name}"
+        fig_pid = next((p.id for p in ws.pages.values() if p.figure is not None
+                        and any(val == value for val, _l in ws.available_sources(p.id))), None)
+        if fig_pid is None:
+            fig_pid = ws.add_page("Figure", FIGURE_KIND).id
+            self._refresh_page_views()
+        c = self._canvas
+        self._show_page(c, fig_pid)
+        ed = c.figure
+        if not c.is_figure() or ed.bound() != fig_pid:
+            self.statusBar().showMessage("Capture view → page: the figure page did not open")
+            return None
+        names = list((page.doc.envs.get(nid).metadata.get("channel_names") or [])
+                     if page.doc.envs.get(nid) is not None else [])
+        display = v.display_state(full, names)
+        iid = ed.capture_view(value, coords=v.coords(), channels=v.channels(),
+                              rect01=v.visible_rect01(), display=display)
+        self.statusBar().showMessage(f"captured the view as {iid} on {ws.pages[fig_pid].name}",
+                                     6000)
+        return iid
 
     def _figure_editors(self) -> List[FigureEditorPanel]:
         return [c.figure for c in self.canvases() if getattr(c, "figure", None) is not None]
