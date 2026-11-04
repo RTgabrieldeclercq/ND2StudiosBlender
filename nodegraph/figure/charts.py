@@ -945,6 +945,9 @@ def chart_geometry(chart: Mapping[str, Any], series: Any, *, rect_mm: Sequence[f
     # ── 6. legend and colour bar geometry ────────────────────────────────────────
     legend: Optional[Dict[str, Any]] = None
     if legend_entries:
+        # a fit appends its equation to the entry label: measure the box again, so an
+        # inside legend hugs the right edge whatever its entries grew to
+        leg_w = max((measure(e["label"], pt)[0] for e in legend_entries), default=0.0) + 6.0
         if leg_loc == "right":
             lx, ly = ax + aw + pad + (cbar_w + pad if cbar_w else 0.0), ay
         elif leg_loc == "bottom":

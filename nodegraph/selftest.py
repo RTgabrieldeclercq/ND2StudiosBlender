@@ -36777,6 +36777,7 @@ def main() -> int:
     test_table_export_split()
     test_figure_core()
     test_figure_page()
+    test_figure_data()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
@@ -37274,6 +37275,118 @@ def test_figure_page() -> None:
         "page; the figure rides the file and round-trips byte-identical, a bad one is "
         "refused by path; a V4 Analysis graph opens as a Free page (graph) with its linked "
         "pages; no linking, no mastering, a copy has its own figure; seeding and reset agree")
+
+
+def test_figure_data() -> None:
+    """The figure's Data step (V5.00 step 4): a data entry compiles into the shadow graph
+    as ``analysis.if_else`` (its filter) → ``table.aggregate`` (its summary), with
+    ``table.concat`` in front when it pools several sources; ``run_ids`` names its terminal
+    stage; the composed graph pulls through it on the real catalog; the chart modules
+    resolve series and geometry from the summary, and a chart's CSV is its values; removing
+    the entry removes its stages; the schema refuses a bad op and an unknown source."""
+    from nodegraph.figure import charts as C
+    from nodegraph.figure import schema as FS
+    from nodegraph.memo import Memo
+    from nodegraph.tables import all_tables
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.figure_document import DATA_PREFIX, FigureDocument
+    from nodelab_v2.workspace import FIGURE_KIND, Workspace
+
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+    P1.doc.add_node("analysis.label", node_id="L")
+    P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.doc.connect("X", "out", "T", "data")
+    P1.doc.connect("T", "out", "L", "data")
+    P1.doc.connect("L", "out", "O", "data")
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    entry = {"id": "d1", "from": ["cells"], "domain": "label", "table": "labels",
+             "where": [["area", ">", 1]],
+             "aggregate": {"group_by": ["t"], "value": "area", "reducers": ["mean", "count"],
+                           "name": "summary"}}
+    fp.figure.edit(lambda d: d.update(
+        goal="plot", sources=[{"id": "cells", "source": "pg3:cells"}], data=[entry],
+        items=[{"id": "ch", "kind": "chart", "rect_mm": [0, 0, 60, 45], "letter": "A",
+                "chart": {"kind": "bar", "data": "d1", "x": "t", "y": "area_mean"}}]))
+    fig = fp.figure
+    assert fig.data_stages(fig.data[0]) == ["where", "agg"], fig.data_stages(fig.data[0])
+    w_id, a_id = fig.data_id("d1", "where"), fig.data_id("d1", "agg")
+    src = FigureDocument.shadow_id("cells")
+    assert set(fp.doc.nodes) == {src, w_id, a_id}, set(fp.doc.nodes)
+    assert fp.doc.nodes[w_id].op_key == "analysis.if_else" \
+        and fp.doc.nodes[w_id].params["column1"] == "area" \
+        and fp.doc.nodes[w_id].params["op1"] == ">" \
+        and fp.doc.nodes[w_id].params["labels"] == "labels"
+    assert fp.doc.nodes[a_id].op_key == "table.aggregate" \
+        and fp.doc.nodes[a_id].params == {"table": "d1_pass", "group_by": "t", "value": "area",
+                                          "reducers": "mean,count", "name": "summary"}
+    assert (src, "out", w_id, "data") in fp.doc.edges and (w_id, "out", a_id, "data") in fp.doc.edges
+    assert fig.data_terminal("d1") == a_id and fig.data_table_name("d1") == "summary"
+    comp = ws.compose(fp.id)
+    rids = fig.run_ids(comp, fp.id)
+    assert rids == {"cells": "pg3/O", "d1": f"{fp.id}/{a_id}"}, rids
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    out = eng.pull(rids["d1"])
+    tables = all_tables(out)
+    assert ("label", "summary") in tables, sorted(tables)
+    summ = tables[("label", "summary")]
+    assert "area_mean" in summ and "n" in summ and len(summ["area_mean"]) == 1 \
+        and float(summ["area_mean"][0]) > 0 and int(summ["area_count"][0]) == 1, (
+            {k: v.tolist() for k, v in summ.items()})
+    area = float(summ["area_mean"][0])
+    # the chart modules, Qt-free: series from the table, geometry with the default measure
+    from nodelab_v2.figure_editor import charts_data as CD
+    chart = FS.normalize(fig.to_dict())["items"][0]["chart"]
+    chart = dict(chart, table=fig.data_table_name("d1"))
+    series, units, note = CD.resolve_series(chart, tables, {})
+    assert not note and len(series) == 1 and series[0]["y"] == [area], (series, note)
+    g = C.chart_geometry(chart, series, rect_mm=[0, 0, 60, 45],
+                         style={"font_pt": 8, "line_width": 1, "marker_size": 3,
+                                "palette": "colorblind"})
+    bars = [m for m in g["marks"] if m["kind"] == "rects" and m["role"] == "bars"]
+    assert bars and len(bars[0]["rects_mm"]) == 1 and g["x"]["categories"] == ["0"], (
+        bars, g["x"])
+    csv = CD.chart_csv(chart, series).splitlines()
+    assert csv[0] == "series,category,mean,err,n" and csv[1].split(",")[1:3] == ["0", str(area)], csv
+    # an XY chart over the raw labels carries the row ride-along per point
+    xy = dict(FS.chart_defaults(), kind="xy", source="cells", table="labels", x="x", y="area")
+    s2, _u, note = CD.resolve_series(xy, all_tables(eng.pull("pg3/O")), {})
+    assert not note and s2[0]["rows"] and s2[0]["rows"][0].count(",") == 4, (s2, note)
+    hit = C.nearest_mark(C.chart_geometry(xy, s2, rect_mm=[0, 0, 60, 45],
+                                          style={"font_pt": 8}), 30.0, 22.5, within_mm=60)
+    assert hit is not None and hit["series"] == 0
+    # pooling two sources adds a concat in front; removing the entry removes its stages
+    fig.edit(lambda d: d.update(
+        sources=[{"id": "cells", "source": "pg3:cells"}, {"id": "more", "source": "pg3:cells"}],
+        data=[dict(entry, **{"from": ["cells", "more"]})]))
+    c_id = fig.data_id("d1", "concat")
+    assert fig.data_stages(fig.data[0]) == ["concat", "where", "agg"]
+    assert fp.doc.nodes[c_id].op_key == "table.concat" \
+        and {e[0] for e in fp.doc.edges if e[2] == c_id} == {src, FigureDocument.shadow_id("more")}
+    assert (c_id, "out", w_id, "data") in fp.doc.edges
+    fig.edit(lambda d: d.update(data=[], items=[]))
+    assert not any(n.startswith(DATA_PREFIX) for n in fp.doc.nodes), set(fp.doc.nodes)
+    # the schema: a bad op, an unknown source, a chart naming a missing entry
+    for bad, path in (({"id": "d2", "from": ["cells"], "where": [["area", "~", 1]]}, "data[0].where[0].op"),
+                      ({"id": "d2", "from": ["nope"]}, "data[0].from[0]")):
+        try:
+            FS.normalize(dict(fig.to_dict(), data=[bad]))
+        except FS.FigureError as exc:
+            assert exc.path == path, (exc.path, path)
+        else:
+            raise AssertionError(f"accepted {bad}")
+    try:
+        FS.normalize(dict(fig.to_dict(), items=[{"id": "c", "kind": "chart", "rect_mm": [0, 0, 1, 1],
+                                                 "chart": {"data": "ghost"}}]))
+    except FS.FigureError as exc:
+        assert exc.path == "items[0].chart.data", exc.path
+    else:
+        raise AssertionError("a chart may not name a missing data entry")
+    print("[ok] figure data: where → aggregate compile into the shadow graph, pull through "
+          "the real catalog, series + geometry + CSV from the summary, concat for pooled "
+          "sources, removal, schema refusals")
 
 
 if __name__ == "__main__":

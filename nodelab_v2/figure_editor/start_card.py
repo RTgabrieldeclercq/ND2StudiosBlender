@@ -29,8 +29,8 @@ GOALS: Tuple[Tuple[str, str, str, str], ...] = (
 )
 
 #: goals the editor can start in this build (the others name the step that adds them)
-AVAILABLE = {"overlay": "", "montage": "", "composite": "",
-             "plot": "charts arrive in step 4", "table": "tables arrive in step 5",
+AVAILABLE = {"overlay": "", "montage": "", "composite": "", "plot": "",
+             "table": "tables arrive in step 5",
              "movie": "the movie hand-off arrives in step 7"}
 
 
@@ -144,7 +144,7 @@ class StartCard(QWidget):
                 if fields:
                     parts.append(fld_txt)
                 card.have.setText(have("; ".join(parts)))
-                ok = n_img > 0
+                ok = n_img > 0 or n_tab > 0
             note = AVAILABLE.get(key, "")
             card.setEnabled(ok and not note)
             card.setToolTip(note or ("" if ok else "nothing upstream carries what this needs"))

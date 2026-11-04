@@ -259,6 +259,45 @@ class ImageItem(FigureItem):
         self._drag_box = box
         self.update()
 
+    def set_highlight(self, yx: Optional[Tuple[float, float]]) -> None:
+        """Ring one object at structure pixels ``(y, x)`` (a chart hover), or none."""
+        self._highlight = yx
+        self.update()
+
+    def structure_to_item(self, y: float, x: float) -> Optional[QPointF]:
+        """A structure coordinate (full-resolution px, centre on the integer) → item units,
+        the mapping :func:`render.paint_overlays` uses; ``None`` without a render."""
+        r = self.rendered
+        if r is None:
+            return None
+        pr = self.picture_rect()
+        H, W = r.level_shape
+        ph, pw = r.plane_shape
+        fy0, _fy1, fx0, _fx1 = r.window
+        sy, sx = H / max(1, r.full_shape[0]), W / max(1, r.full_shape[1])
+        px = (x + 0.5) * sx - fx0 * W
+        py = (y + 0.5) * sy - fy0 * H
+        xx = px * pr.width() / max(1, pw)
+        yy = py * pr.height() / max(1, ph)
+        if self.image_spec.get("flip_x"):
+            xx = pr.width() - xx
+        if self.image_spec.get("flip_y"):
+            yy = pr.height() - yy
+        return QPointF(pr.x() + xx, pr.y() + yy)
+
+    def paint_highlight(self, p: QPainter) -> None:
+        yx = getattr(self, "_highlight", None)
+        if yx is None or self.rendered is None:
+            return
+        pt = self.structure_to_item(float(yx[0]), float(yx[1]))
+        if pt is None or not self.picture_rect().contains(pt):
+            return
+        pen = QPen(QColor(T.ACCENT), max(0.6 * PT, mm(0.25)))
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        r = max(mm(1.2), self.picture_rect().width() * 0.03)
+        p.drawEllipse(pt, r, r)
+
     def picture_rect(self) -> QRectF:
         """Where the picture sits inside the item: the item rect, the picture fitted."""
         r = self.rect()
@@ -301,6 +340,7 @@ class ImageItem(FigureItem):
                          flip_y=bool(self.image_spec.get("flip_y")))
         self.paint_zoom_boxes(p, pr)
         self.paint_decor(p, pr)
+        self.paint_highlight(p)
         self.paint_letter(p)
         if self._drag_box is not None:
             pen = QPen(QColor(T.ACCENT), 0)
@@ -914,7 +954,313 @@ class LeaderItem(QGraphicsItem):
             p.drawLine(s, e)
 
 
+class ChartItem(FigureItem):
+    """A chart (V5.00 step 4): the geometry :func:`nodegraph.figure.charts.chart_geometry`
+    computed for the item's rect — the panel resolves the series and sets it — painted in
+    item units with plain pens: axes, ticks, marks, legend, colour bar, brackets. Text is
+    drawn with the page font at its point size, the same metrics the geometry was measured
+    with. :meth:`hover` maps an item point back to data and to the nearest marker's row."""
+
+    def __init__(self, spec: Mapping[str, Any], style: Mapping[str, Any]) -> None:
+        self.geometry: Optional[Dict[str, Any]] = None
+        self.series: Any = None
+        self.note = ""
+        super().__init__(spec, style)
+
+    def set_geometry(self, geometry: Optional[Dict[str, Any]], series: Any = None,
+                     note: str = "") -> None:
+        self.geometry = geometry
+        self.series = series
+        self.note = note
+        self.update()
+
+    # ── hover ──────────────────────────────────────────────────────────────────
+    def hover(self, item_pos: QPointF) -> Dict[str, Any]:
+        """What is under an item-coordinate point: ``inside``, the data ``x`` / ``y``, and
+        with a marker within reach its ``hit`` (``series``, ``index``), the series
+        ``label`` and the ``row`` ride-along (``"m,t,id,y,x"``) when the series has one."""
+        from nodegraph.figure import charts as C
+        if self.geometry is None:
+            return {}
+        p = self.pos()
+        x_mm, y_mm = to_mm(p.x() + item_pos.x()), to_mm(p.y() + item_pos.y())
+        out: Dict[str, Any] = dict(C.data_at(self.geometry, x_mm, y_mm))
+        hit = C.nearest_mark(self.geometry, x_mm, y_mm, within_mm=1.5)
+        if hit is not None:
+            out["hit"] = hit
+            try:
+                s = self.series[hit["series"]]
+                if isinstance(s, Mapping):
+                    out["label"] = str(s.get("label", ""))
+                    rows = s.get("rows")
+                    if rows and hit["index"] < len(rows):
+                        out["row"] = rows[hit["index"]]
+            except (TypeError, IndexError, KeyError):
+                pass
+        return out
+
+    # ── coordinates: page mm → item units ──────────────────────────────────────
+    def _pt(self, xy_mm: Sequence[float]) -> QPointF:
+        p = self.pos()
+        return QPointF(mm(float(xy_mm[0])) - p.x(), mm(float(xy_mm[1])) - p.y())
+
+    def _rect(self, rect_mm: Sequence[float]) -> QRectF:
+        p = self.pos()
+        x, y, w, h = (float(v) for v in rect_mm)
+        return QRectF(mm(x) - p.x(), mm(y) - p.y(), mm(w), mm(h))
+
+    @staticmethod
+    def _qcolor(s: Any) -> QColor:
+        if s is None:
+            return QColor(0, 0, 0, 0)
+        t = str(s)
+        if len(t) == 9 and t.startswith("#"):          # #rrggbbaa
+            return QColor(int(t[1:3], 16), int(t[3:5], 16), int(t[5:7], 16), int(t[7:9], 16))
+        return QColor(t)
+
+    def _pen(self, color: Any, width_pt: Any, dash: str = "solid") -> QPen:
+        pen = QPen(self._qcolor(color), max(0.0, float(width_pt or 0.0)) * PT)
+        if dash == "dashed":
+            pen.setStyle(Qt.DashLine)
+        elif dash == "dotted":
+            pen.setStyle(Qt.DotLine)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        return pen
+
+    # ── painting ───────────────────────────────────────────────────────────────
+    def paint_content(self, p: QPainter) -> None:
+        g = self.geometry
+        r = self.rect()
+        if g is None:
+            p.fillRect(r, QColor("#20242a") if self.style.get("dark") else QColor("#f3f4f6"))
+            pen = QPen(QColor(T.MUTED), 0)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(r)
+            p.setFont(page_font(self.style, 7.0))
+            p.setPen(QPen(ink(self.style), 0))
+            p.drawText(r.adjusted(mm(1), mm(1), -mm(1), -mm(1)),
+                       Qt.AlignCenter | Qt.TextWordWrap, self.note or "no data yet")
+            self.paint_letter(p)
+            return
+        p.setRenderHint(QPainter.Antialiasing, True)
+        fg = self._qcolor(g.get("fg", "#111111"))
+        for mk in g.get("marks", []):
+            self._paint_mark(p, mk, fg)
+        for tx in g.get("texts", []):
+            self._paint_text(p, tx)
+        if g.get("legend"):
+            self._paint_legend(p, g["legend"], fg)
+        if g.get("colorbar"):
+            self._paint_colorbar(p, g["colorbar"], fg)
+        self.paint_letter(p)
+
+    def _paint_mark(self, p: QPainter, mk: Mapping[str, Any], fg: QColor) -> None:
+        kind = mk.get("kind")
+        stroke = mk.get("stroke")
+        if kind == "rect":
+            p.setPen(self._pen(stroke, mk.get("width_pt", 0.75)) if stroke else Qt.NoPen)
+            p.setBrush(self._qcolor(mk["fill"]) if mk.get("fill") else Qt.NoBrush)
+            p.drawRect(self._rect(mk["rect_mm"]))
+        elif kind == "segments":
+            p.setPen(self._pen(stroke or fg.name(), mk.get("width_pt", 0.6)))
+            for a, b in mk.get("segs_mm", []):
+                p.drawLine(self._pt(a), self._pt(b))
+        elif kind == "polyline":
+            pts = mk.get("pts_mm", [])
+            if len(pts) >= 2:
+                p.setPen(self._pen(stroke or fg.name(), mk.get("width_pt", 1.0),
+                                   str(mk.get("dash", "solid"))))
+                p.setBrush(Qt.NoBrush)
+                p.drawPolyline(QPolygonF([self._pt(q) for q in pts]))
+        elif kind == "polygon":
+            pts = mk.get("pts_mm", [])
+            if len(pts) >= 3:
+                p.setPen(self._pen(stroke, mk.get("width_pt", 0.5)) if stroke else Qt.NoPen)
+                p.setBrush(self._qcolor(mk.get("fill")) if mk.get("fill") else Qt.NoBrush)
+                p.drawPolygon(QPolygonF([self._pt(q) for q in pts]))
+        elif kind == "markers":
+            rad = float(mk.get("size_pt", 3.0)) * PT / 2.0
+            fills = mk.get("fills")
+            shape = str(mk.get("shape", "circle"))
+            pen = self._pen(stroke, 0.5) if stroke else Qt.NoPen
+            for k, q in enumerate(mk.get("pts_mm", [])):
+                fill = fills[k] if fills and k < len(fills) else mk.get("fill")
+                p.setBrush(self._qcolor(fill) if fill else Qt.NoBrush)
+                p.setPen(pen)
+                c = self._pt(q)
+                self._marker(p, shape, c.x(), c.y(), rad, self._qcolor(fill or stroke or fg))
+            labels = mk.get("labels")
+            if labels:
+                p.setFont(page_font(self.style, float(self.style.get("font_pt", 8.0)) * 0.8))
+                p.setPen(QPen(fg, 0))
+                for q, txt in zip(mk.get("pts_mm", []), labels):
+                    if txt:
+                        c = self._pt(q)
+                        p.drawText(QPointF(c.x() + rad * 1.4, c.y() - rad * 0.8), str(txt))
+        elif kind == "rects":
+            p.setPen(self._pen(stroke, mk.get("width_pt", 0.5)) if stroke else Qt.NoPen)
+            p.setBrush(self._qcolor(mk.get("fill")) if mk.get("fill") else Qt.NoBrush)
+            for rc in mk.get("rects_mm", []):
+                p.drawRect(self._rect(rc))
+        elif kind == "box":
+            p.setPen(self._pen(stroke or fg.name(), mk.get("width_pt", 1.0)))
+            p.setBrush(self._qcolor(mk.get("fill")) if mk.get("fill") else Qt.NoBrush)
+            p.drawRect(self._rect(mk["rect_mm"]))
+            a, b = mk["median_mm"]
+            p.drawLine(self._pt(a), self._pt(b))
+            for seg in list(mk.get("whiskers_mm", [])) + list(mk.get("caps_mm", [])):
+                p.drawLine(self._pt(seg[0]), self._pt(seg[1]))
+        elif kind == "cells":
+            p.setPen(Qt.NoPen)
+            for cell in mk.get("cells", []):
+                fill = cell.get("fill")
+                if fill is None:
+                    continue
+                p.setBrush(self._qcolor(fill))
+                if "rect_mm" in cell:
+                    p.drawRect(self._rect(cell["rect_mm"]))
+                elif cell.get("pts_mm"):
+                    p.drawPolygon(QPolygonF([self._pt(q) for q in cell["pts_mm"]]))
+        elif kind == "wedge":
+            p.setPen(self._pen(stroke or fg.name(), mk.get("width_pt", 0.4)))
+            p.setBrush(self._qcolor(mk.get("fill")) if mk.get("fill") else Qt.NoBrush)
+            for wd in mk.get("wedges", []):
+                c = self._pt((wd["cx_mm"], wd["cy_mm"]))
+                r1 = mm(float(wd["r1_mm"]))
+                path = QPainterPath(c)
+                path.arcTo(QRectF(c.x() - r1, c.y() - r1, 2 * r1, 2 * r1),
+                           float(wd["a0_deg"]), float(wd["a1_deg"]) - float(wd["a0_deg"]))
+                path.closeSubpath()
+                p.drawPath(path)
+        elif kind == "rings":
+            p.setPen(self._pen(stroke or "#808080", mk.get("width_pt", 0.4), "dashed"))
+            p.setBrush(Qt.NoBrush)
+            for rg in mk.get("rings", []):
+                c = self._pt((rg["cx_mm"], rg["cy_mm"]))
+                p.drawEllipse(c, mm(float(rg["r_mm"])), mm(float(rg["r_mm"])))
+        elif kind == "bracket":
+            p.setPen(self._pen(stroke or fg.name(), mk.get("width_pt", 0.6)))
+            x0, x1 = float(mk["x0_mm"]), float(mk["x1_mm"])
+            y, d = float(mk["y_mm"]), float(mk.get("drop_mm", 1.0))
+            p.drawLine(self._pt((x0, y + d)), self._pt((x0, y)))
+            p.drawLine(self._pt((x0, y)), self._pt((x1, y)))
+            p.drawLine(self._pt((x1, y)), self._pt((x1, y + d)))
+
+    @staticmethod
+    def _marker(p: QPainter, shape: str, x: float, y: float, r: float, col: QColor) -> None:
+        if shape == "square":
+            p.drawRect(QRectF(x - r, y - r, 2 * r, 2 * r))
+        elif shape == "triangle":
+            p.drawPolygon(QPolygonF([QPointF(x, y - r), QPointF(x + r, y + r),
+                                     QPointF(x - r, y + r)]))
+        elif shape == "diamond":
+            p.drawPolygon(QPolygonF([QPointF(x, y - r), QPointF(x + r, y), QPointF(x, y + r),
+                                     QPointF(x - r, y)]))
+        elif shape in ("cross", "plus"):
+            pen = QPen(col, max(0.3, r * 0.45))
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            if shape == "plus":
+                p.drawLine(QPointF(x - r, y), QPointF(x + r, y))
+                p.drawLine(QPointF(x, y - r), QPointF(x, y + r))
+            else:
+                p.drawLine(QPointF(x - r, y - r), QPointF(x + r, y + r))
+                p.drawLine(QPointF(x - r, y + r), QPointF(x + r, y - r))
+        else:
+            p.drawEllipse(QPointF(x, y), r, r)
+
+    def _paint_text(self, p: QPainter, tx: Mapping[str, Any]) -> None:
+        pt = float(tx.get("pt", 8.0))
+        f = page_font(self.style, pt, bold=bool(tx.get("bold")))
+        p.setFont(f)
+        fm = QFontMetricsF(f)
+        text = str(tx.get("text", ""))
+        w, asc, desc = fm.horizontalAdvance(text), fm.ascent(), fm.descent()
+        hz, _sep, vt = str(tx.get("anchor", "start")).partition("_")
+        dx = -w / 2 if hz == "middle" else (-w if hz == "end" else 0.0)
+        dy = asc if vt == "top" else ((asc - desc) / 2 if vt == "middle"
+                                      else (-desc if vt == "bottom" else 0.0))
+        p.setPen(QPen(self._qcolor(tx.get("color", "#111111")), 0))
+        p.save()
+        p.translate(self._pt((tx["x_mm"], tx["y_mm"])))
+        rot = float(tx.get("rotate", 0.0))
+        if rot:
+            p.rotate(rot)
+        p.drawText(QPointF(dx, dy), text)
+        p.restore()
+
+    def _paint_legend(self, p: QPainter, leg: Mapping[str, Any], fg: QColor) -> None:
+        rr = self._rect(leg["rect_mm"])
+        if leg.get("fill"):
+            p.setPen(Qt.NoPen)
+            p.setBrush(self._qcolor(leg["fill"]))
+            p.drawRect(rr)
+        f = page_font(self.style, float(leg.get("pt", 8.0)))
+        p.setFont(f)
+        fm = QFontMetricsF(f)
+        lh = mm(float(leg.get("line_h_mm", 3.0)))
+        x0 = rr.x() + mm(0.8)
+        for k, e in enumerate(leg.get("entries", [])):
+            cy = rr.y() + mm(0.6) + k * lh + lh / 2
+            col = self._qcolor(e.get("color", fg.name()))
+            if e.get("fill"):
+                p.setPen(Qt.NoPen)
+                p.setBrush(col)
+                p.drawRect(QRectF(x0, cy - lh * 0.3, mm(3.0), lh * 0.6))
+            elif e.get("line"):
+                p.setPen(self._pen(col, 1.0))
+                p.drawLine(QPointF(x0, cy), QPointF(x0 + mm(3.0), cy))
+            if e.get("marker"):
+                p.setPen(Qt.NoPen)
+                p.setBrush(col)
+                self._marker(p, str(e["marker"]), x0 + mm(1.5), cy, mm(0.6), col)
+            p.setPen(QPen(fg, 0))
+            p.drawText(QPointF(rr.x() + mm(5.0), cy + (fm.ascent() - fm.descent()) / 2),
+                       str(e.get("label", "")))
+
+    def _paint_colorbar(self, p: QPainter, cb: Mapping[str, Any], fg: QColor) -> None:
+        from nodegraph.catalog._shared.overlay_math import colormap_lut
+        bar = self._rect(cb["rect_mm"])
+        lut = colormap_lut(str(cb.get("cmap", "viridis")))
+        ramp = np.repeat(lut[::-1][:, None, :], 2, axis=1)
+        ramp = np.ascontiguousarray(np.concatenate(
+            [ramp, np.full(ramp.shape[:2] + (1,), 255, np.uint8)], axis=2))
+        img = QImage(ramp.data, ramp.shape[1], ramp.shape[0], 4 * ramp.shape[1],
+                     QImage.Format_RGBA8888).copy()
+        p.save()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(bar, img)
+        p.restore()
+        p.setPen(self._pen(fg, 0.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(bar)
+        f = page_font(self.style, float(cb.get("pt", 8.0)) * 0.85)
+        p.setFont(f)
+        fm = QFontMetricsF(f)
+        widest = 0.0
+        for t in cb.get("ticks", []):
+            y = self._pt((0.0, float(t["pos_mm"]))).y()
+            p.drawLine(QPointF(bar.right(), y), QPointF(bar.right() + mm(0.6), y))
+            label = str(t["label"])
+            p.drawText(QPointF(bar.right() + mm(0.9), y + (fm.ascent() - fm.descent()) / 2),
+                       label)
+            widest = max(widest, fm.horizontalAdvance(label))
+        if cb.get("label"):
+            label = str(cb["label"])
+            p.save()
+            p.translate(bar.right() + mm(0.9) + widest + mm(1.2) + fm.ascent(),
+                        bar.center().y())
+            p.rotate(90)
+            p.drawText(QPointF(-fm.horizontalAdvance(label) / 2, 0.0), label)
+            p.restore()
+
+
 ITEM_CLASSES = {
+    "chart": ChartItem,
     "image": ImageItem, "montage": MontageItem, "colorbar": ColorbarItem,
     "histogram": HistogramItem, "scale_bar": ScaleBarItem, "text": TextItem,
     "letter": LetterItem, "shape": ShapeItem, "line": LineItem, "arrow": ArrowItem,

@@ -385,12 +385,21 @@ class _FigureHost:
         return out
 
     def envelopes(self, page_id: str) -> Dict[str, Any]:
+        """Per source id, and per data entry id (step 4: its terminal stage's envelope on
+        the figure page's own graph)."""
         fig = self.figure_state(page_id)
-        return fig.envelopes(self._w.workspace, page_id) if fig is not None else {}
+        if fig is None:
+            return {}
+        ws = self._w.workspace
+        out = dict(fig.envelopes(ws, page_id))
+        page = ws.pages.get(page_id)
+        if page is not None and fig.data:
+            out.update(fig.data_envelopes(page))
+        return out
 
     def run_ids(self, page_id: str) -> Dict[str, str]:
         fig = self.figure_state(page_id)
-        if fig is None or not fig.sources:
+        if fig is None or not (fig.sources or fig.data):
             return {}
         comp = self._w.workspace.compose(page_id)
         return fig.run_ids(comp, page_id)

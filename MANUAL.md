@@ -446,8 +446,10 @@ journal-sized page you place things on. What it can show is whatever the pages b
 *publish* as Page Outputs, read from their metadata before anything is computed.
 
 1. **Start.** An empty Analysis page asks *What do you want to make?* — Overlay, Montage,
-   Plot + Overlay (charts arrive in step 4). Each card says what it needs and what the
-   upstream pages carry. Pick one, or press one of the image sources listed under it.
+   Plot, Plot + Overlay (Table and Movie arrive later). Each card says what it needs and
+   what the upstream pages carry. Pick one, or press one of the image sources listed under
+   it. *Plot* places a histogram of the first table's first measured column (`area` when
+   the table has it) — something drawn at once, to edit from.
 2. **Sources** (left) lists every Page Output of the pages before this one, grouped by
    page, with what each carries: the image and its channels, the label / point / track
    tables and their columns, the measured fields. **Drag a source onto the page** to place
@@ -472,9 +474,27 @@ journal-sized page you place things on. What it can show is whatever the pages b
    correlation grid). A colour bar, a histogram of a channel with its window marked, a
    standalone scale bar, text, a letter, an arrow, a line, a shape and a measurement line
    are items of their own.
-6. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
+6. **Charts** (V5.00 step 4) are items like any other, drawn from the tables a source
+   carries: XY (scatter / line, grouped, with error bars or a band and a linear / power /
+   exponential / Langmuir fit), time series on the frame clock, bars with SEM / SD / CI,
+   distributions (histogram, KDE, box, violin, ECDF, strip, SuperPlot) with a test and its
+   brackets, heat map, hexbin density, MSD and survival from a track table, a rose of
+   angles. **Drag a column onto a chart** to make it the chart's Y (or value); the chart
+   form in Properties picks the kind, the source or data entry, the table and the
+   columns, the draw mode, error, fit, test, axis labels and ranges, legend and colour
+   map. **Hover a marker** of an XY chart: the status line reads the point's data and
+   its object id, and that object is ringed on every image of the same source on the
+   page (or on the targets of a *highlight* link) — the plot and the image read the same
+   result. **Filter / summarise** on a chart gives it a **data entry**: its source's table
+   kept where up to four `column op value` terms hold, summarised one row per group
+   (group by `t` for one row per frame, `condition, t` per condition and frame) with mean,
+   median, sum, min, max, count, std or sem of a column. A data entry compiles into the
+   page's hidden graph as real nodes (Table Concat for pooled sources → If/Else → Table
+   Aggregate) and is fetched by *Compute sources* like a source — nothing is computed
+   until you ask, and the memo keeps what was.
+7. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
    paths) or PDF (fonts embedded). The preview and the export are one set of lines.
-7. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
+8. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
    the paper-readiness checks (a missing scale bar, an inset with no box, a red / green
    merge, twins that do not share a display range, an unlabelled colour bar). A V4 file's
    Analysis page that held nodes opens as a Free page named *(graph)*.
