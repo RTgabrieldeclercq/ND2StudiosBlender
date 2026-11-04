@@ -245,7 +245,10 @@ class FigureEditorPanel(QWidget):
         self.start.hide()
         self.start.goal_chosen.connect(self._on_goal)
         self.start.source_chosen.connect(lambda v: self.add_image(v))
+        self.start.recipe_chosen.connect(self.apply_recipe)
         self.start.dismissed.connect(self._dismiss_start)
+        from nodelab_v2.figure_editor.fonts import ensure_page_fonts
+        ensure_page_fonts()
 
         self.scene.selectionChanged.connect(self._on_selection)
         self.scene.geometry_edited.connect(self._on_geometry_edited)
@@ -1098,9 +1101,13 @@ class FigureEditorPanel(QWidget):
             md = dict(getattr(env, "metadata", None) or {})
             if not md and chart.get("source"):
                 md = dict(getattr(self._envs.get(str(chart["source"])), "metadata", None) or {})
+            rect = [float(v) for v in spec["rect_mm"]]
+            if spec.get("letter"):                   # the letter sits above the axes
+                drop = float(page.get("font_pt", 8.0)) * 1.25 * FL.PT_MM + 1.0
+                rect = [rect[0], rect[1] + drop, rect[2], max(5.0, rect[3] - drop)]
             try:
                 series, units, note = CD.resolve_series(chart, self._tables_of(rid, payload), md)
-                geometry = (CD.chart_geometry(chart, series, spec["rect_mm"], page, units=units)
+                geometry = (CD.chart_geometry(chart, series, rect, page, units=units)
                             if not note else None)
             except Exception as exc:           # noqa: BLE001 — a chart that cannot draw says why
                 series, geometry, note = None, None, f"{type(exc).__name__}: {exc}"
@@ -1556,6 +1563,42 @@ class FigureEditorPanel(QWidget):
                 self.add_image(str(imgs[0]["value"]))
             if tabs:
                 self.add_chart(str(tabs[0]["value"]))
+
+    def apply_recipe(self, recipe: Any, picks: Optional[Mapping[str, str]] = None
+                     ) -> List[str]:
+        """Start the page from a figure template (``recipe``: a slug, a name or a
+        :class:`~nodelab_v2.figure_recipes.FigureRecipe`): its slots bound to the catalog
+        (``picks`` = ``{slot: Page Output value}`` to choose), the document committed as
+        the page. Returns the slots nothing upstream could fill (their items stay, with
+        their source unbound, for the user to point)."""
+        from nodelab_v2 import figure_recipes as FR
+        rec = recipe if isinstance(recipe, FR.FigureRecipe) else FR.find_recipe(str(recipe))
+        if rec is None:
+            self._status.setText(f"no figure template named {recipe!r}")
+            return []
+        catalog = [dict(describe_envelope(c.get("env")), value=c["value"], label=c.get("label"),
+                        page=c.get("page")) for c in self.sources_panel.catalog]
+        doc, missing = FR.bind_recipe(rec, catalog)
+        doc.setdefault("goal", rec.goal or None)
+        self.commit(doc)
+        self.start.hide()
+        self._doc["_dismissed"] = True
+        if missing:
+            self._status.setText(f"template {rec.name!r}: nothing upstream fills "
+                                 f"{', '.join(missing)} — bind the source in Properties")
+        else:
+            self._status.setText(f"template {rec.name!r} placed — Compute sources draws it")
+        return missing
+
+    def save_as_recipe(self, name: str, description: str = "") -> str:
+        """Save this figure as a template of the user's own (``~/.nd2studios/figure_recipes``)."""
+        from nodelab_v2 import figure_recipes as FR
+        catalog = [dict(describe_envelope(c.get("env")), value=c["value"], label=c.get("label"))
+                   for c in self.sources_panel.catalog]
+        rec = FR.recipe_from_figure(self._doc, catalog, name=name, description=description)
+        path = FR.save_recipe(rec)
+        self._host.status(f"figure template saved: {path}")
+        return str(path)
 
     def _sync_status(self) -> None:
         if self._fig is None:

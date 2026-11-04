@@ -785,6 +785,32 @@ from the nearest-centre tile), so Stitch between the Field cards and `plot.field
 field over the whole mosaic. A merged mosaic is rarely one lattice, so it is drawn as a
 scattered field. `plot.field` thins its arrows on a spatial grid, at most 2500 a view.
 
+### CON-29 — figure document, shadow graph and figure job
+anchors: sym:nodegraph.figure.schema.normalize, sym:nodelab_v2.figure_document.FigureDocument.sync_shadow, sym:nodelab_v2.figure_document.FigureDocument.run_ids, sym:nodelab_v2.figure_render.build_job, sym:nodelab_v2.figure_render.render_job, sym:nodelab_v2.figure_recipes.bind_recipe
+
+A **figure document** (V5.00, schema `nd2studios-figure/1`) is what an Analysis page IS:
+a page in millimetres, `sources` (each a Page Output value `<page>:<name>`), `data` entries
+(a source pooled, filtered, summarised), `items` (image, montage, chart, table, legend,
+colour bar, histogram, scale bar, text, letter, arrow, line, shape, measure line) and
+`links` between items (a popout's zoom box on its parent, twins, a shared display range,
+the page cursor, a chart's highlight targets). `schema.normalize` fills every default and
+checks every value, naming the spec path of the first bad one; `schema.digest` is the
+document's identity. The page's own `GraphDocument` is the figure's **shadow graph**:
+`FigureDocument.sync_shadow` keeps one hidden `page.input` per source and the data
+entries' stages (`table.concat` → `analysis.if_else` → `table.aggregate`) in step with the
+figure, so `Workspace.compose`, the memo, the revision fence and the LabLink publisher see
+ordinary nodes, and `FigureDocument.run_ids` maps every source and data id to a run id in
+the composed graph. The editor (`FigureEditorPanel`) reads payloads by those run ids and
+paints items in page units — plain pens, the page font — so the screen, the export and
+the headless render are one drawing. A **figure job** (`figure_render.build_job`) is the
+window-free form of a render: the composed graph, the figure, its run ids and a seed per
+loader (a file path or the synthetic stack); `render_job` runs it under the offscreen
+platform through the same panel, driven by a host that answers from a headless engine.
+A **figure recipe** is a document with slots in place of sources; `bind_recipe` fills
+them from the page's catalog. Rules: INV-18. Flows: WF-10.
+
+see: CON-17 · WF-08 · WF-10 · INV-18 · [MANUAL §2c](../MANUAL.md)
+
 ### CON-27 — resource governor
 anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold
 

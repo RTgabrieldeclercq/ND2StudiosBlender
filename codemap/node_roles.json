@@ -42,7 +42,7 @@
     "analyze": {
       "label": "Analysis",
       "order": 3,
-      "description": "Synthesize the outputs of refinement and processing pages: overlays, plots and tables, written out as figures, movies and TIFFs."
+      "description": "Compose the figure (V5.00): an Analysis page is the Figure Editor, a journal-sized page of images, overlays, popouts, charts, tables and legends read from what the refinement and processing pages publish, exported as PNG / SVG / PDF with its bundle; its hidden graph carries the sources and the data steps."
     }
   },
   "roles": {

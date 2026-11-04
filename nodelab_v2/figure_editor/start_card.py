@@ -68,6 +68,8 @@ class StartCard(QWidget):
 
     goal_chosen = Signal(str)
     source_chosen = Signal(str)
+    #: a figure template was picked: its slug (``nodelab_v2.figure_recipes``)
+    recipe_chosen = Signal(str)
     dismissed = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -101,6 +103,13 @@ class StartCard(QWidget):
         self.sources_row = QHBoxLayout()
         self.sources_row.setSpacing(6)
         outer.addLayout(self.sources_row)
+        self.recipes_label = QLabel("Or start from a template:")
+        self.recipes_label.setProperty("role", "muted")
+        outer.addWidget(self.recipes_label)
+        self.recipes_row = QHBoxLayout()
+        self.recipes_row.setSpacing(6)
+        outer.addLayout(self.recipes_row)
+        self._recipe_buttons: List[QPushButton] = []
         row = QHBoxLayout()
         row.addStretch(1)
         self.skip = QPushButton("Start empty")
@@ -158,6 +167,28 @@ class StartCard(QWidget):
             self.sources_row.addWidget(b)
             self._source_buttons.append(b)
         self.sources_label.setVisible(bool(images))
+        # figure templates (step 6): the recipes the catalog can fill
+        from nodelab_v2 import figure_recipes as FR
+        for b in self._recipe_buttons:
+            b.setParent(None)
+            b.deleteLater()
+        self._recipe_buttons = []
+        try:
+            recipes = FR.list_recipes()
+        except Exception:                 # noqa: BLE001 — a damaged user folder lists nothing
+            recipes = []
+        for r in recipes:
+            ok = FR.applicable(r, catalog)
+            b = QPushButton(r.name)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setEnabled(ok)
+            need = "; ".join(f"{s.get('label') or s['needs']}" for s in r.slots)
+            b.setToolTip(f"{r.description}\n\nNeeds: {need}" + ("" if ok else
+                         "\n\nNothing upstream carries what this template needs yet"))
+            b.clicked.connect(lambda _=False, s=r.slug: self.recipe_chosen.emit(s))
+            self.recipes_row.addWidget(b)
+            self._recipe_buttons.append(b)
+        self.recipes_label.setVisible(bool(recipes))
 
     def restyle(self) -> None:
         def h(c) -> str:

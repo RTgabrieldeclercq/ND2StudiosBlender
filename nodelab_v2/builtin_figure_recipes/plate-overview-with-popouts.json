@@ -1,0 +1,33 @@
+{
+  "format": "nd2studios.figure-recipe/1",
+  "name": "Plate overview with popout",
+  "description": "Every position of a multi-point acquisition as a montage with one shared display range, and a magnified popout of the centre of the first field with its box drawn on the tile.",
+  "goal": "montage",
+  "tags": ["montage", "plate", "overview"],
+  "slots": [
+    {"id": "plate", "needs": "image", "label": "an image stream (several positions make the montage)"}
+  ],
+  "figure": {
+    "goal": "montage",
+    "page": {"preset": "double_column", "width_mm": 180.0, "height_mm": 120.0, "dpi": 300,
+             "style": "paper", "font": "sans", "font_pt": 8.0, "palette": "colorblind",
+             "letters": "A"},
+    "sources": [{"id": "plate", "source": "slot:plate"}],
+    "items": [
+      {"id": "overview", "kind": "montage", "rect_mm": [4.0, 4.0, 110.0, 82.0], "letter": "A",
+       "image": {"source": "plate", "frame": {"m": 0, "t": "cursor", "z": "max"},
+                 "channels": [], "decor": {"scale_bar_um": 50.0}},
+       "montage": {"tile_by": "m", "columns": 0, "gap_mm": 0.6, "labels": "auto"}},
+      {"id": "popout", "kind": "image", "rect_mm": [120.0, 4.0, 56.0, 42.0], "letter": "B",
+       "image": {"source": "plate", "frame": {"m": 0, "t": "cursor", "z": "max"},
+                 "channels": [],
+                 "region": {"from": "rect_frac", "rect_frac": [0.3, 0.7, 0.3, 0.7]},
+                 "decor": {"scale_bar_um": 10.0}}}
+    ],
+    "links": [
+      {"kind": "zoom", "parent": "overview", "child": "popout",
+       "box": {"color": "#ffffff", "width_pt": 0.75, "leaders": true}},
+      {"kind": "lut_share", "items": ["overview", "popout"]}
+    ]
+  }
+}

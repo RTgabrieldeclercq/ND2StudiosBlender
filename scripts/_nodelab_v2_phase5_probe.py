@@ -365,6 +365,19 @@ def _probe_figure_editor(win, app) -> None:
     if _stop(1):
         return
     assert ed.start.isVisible(), "the start card shows on an empty figure page"
+    # a figure template (step 6): the card lists them, applying one places its items
+    names = {b.text(): b.isEnabled() for b in ed.start._recipe_buttons}
+    assert names.get("Segment & measure summary") is True \
+        and names.get("Tracking summary") is False, names    # no track table upstream
+    missing = ed.apply_recipe("segment-measure-summary")
+    app.processEvents()
+    assert not missing and {it["kind"] for it in ed.document["items"]} >= \
+        {"image", "chart", "table", "legend"}, (missing, ed.document["items"])
+    assert ed.document["sources"][0]["source"] == f"{pids['process']}:cells" \
+        and not ed.start.isVisible()
+    ed.commit(_FS.new_document())                          # back to the empty page
+    app.processEvents()
+    assert ed.start.isVisible() and not ed.document["items"] and not an.doc.nodes
     cat = {r["value"]: r for r in ed.sources_panel.catalog}
     assert f"{pids['input']}:raw" in cat and f"{pids['process']}:cells" in cat, list(cat)
     d = _describe(cat[f"{pids['process']}:cells"]["env"])

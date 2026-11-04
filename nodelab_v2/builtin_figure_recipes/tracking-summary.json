@@ -1,0 +1,41 @@
+{
+  "format": "nd2studios.figure-recipe/1",
+  "name": "Tracking summary",
+  "description": "The tracked field with its trails, the mean squared displacement with its exponent, the survival of tracks over time and a table of track lifetimes.",
+  "goal": "composite",
+  "tags": ["tracking", "motility"],
+  "slots": [
+    {"id": "tracks", "needs": "tracks", "label": "a tracked image (Track Objects) — the image with its track table"}
+  ],
+  "figure": {
+    "goal": "composite",
+    "page": {"preset": "double_column", "width_mm": 180.0, "height_mm": 120.0, "dpi": 300,
+             "style": "paper", "font": "sans", "font_pt": 8.0, "palette": "colorblind",
+             "letters": "A"},
+    "sources": [{"id": "tracks", "source": "slot:tracks"}],
+    "items": [
+      {"id": "field", "kind": "image", "rect_mm": [4.0, 4.0, 84.0, 63.0], "letter": "A",
+       "image": {"source": "tracks", "frame": {"m": 0, "t": "cursor", "z": "max"},
+                 "channels": [],
+                 "layers": [{"domain": "track", "layer": "slot:tracks.tracks", "kind": "tracks",
+                             "look": {"tail": 0, "line_width": 0.6, "show_ids": false,
+                                      "fade": true}, "opacity": 100}],
+                 "decor": {"scale_bar_um": 20.0, "time_stamp": "elapsed"}}},
+      {"id": "msd", "kind": "chart", "rect_mm": [96.0, 4.0, 80.0, 52.0], "letter": "B",
+       "chart": {"kind": "msd", "source": "tracks", "domain": "track",
+                 "table": "slot:tracks.tracks", "bins": 40,
+                 "axes": {"title": "", "x_label": "", "y_label": "", "log_x": true,
+                          "log_y": true},
+                 "legend": {"show": true, "loc": "inside"}}},
+      {"id": "survival", "kind": "chart", "rect_mm": [4.0, 70.0, 84.0, 46.0], "letter": "C",
+       "chart": {"kind": "survival", "source": "tracks", "domain": "track",
+                 "table": "slot:tracks.tracks",
+                 "axes": {"title": "", "x_label": "", "y_label": ""}}},
+      {"id": "lifetimes", "kind": "table", "rect_mm": [96.0, 62.0, 80.0, 28.0], "letter": "D",
+       "table": {"source": "tracks", "domain": "track", "table": "slot:tracks.tracks",
+                 "columns": ["track_length"], "group_by": "",
+                 "stats": ["n", "mean", "median", "max"], "decimals": 1}}
+    ],
+    "links": []
+  }
+}
