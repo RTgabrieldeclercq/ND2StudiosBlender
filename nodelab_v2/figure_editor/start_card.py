@@ -24,13 +24,15 @@ GOALS: Tuple[Tuple[str, str, str, str], ...] = (
     ("plot", "Plot", "A chart of measured columns — scatter, bars, distributions, time "
                      "series, MSD.", "a table"),
     ("table", "Table", "A summary table per group, formatted for a paper.", "a table"),
-    ("movie", "Movie", "A movie of the result — opens the Movie Editor on a Free page.",
-     "an image stream"),
+    ("report", "Report", "The figure with a caption per panel and the legend text, as "
+                         "HTML and PDF.", "an image stream or a table"),
+    ("movie", "Movie", "A movie of an image — Export Movie on a Free page, opened in the "
+                       "Movie Editor (also *Movie…* on any image item).", "an image stream"),
 )
 
 #: goals the editor can start in this build (the others name the step that adds them)
 AVAILABLE = {"overlay": "", "montage": "", "composite": "", "plot": "", "table": "",
-             "movie": "the movie hand-off arrives in step 7"}
+             "report": "", "movie": ""}
 
 
 class _GoalCard(QFrame):
@@ -95,7 +97,7 @@ class StartCard(QWidget):
             card = _GoalCard(key, title, blurb)
             card.chosen.connect(self.goal_chosen)
             self.cards[key] = card
-            grid.addWidget(card, k // 3, k % 3)
+            grid.addWidget(card, k // 4, k % 4)
         outer.addLayout(grid)
         self.sources_label = QLabel("Start with an image:")
         self.sources_label.setProperty("role", "muted")
@@ -147,6 +149,10 @@ class StartCard(QWidget):
             elif key in ("plot", "table"):
                 card.have.setText(have(tab_txt if n_tab else ""))
                 ok = n_tab > 0
+            elif key == "report":
+                parts = [p for p, n in ((img_txt, n_img), (tab_txt, n_tab)) if n]
+                card.have.setText(have("; ".join(parts)))
+                ok = n_img > 0 or n_tab > 0
             else:
                 parts = [p for p, n in ((img_txt, n_img), (tab_txt, n_tab)) if n]
                 if fields:

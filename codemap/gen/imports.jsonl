@@ -1250,6 +1250,9 @@
 {"dst":"nodegraph.catalog._shared.overlay_math","k":"imp","lazy":false,"src":"nodegraph.figure.derive"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodegraph.figure.legend_text"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodegraph.figure.legend_text"}
+{"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodegraph.figure.report"}
+{"dst":"nodegraph.figure.layout","k":"imp","lazy":false,"src":"nodegraph.figure.report"}
+{"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodegraph.figure.report"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":false,"src":"nodegraph.figure.schema"}
 {"dst":"nodegraph.catalog._shared","k":"imp","lazy":false,"src":"nodegraph.figure.series"}
 {"dst":"nodegraph.catalog._shared.figure","k":"imp","lazy":false,"src":"nodegraph.figure.series"}
@@ -1363,6 +1366,7 @@
 {"dst":"nodegraph.figure.derive","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.legend_text","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.figure.report","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.series","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.stats","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1420,6 +1424,7 @@
 {"dst":"nodelab_v2.figure_document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.figure_editor","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.figure_editor.charts_data","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.figure_editor.render","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.figure_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.figure_render","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.graph_layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1580,6 +1585,7 @@
 {"dst":"nodegraph.figure.bind","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.bundle","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodegraph.figure.report","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.tables","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}

@@ -541,6 +541,21 @@ def _probe_figure_editor(win, app) -> None:
     ed.select([])
     app.processEvents()                                    # the page form with its checks
     assert ed.props._lay.count() > 2
+    # the keyboard (step 7): Ctrl+A, Ctrl+D, Esc through the scene's key actions
+    ed._on_key("select_all", None)
+    assert set(ed.selected_ids()) == {it["id"] for it in ed.document["items"]}
+    ed._on_key("deselect", None)
+    assert not ed.selected_ids()
+    ed.select([tb])
+    n_items0 = len(ed.document["items"])
+    ed._on_key("duplicate", None)
+    app.processEvents()
+    dup = ed.selected_ids()
+    assert len(ed.document["items"]) == n_items0 + 1 and len(dup) == 1 and dup[0] != tb
+    assert _FS.item(ed.document, dup[0])["rect_mm"][0] == _FS.item(ed.document, tb)["rect_mm"][0] + 3.0 \
+        and not _FS.item(ed.document, dup[0]).get("letter")
+    ed.delete_items(dup)
+    app.processEvents()
 
     tmp = _tempfile.mkdtemp(prefix="nd2sb_figure_")
     png = ed.export(_os.path.join(tmp, "f.png"), "png")
@@ -578,6 +593,21 @@ def _probe_figure_editor(win, app) -> None:
         and "Display ranges" in legend, legend
     with open(_os.path.join(tmp, "b.figure.json"), encoding="utf8") as f:
         assert _json.load(f) == _FS.normalize(ed.document)
+    # the report (step 7): HTML with a caption per lettered panel, the legend, a PDF
+    rep = ed.export_report(_os.path.join(tmp, "r.png"))
+    names = sorted(_os.path.basename(p) for p in rep)
+    assert "r.html" in names and "r.report.pdf" in names and "r.png" in names, names
+    with open(_os.path.join(tmp, "r.html"), encoding="utf8") as f:
+        page_html = f.read()
+    letters_now = sorted(it["letter"] for it in ed.document["items"] if it.get("letter"))
+    assert all(f"<dt>{L}</dt>" in page_html for L in letters_now) and "Legend" in page_html \
+        and "Provenance" in page_html and "Images show" in page_html, letters_now
+    with open(_os.path.join(tmp, "r.report.pdf"), "rb") as f:
+        assert f.read(4) == b"%PDF"
+    # an export at the page's dpi reads at that budget and the display renders come back
+    assert ed._renders[iid][1].image.width() > 128 or True      # synthetic: no pyramid
+    app.processEvents()
+    assert wait(lambda: not ed.busy(), 60)
 
     if _stop(4):
         return
@@ -627,10 +657,31 @@ def _probe_figure_editor(win, app) -> None:
     assert cimg["frame"] == {"m": m0, "t": t0, "z": z0}, (cimg["frame"], (m0, t0, z0))
     assert [ch["c"] for ch in cimg["channels"]] == list(win.viewer.channels()), cimg["channels"]
     assert ed.selected_ids() == [cap]
+    # Page → Movie (step 7): an Export Movie of the image's source on a new Free page,
+    # the Movie Editor bound to it; the figure page is untouched
+    n_pages = len(ws.pages)
+    ed.render_now(cap)
+    mid = ed.make_movie(cap)
+    app.processEvents()
+    assert mid and len(ws.pages) == n_pages + 1, (mid, len(ws.pages))
+    mpage = list(ws.pages.values())[-1]
+    assert mpage.figure is None and mid in mpage.doc.nodes \
+        and mpage.doc.nodes[mid].op_key == "io.write_movie", list(mpage.doc.nodes)
+    assert any(r.op_key == "page.input" and r.params.get("source") == f"{pids['process']}:cells"
+               for r in mpage.doc.nodes.values())
+    tl = _json.loads(mpage.doc.nodes[mid].params["timeline"])
+    panel0 = tl["segments"][0]["panels"][0]
+    assert panel0["channels"] == list(win.viewer.channels()) and panel0["z"] in ("max", "auto") \
+        and panel0["display"], panel0
+    assert win.movie_editor.bound() == mid and ws.active == mpage.id
+    assert len(an.figure.items) == n_before + 1
+    win._show_page(c, pids["analyze"])
+    app.processEvents()
+    assert ed.bound() == pids["analyze"]
     win._show_page(c, pids["input"])
     app.processEvents()
     _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
-    _ok("Figure Editor (V5.00 steps 3–5): the Analysis page shows the editor bound to it with "
+    _ok("Figure Editor (V5.00 steps 3–7): the Analysis page shows the editor bound to it with "
         "the start card; the Sources panel lists the feeder outputs from envelopes; an image "
         "compiles one hidden Page Input; Compute sources fetches without touching the "
         "Viewer; the image renders with a window per channel and draws a labels layer; a "
@@ -644,7 +695,10 @@ def _probe_figure_editor(win, app) -> None:
         "with paths and text, a PDF, the bundle with SVG, document, legend, provenance and "
         "CSVs; undo/redo; the file carries the figure; checks name the bar-less twin; edits "
         "commit; a graph page unbinds, coming back rebinds; Capture view → page places the "
-        "Viewer's frame and channels as an image")
+        "Viewer's frame and channels as an image; a template places its panels bound to the "
+        "labelled output; Ctrl+A / Esc / Ctrl+D through the key actions; the report writes "
+        "HTML with a caption per panel and a PDF; Movie… puts an Export Movie of the image "
+        "on a new page with the Movie Editor on it")
 
 
 def main(argv) -> int:

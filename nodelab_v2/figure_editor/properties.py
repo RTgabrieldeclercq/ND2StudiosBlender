@@ -557,6 +557,15 @@ class PropertiesPanel(QScrollArea):
             b.setToolTip("A legend of this image's channels and layers")
             b.clicked.connect(lambda _=False: self._panel.add_legend_for(iid))
             row.addWidget(b)
+            b = QPushButton("Movie…")
+            b.setToolTip("An Export Movie of this image's source with its channels, windows "
+                         "and first layer, on a Free page, opened in the Movie Editor")
+            b.clicked.connect(lambda _=False: self._panel.make_movie(iid))
+            row.addWidget(b)
+        b = QPushButton("Duplicate")
+        b.setToolTip("A copy beside it (Ctrl+D)")
+        b.clicked.connect(lambda _=False: self._panel.duplicate_items([iid]))
+        row.addWidget(b)
         if kind == "table":
             b = QPushButton("Fit to content")
             b.clicked.connect(lambda _=False: self._panel.fit_table(iid))
