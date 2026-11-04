@@ -20,7 +20,8 @@ from typing import Dict, Optional, Tuple
 
 from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QTransform
-from PySide6.QtWidgets import QHBoxLayout, QMenu, QTabBar, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QHBoxLayout, QMenu, QStackedWidget, QTabBar, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from nodelab_v2 import theme as T
 
@@ -304,7 +305,13 @@ class CanvasPanel(QWidget):
         self.tabs = PageTabs(self)
         lay.addWidget(self.tabs)
         self.view = GraphView(host.scene_for(page_id))
-        lay.addWidget(self.view)
+        # a FIGURE page (V5.00) shows the Figure Editor where a graph page shows its view;
+        # the tabs above stay, so every page is still one click away
+        self.stack = QStackedWidget(self)
+        self.stack.addWidget(self.view)
+        self.figure = host.make_figure_editor(self)
+        self.stack.addWidget(self.figure)
+        lay.addWidget(self.stack)
         # an EMPTY page: this card invites the first node and steps aside once it has one
         self.welcome = WelcomeCard(self.view)
         # maximized (Ctrl+Space / ⛶): the active Viewer re-homed into this HUD frame
@@ -351,6 +358,23 @@ class CanvasPanel(QWidget):
         text, kind = self._host.page_title(self.page_id)
         self.view.set_page_title(text, kind_icon(kind))
         self.sync_tabs()
+        self.sync_mode()
+
+    def sync_mode(self) -> None:
+        """Show the graph view or the Figure Editor, whichever the page shown is (V5.00)."""
+        if self._host.page_is_figure(self.page_id):
+            if self.figure.bound() != self.page_id:
+                self.figure.bind(self.page_id)
+            if self.stack.currentWidget() is not self.figure:
+                self.stack.setCurrentWidget(self.figure)
+        else:
+            if self.figure.bound() is not None:
+                self.figure.bind(None)
+            if self.stack.currentWidget() is not self.view:
+                self.stack.setCurrentWidget(self.view)
+
+    def is_figure(self) -> bool:
+        return self.stack.currentWidget() is self.figure
 
     def sync_tabs(self) -> None:
         """Mirror the workspace's pages on the tab strip (cheap when nothing changed)."""
@@ -392,6 +416,7 @@ class CanvasPanel(QWidget):
         self.view.restyle()
         self.welcome.restyle()
         self.minimap.restyle()
+        self.figure.restyle()
 
 
 __all__ = ["CanvasPanel", "PageTabs", "PAGE_KIND_COLORS", "kind_icon"]

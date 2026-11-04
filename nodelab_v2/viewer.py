@@ -62,6 +62,7 @@ from nodegraph.mesh import mesh_part as MESH_PART
 from nodegraph.provider import subset_index
 import nodegraph.fieldmap as FV
 from nodelab_v2 import overlays as OV
+from nodelab_v2 import overlay_geometry as OG
 from nodelab_v2 import region_box
 from nodelab_v2 import theme as T
 #: How many channels the GL composite can sample at once. Defined in
@@ -158,7 +159,7 @@ _HOVER_HINT = "hover the image to read a pixel"
 #: objects are neighbours barely changes frame to frame — the pairs deduplicate almost
 #: completely across a series — so an evenly spaced sample of the frames gives the same
 #: graph for a bounded cost, whether the movie is 20 frames or 2000.
-MAX_NEIGHBOR_FRAMES = 64
+MAX_NEIGHBOR_FRAMES = OG.MAX_NEIGHBOR_FRAMES
 
 #: Above this many distinct objects the neighbour de-confliction is skipped. It runs on the
 #: GUI thread, once per delivered payload — under the troubleshooting scope that is once
@@ -169,20 +170,11 @@ MAX_NEIGHBOR_FRAMES = 64
 #: second. Every object still keeps ONE colour for the whole series — only the
 #: nudging-apart is dropped, and above a few thousand objects no eye compares neighbouring
 #: hues anyway. Announced once on stderr rather than silently capped.
-MAX_PALETTE_OBJECTS = 10_000
+MAX_PALETTE_OBJECTS = OG.MAX_PALETTE_OBJECTS
 
 
-@dataclass(frozen=True)
-class _Palette:
-    """The viewed dataset's **identity palette**: per layer, an ``id → palette slot`` LUT.
-
-    Built once per dataset by :meth:`ViewerPanel._build_palette` and read by every overlay
-    that colours per item. Dense int arrays rather than dicts because the label fill
-    indexes one straight into its per-pixel colour table.
-    """
-    labels: Dict[Any, np.ndarray] = dc_field(default_factory=dict)   # (LABEL, layer) → LUT
-    points: Dict[Any, np.ndarray] = dc_field(default_factory=dict)   # (POINT, layer) → LUT
-    tracks: Dict[Any, np.ndarray] = dc_field(default_factory=dict)   # track layer → LUT
+#: the identity palette record (moved to overlay_geometry, V5.00 step 3)
+_Palette = OG.Palette
 
 
 def _flat_window(lo: float, hi: float):
@@ -5082,57 +5074,19 @@ class ViewerPanel(QWidget):
         return sorted(set(out))
 
     def _label_source(self) -> Optional[np.ndarray]:
-        """The full-resolution 6-D integer Voxel layer the Labels overlay draws.
-
-        Honours ``overlays.labels.layer`` when it names a raster that is present; otherwise
-        falls back to the historical guess — the one with the most regions in the viewed
-        plane. The fallback is what made this unpredictable: several label rasters on one
-        Dataset is the normal case, so "most regions" silently drew whichever was most
-        fragmented and no click could change it (2026-08-04).
-
-        Shared with :meth:`_label_plane` so the picked raster, the painted outline and the
-        object-size probe can never disagree about WHICH layer is on screen."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return None
-        want = str(getattr(self.overlays.labels, "layer", "") or "").strip()
-        m, t, z, c = self._payload_coords()
-        # Auto prefers the layers the VIEWED NODE itself produced, in declaration order — you
-        # view a node to see what it made (2026-08-04). Ranking every raster on the payload by
-        # id instead drew the seeds branch's labels, or the copied areas raster whose ids are
-        # the SOURCE's (in the hundreds while a handful of its regions survive).
-        rasters = {}
-        for (dom, _layer, name), attr in ds.attributes.items():
-            if dom is not Domain.VOXEL or not name:
-                continue
-            vals = attr.values
-            if np.issubdtype(vals.dtype, np.integer) and vals.ndim == 6:
-                rasters[str(name)] = vals
-        if want:
-            if want in rasters:
-                return rasters[want]       # an explicit pick wins, empty plane or not
-            # named a layer this payload does not carry (a stale pick, or a graph edit that
-            # renamed it) — fall through to the guess rather than draw nothing
-            return self._label_source_auto()
+        """The full-resolution 6-D integer Voxel layer the Labels overlay draws — the
+        picked layer, else the viewed node's own output, else the raster with the most
+        regions on the plane (:func:`nodelab_v2.overlay_geometry.label_source`; moved
+        there, V5.00 step 3). Shared with :meth:`_label_plane` so the picked raster, the
+        painted outline and the object-size probe can never disagree."""
+        own: List[str] = []
         if self.own_layers_cb is not None and self._node_id:
             try:
-                for nm in self.own_layers_cb(self._node_id):
-                    if nm in rasters:
-                        return rasters[nm]
+                own = list(self.own_layers_cb(self._node_id))
             except Exception:  # noqa: BLE001 — a preference must never break the view
-                pass
-        best, best_regions = None, 0
-        for vals in rasters.values():
-            try:
-                plane = vals[m, t, z, c]
-            except IndexError:
-                continue
-            # COUNT the regions; `plane.max()` is the largest id, which a raster carrying
-            # another node's numbering wins on while showing almost nothing
-            regions = int(np.count_nonzero(np.unique(plane)))
-            if regions >= 1 and regions >= best_regions:
-                best, best_regions = vals, regions
-        return best
+                own = []
+        return OG.label_source(self._dataset, self._payload_coords(),
+                               getattr(self.overlays.labels, "layer", ""), own)
 
     def _label_source_auto(self) -> Optional[np.ndarray]:
         """:meth:`_label_source` with the explicit pick ignored — what a STALE pick falls back
@@ -5440,91 +5394,15 @@ class ViewerPanel(QWidget):
 
     def _drop_synth(self, by_layer: Dict[Any, Dict[str, np.ndarray]],
                     domain: Domain) -> Dict[Any, Dict[str, np.ndarray]]:
-        """``by_layer`` without the tables a table node wrote (V4.00): a Table Concat holds
-        other inputs' rows at positions on THEIR images, a Table Join repeats its left
-        table's — drawn over this image they would be detections it does not have. A Points
-        picker naming one still shows it (see :meth:`_point_marks`).
-
-        Nor a PIXEL table (Measure, Members = pixel, 2026-11-02): its rows are the image's own
-        voxels, up to millions of them, and one marker each would bury the picture it was
-        gathered from and stall every repaint. The spreadsheet shows it as a strip; naming
-        it in the Points picker still draws it."""
-        from nodegraph.catalog._shared.table_ops import synthesized
-        from nodegraph.tables import pixel_layers
-        md = getattr(self._dataset, "metadata", None) or {}
-        skip = synthesized(md, domain)
-        if domain is Domain.POINT:
-            skip = skip | pixel_layers(md)
-        if not skip:
-            return by_layer
-        return {k: v for k, v in by_layer.items() if str(k) not in skip}
+        """``by_layer`` without the tables a table node wrote, or a pixel table — see
+        :func:`nodelab_v2.overlay_geometry.drop_synth` (moved there, V5.00 step 3)."""
+        return OG.drop_synth(self._dataset, by_layer, domain)
 
     def _point_marks(self) -> List[OV.PointMark]:
-        """Every Point-domain row that belongs on the viewed frame, as draw-ready marks.
-
-        Positions stay in *structure* coordinates (full-resolution image pixels); the
-        renderer scales them into the displayed plane. The colour key is the point's
-        **palette slot** — its track's when a tracker has linked it, its own id otherwise
-        — so a detection keeps one colour across frames; the layer index is the per-layer
-        key. With ``z_project`` on, off-plane detections come along flagged
-        ``on_plane=False`` and the renderer dims them.
-
-        **``z_project`` is authoritative for every layer, including a 3-D one.** A previous
-        revision made a ``z_kind="subpixel"`` layer project regardless of the setting, on the
-        reasoning that a continuous depth belongs to the volume rather than to one plane. It
-        was the wrong call twice over: the checkbox became inert, and on a real 3-D detection
-        it drew *every* plane's particles at once — thousands of overlapping glyphs at the
-        off-plane opacity blend into one flat wash, so a per-point palette also stopped
-        looking like a palette. The problem it was trying to solve (a plane that holds none
-        of the detections reading as "nothing was detected") is solved by
-        :meth:`_point_tally` reporting the off-plane count in the status line, which costs
-        the picture nothing.
-        """
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return []
-        m, t, z, _c = self._payload_coords()
-        project = bool(self.overlays.points.z_project)
-        pal = self._palette()
-        by_layer: Dict[Any, Dict[str, np.ndarray]] = {}
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.POINT:
-                by_layer.setdefault(layer, {})[name] = attr.values
-        # one table when the picker names a present one; every table otherwise (2026-08-04).
-        # A pick this payload lacks falls through to all, rather than drawing nothing — the
-        # same rule the Labels picker uses for a stale name.
-        _want = str(getattr(self.overlays.points, "layer", "") or "").strip()
-        if _want and _want in {str(k) for k in by_layer}:
-            by_layer = {k: v for k, v in by_layer.items() if str(k) == _want}
-        else:
-            by_layer = self._drop_synth(by_layer, Domain.POINT)
-            # a correlation grid's rows are ELEMENT centres, drawn by the Grid tab — as
-            # points they would only bury the field's own nodes (2026-10-09)
-            _grids = ds.metadata.get("__analysis_mesh__") or {}
-            by_layer = {k: v for k, v in by_layer.items() if str(k) not in _grids}
-        out: List[OV.PointMark] = []
-        # sorted: the per-layer colour must not depend on dict insertion order
-        for li, layer in enumerate(sorted(by_layer, key=lambda v: str(v))):
-            cols = by_layer[layer]
-            if "y" not in cols or "x" not in cols:
-                continue
-            ys, xs = cols["y"], cols["x"]
-            zs = cols.get("z"); ms = cols.get("m"); ts = cols.get("t")
-            ids = cols.get("id")
-            slots = pal.points.get((Domain.POINT, layer))
-            for i in range(len(ys)):
-                if ms is not None and int(ms[i]) != m:
-                    continue
-                if ts is not None and int(ts[i]) != t:
-                    continue
-                zpl = z if zs is None else int(round(float(zs[i])))
-                on_plane = zpl == z
-                if not on_plane and not project:
-                    continue
-                key = OV.slot_of(slots, int(ids[i])) if ids is not None else i + 1
-                out.append(OV.PointMark(float(ys[i]), float(xs[i]), key, li, on_plane,
-                                        zpl))
-        return out
+        """Every Point-domain row on the viewed frame, as draw-ready marks — see
+        :func:`nodelab_v2.overlay_geometry.point_marks` (moved there, V5.00 step 3)."""
+        return OG.point_marks(self._dataset, self._payload_coords(), self.overlays.points,
+                              self._palette())
 
     def _points_here(self):
         """On-plane point positions ``(y, x)`` — kept for callers/tests and the count."""
@@ -5536,144 +5414,25 @@ class ViewerPanel(QWidget):
         return [(mk.y, mk.x) for mk in marks if mk.on_plane]
 
     def _label_plane(self) -> Optional[np.ndarray]:
-        """The viewed plane of the chosen label raster, decimated to the reference plane.
-
-        Selection lives in :meth:`_label_source` — one place, so the outline that is painted
-        and the raster the size-probe counts are always the same layer."""
+        """The viewed plane of the chosen label raster, decimated to the reference plane
+        (:func:`nodelab_v2.overlay_geometry.label_plane`)."""
         if self._ref_plane is None:
             return None
-        vals = self._label_source()
-        if vals is None:
-            return None
-        m, t, z, c = self._payload_coords()
-        try:
-            best = vals[m, t, z, c]
-        except IndexError:
-            return None
-        ay, ax_ = best.shape
-        ty = max(1, int(np.ceil(ay / self._ref_plane.shape[0])))
-        tx = max(1, int(np.ceil(ax_ / self._ref_plane.shape[1])))
-        return best[::ty, ::tx]
+        return OG.label_plane(self._label_source(), self._payload_coords(),
+                              tuple(self._ref_plane.shape[:2]))
 
     def _scalar_plane(self) -> Optional[np.ndarray]:
-        """The Voxel-domain SCALAR layer for the viewed plane, or ``None``.
-
-        The counterpart to :meth:`_label_plane`, and it selects by the opposite test:
-        anything **non-integer** is a measurement (a strain component, a distance
-        transform, a density, a probability), while an integer raster is a label map and
-        belongs to the Labels overlay. A boolean mask is admitted too — it is a scalar in
-        every sense the colour ramp cares about — but an integer id raster is not, because
-        colour-mapping label ids paints a gradient across objects whose numbering is
-        arbitrary and re-issued every frame.
-
-        Picks the layer with the largest finite spread when several qualify: a field with
-        no variation carries nothing to look at, and silently choosing it over a real one
-        would look like the overlay was broken.
-        """
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes") or self._ref_plane is None:
+        """The Voxel-domain SCALAR layer for the viewed plane, or ``None``
+        (:func:`nodelab_v2.overlay_geometry.scalar_plane`; moved there, V5.00 step 3)."""
+        if self._ref_plane is None:
             return None
-        m, t, z, c = self._payload_coords()
-        best, best_spread = None, -1.0
-        for (dom, _layer, _name), attr in ds.attributes.items():
-            if dom is not Domain.VOXEL:
-                continue
-            vals = attr.values
-            if vals.ndim != 6:
-                continue
-            if np.issubdtype(vals.dtype, np.integer) and vals.dtype != np.bool_:
-                continue                       # a label raster — the Labels overlay's job
-            try:
-                plane = np.asarray(vals[m, t, z, c], dtype=float)
-            except IndexError:
-                continue
-            finite = plane[np.isfinite(plane)]
-            if finite.size == 0:
-                continue
-            spread = float(finite.max() - finite.min())
-            if spread >= best_spread:
-                best, best_spread = plane, spread
-        if best is None:
-            return None
-        ay, ax_ = best.shape
-        ty = max(1, int(np.ceil(ay / self._ref_plane.shape[0])))
-        tx = max(1, int(np.ceil(ax_ / self._ref_plane.shape[1])))
-        return best[::ty, ::tx]
+        return OG.scalar_plane(self._dataset, self._payload_coords(),
+                               tuple(self._ref_plane.shape[:2]))
 
     def _grid_rects(self) -> Optional[np.ndarray]:
-        """The correlation grid on the viewed plane → ``(N, 5)`` ``y_lo, y_hi, x_lo, x_hi,
-        level`` boxes in full-resolution image pixels (2026-10-09).
-
-        Reads every ``<field>_mesh`` table the ``__analysis_mesh__`` metadata names
-        (:mod:`nodegraph.catalog._shared.analysis_mesh`), keeps the viewed position and frame
-        (``t = -1`` rows are a mesh shared by every frame) and the viewed plane — a 2-D
-        element's plane index must equal it, a DVC hex is kept when its z extent spans it,
-        which is the honest 2-D reading of a 3-D grid: its section at this Z. Style
-        ``subsets`` replaces the element boxes with the subset / window around every Nth
-        node of the FIELD table, its size taken from the marker."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return None
-        marks = ds.metadata.get("__analysis_mesh__") or {}
-        if not marks:
-            return None
-        m, t, z, _c = self._payload_coords()
-        g = self.overlays.grid
-        by_layer: Dict[str, Dict[str, np.ndarray]] = {}
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.POINT and layer:
-                by_layer.setdefault(str(layer), {})[str(name)] = attr.values
-        out: List[np.ndarray] = []
-        for mesh_layer, info in marks.items():
-            info = info if isinstance(info, dict) else {}
-            kind = str(info.get("kind", ""))
-            if g.style == "subsets":
-                cols = by_layer.get(str(info.get("field", "")), {})
-                win = info.get("window")
-                if not cols or "y" not in cols or not win:
-                    continue
-                keep = np.ones(len(cols["y"]), dtype=bool)
-                for key, want in (("m", m), ("t", t)):
-                    if key in cols:
-                        keep &= np.asarray(cols[key]) == want
-                if "z" in cols:
-                    zz = np.asarray(cols["z"], dtype=float)
-                    if kind == "hex":
-                        half_z = float((list(win) + [0, 0, 0])[2] or win[0]) / 2.0
-                        keep &= np.abs(zz - z) <= half_z
-                    else:
-                        keep &= np.rint(zz) == z
-                idx = np.flatnonzero(keep)[::max(1, int(g.every))]
-                if idx.size == 0:
-                    continue
-                wy, wx = float(win[0]) / 2.0, float(win[1] if len(win) > 1 else win[0]) / 2.0
-                yy = np.asarray(cols["y"], dtype=float)[idx]
-                xx = np.asarray(cols["x"], dtype=float)[idx]
-                out.append(np.stack([yy - wy, yy + wy, xx - wx, xx + wx,
-                                     np.zeros(idx.size)], axis=1))
-                continue
-            cols = by_layer.get(str(mesh_layer), {})
-            if "y_lo" not in cols:
-                continue
-            keep = np.ones(len(cols["y_lo"]), dtype=bool)
-            if "m" in cols:
-                keep &= np.asarray(cols["m"]) == m
-            if "t" in cols:
-                tt = np.asarray(cols["t"])
-                keep &= (tt == t) | (tt < 0)
-            if kind == "hex":
-                keep &= ((np.asarray(cols["z_lo"], float) <= z + 0.5)
-                         & (np.asarray(cols["z_hi"], float) >= z - 0.5))
-            elif "z" in cols:
-                keep &= np.rint(np.asarray(cols["z"], float)) == z
-            idx = np.flatnonzero(keep)
-            if idx.size == 0:
-                continue
-            lv = (np.asarray(cols["level"], float)[idx] if "level" in cols
-                  else np.zeros(idx.size))
-            out.append(np.stack([np.asarray(cols[k], dtype=float)[idx]
-                                 for k in ("y_lo", "y_hi", "x_lo", "x_hi")] + [lv], axis=1))
-        return np.concatenate(out) if out else None
+        """The correlation grid on the viewed plane as ``(N, 5)`` boxes
+        (:func:`nodelab_v2.overlay_geometry.grid_rects`; moved there, V5.00 step 3)."""
+        return OG.grid_rects(self._dataset, self._payload_coords(), self.overlays.grid)
 
     def _vector_field(self) -> Optional[np.ndarray]:
         """Point-domain displacement vectors on the viewed frame → ``(N, 4)`` ``y,x,u,v``
@@ -5683,259 +5442,56 @@ class ViewerPanel(QWidget):
         return None if vf is None else vf.rows
 
     def _vector_info(self):
-        """The Vectors tab's :class:`nodegraph.fieldmap.VectorField` for the viewed
-        plane — the rows plus the series-wide length statistics the colour and Auto length
-        use — from the picked table (or the first one carrying a displacement)."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return None
-        m, t, z, c = self._payload_coords()
-        return FV.vectors(ds, m, t, z, c, layer=self.overlays.vectors.layer)
+        """The Vectors tab's field for the viewed plane
+        (:func:`nodelab_v2.overlay_geometry.vector_info`)."""
+        return OG.vector_info(self._dataset, self._payload_coords(),
+                              self.overlays.vectors.layer)
 
     def _field_info(self):
         """The Field tab's ``(raster, limits, colour map, colour-bar label)`` for the viewed
-        plane, or ``None``: the picked (or Auto) table and column, rasterised by
-        :func:`nodegraph.fieldmap.raster`, limits by the tab's Limits setting (the
-        series' 1st / 99th percentile cached per payload and column)."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return None
-        s = self.overlays.field
-        layer, col = FV.auto_pick(ds, s.layer, s.column)
-        if not col:
-            return None
-        m, t, z, c = self._payload_coords()
-        fr = FV.raster(ds, layer, col, m, t, z, c)
-        if fr is None:
-            return None
-        if s.limits == "manual":
-            lims = (float(s.clim_lo), float(s.clim_hi))
-        elif s.limits == "frame":
-            g = fr.grid[np.isfinite(fr.grid)]
-            lims = (tuple(float(v) for v in np.percentile(g, [1.0, 99.0]))
-                    if g.size else (0.0, 1.0))
-        else:
-            cache = self.__dict__.setdefault("_field_lim_cache", {})
-            key = (id(ds), layer, col)
-            if key not in cache:
-                if len(cache) > 32:
-                    cache.clear()
-                cache[key] = FV.series_limits(ds, layer, col)
-            lims = cache[key]
-        cmap = s.colormap if s.colormap != "auto" else (
-            "coolwarm" if lims[0] < 0.0 < lims[1] else "turbo")
-        unit = FV.column_unit(ds, layer, col)
-        return fr, lims, cmap, (f"{col} ({unit})" if unit else col)
+        plane (:func:`nodelab_v2.overlay_geometry.field_info`; the series limits cached per
+        payload and column here)."""
+        cache = self.__dict__.setdefault("_field_lim_cache", {})
+        return OG.field_info(self._dataset, self._payload_coords(), self.overlays.field,
+                             cache)
 
     def _glyph_info(self):
-        """The Field tab's principal-axis glyphs for the viewed plane (the Strain / Stress
-        tensor on the table the tab draws), or ``None``."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return None
-        s = self.overlays.field
-        layer, _col = FV.auto_pick(ds, s.layer, "")
-        if not layer:
-            return None
-        m, t, z, c = self._payload_coords()
-        return FV.tensor_glyphs(ds, layer, s.glyphs, m, t, z, c, every=s.glyph_every)
+        """The Field tab's principal-axis glyphs for the viewed plane
+        (:func:`nodelab_v2.overlay_geometry.glyph_info`)."""
+        return OG.glyph_info(self._dataset, self._payload_coords(), self.overlays.field)
 
     def _deformed_lines(self):
-        """The Grid tab's deformed lattice: the Vectors table's nodes joined through their
-        displaced positions, ``exaggerate`` times the displacement."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return None
-        m, t, z, c = self._payload_coords()
-        return FV.deformed_lines(ds, self.overlays.vectors.layer, m, t, z, c,
-                                 exaggerate=self.overlays.grid.exaggerate) or None
+        """The Grid tab's deformed lattice (:func:`nodelab_v2.overlay_geometry.deformed_lines`)."""
+        return OG.deformed_lines(self._dataset, self._payload_coords(),
+                                 self.overlays.vectors.layer, self.overlays.grid.exaggerate)
 
     def _diff_sets(self):
-        """The two Point sets the comparison overlay judges → ``(a, b)`` of ``(N,2)`` yx.
-
-        Taken from the **two Point layers** on the viewed frame, in first-appearance order:
-        a graph that produced two candidate detections (an old detector and a new one, a
-        prediction and a hand-annotated truth) carries both, and that is the comparison
-        worth drawing. ``(None, None)`` unless there are exactly two — with one there is
-        nothing to compare, and with three the pairing to draw is a question the overlay
-        cannot answer for you.
-        """
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes"):
-            return (None, None)
-        m, t, z, c = self._payload_coords()
-        from nodegraph.tables import pixel_layers
-        pixels = pixel_layers(ds.metadata)        # a pixel table is not a detection set
-        by_layer: Dict[str, Dict[str, np.ndarray]] = {}
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.POINT and layer and str(layer) not in pixels:
-                by_layer.setdefault(str(layer), {})[str(name)] = attr.values
-        usable = [(lyr, cols) for lyr, cols in by_layer.items()
-                  if "y" in cols and "x" in cols]
-        if len(usable) != 2:
-            return (None, None)
-        out = []
-        for lyr, cols in usable:
-            keep = np.ones(len(cols["y"]), dtype=bool)
-            for key, want in (("m", m), ("t", t), ("c", c)):
-                if key in cols:
-                    keep &= np.asarray(cols[key]) == want
-            try:
-                z_kind = ds.structure_zkind(Domain.POINT, lyr)
-            except Exception:      # noqa: BLE001 — provenance is advisory
-                z_kind = None
-            if z_kind == "plane_index" and "z" in cols:
-                keep &= np.asarray(cols["z"]) == z
-            idx = np.flatnonzero(keep)
-            out.append(np.stack([np.asarray(cols["y"], dtype=float)[idx],
-                                 np.asarray(cols["x"], dtype=float)[idx]], axis=1))
-        return (out[0], out[1])
+        """The two Point sets the comparison overlay judges
+        (:func:`nodelab_v2.overlay_geometry.diff_sets`)."""
+        return OG.diff_sets(self._dataset, self._payload_coords())
 
     def _mesh_sections(self) -> List[OV.MeshSection]:
-        """Every Mesh element on the viewed frame, cut by the viewed Z plane.
-
-        The Mesh domain stores three flat CSR strata per mesh under one domain, keyed by a
-        layer sub-name (``L`` element rows / ``L/vert`` / ``L/face``) — see
-        :mod:`nodegraph.mesh`. This walks the store directly rather than going through
-        ``read_mesh`` so a partially-written or foreign mesh can never raise inside a paint
-        call: anything that does not look like a mesh is simply skipped.
-
-        Coordinates stay in *structure* pixels (voxel ``z,y,x``, the domain's storage
-        convention); the renderer scales them into the displayed plane, exactly as for
-        points and tracks.
-        """
-        ds = self._dataset
-        out: List[OV.MeshSection] = []
-        if ds is None or not hasattr(ds, "attributes"):
-            return out
-        m, t, z, c = self._payload_coords()
-        near = max(0.0, float(self.overlays.mesh.near_z))
-        vertex_style = self.overlays.mesh.style == "points"
-        by_layer: Dict[Any, Dict[str, np.ndarray]] = {}
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.MESH and layer is not None:
-                by_layer.setdefault(layer, {})[name] = attr.values
-        for layer in sorted(by_layer, key=lambda v: str(v)):
-            base, part = MESH_PART(str(layer))
-            if part is not None:                       # only iterate ELEMENT buckets
-                continue
-            el = by_layer[layer]
-            vt = by_layer.get(f"{base}/vert")
-            fc = by_layer.get(f"{base}/face")
-            if vt is None or fc is None:
-                continue
-            if not ({"id", "m", "t", "c", "vert_start", "vert_count",
-                     "face_start", "face_count"} <= set(el)
-                    and {"z", "y", "x"} <= set(vt) and {"v0", "v1", "v2"} <= set(fc)):
-                continue
-            vz, vy, vx = (np.asarray(vt[k], dtype=float) for k in ("z", "y", "x"))
-            tri = np.column_stack([np.asarray(fc[f"v{i}"], dtype=np.int64)
-                                   for i in range(3)])
-            verts = np.column_stack([vz, vy, vx])
-            for row in range(len(np.asarray(el["id"]))):
-                if (int(np.asarray(el["m"])[row]) != m
-                        or int(np.asarray(el["t"])[row]) != t
-                        or int(np.asarray(el["c"])[row]) != c):
-                    continue
-                vs = int(np.asarray(el["vert_start"])[row])
-                vc = int(np.asarray(el["vert_count"])[row])
-                fs = int(np.asarray(el["face_start"])[row])
-                nf = int(np.asarray(el["face_count"])[row])
-                oid = int(np.asarray(el["id"])[row])
-                sub_v = verts[vs:vs + vc]
-                sub_f = tri[fs:fs + nf] - vs           # v0..v2 are GLOBAL indices
-                sec = OV.MeshSection(oid)
-                if vertex_style:
-                    keep = np.abs(sub_v[:, 0] - float(z)) <= near
-                    sec.verts = [(float(a), float(b))
-                                 for a, b in zip(sub_v[keep, 1], sub_v[keep, 2])]
-                else:
-                    sec.loops, sec.closed = OV.mesh_section(sub_v, sub_f, float(z))
-                if sec.loops or sec.verts:
-                    out.append(sec)
-        return out
+        """Every Mesh element on the viewed frame, cut by the viewed Z plane
+        (:func:`nodelab_v2.overlay_geometry.mesh_sections`; moved there, V5.00 step 3)."""
+        return OG.mesh_sections(self._dataset, self._payload_coords(), self.overlays.mesh)
 
     def _member_layers(self):
-        """``{(domain, layer): {col: values}}`` for every Point/Label layer that carries
-        a joinable ``id,y,x`` triple — the member position source for Track trajectories.
-
-        **Every layer is clipped to its shortest column** (V2.27, reported 2026-08-06). A
-        structure instance is stored as one array per column under one layer name, and nothing
-        revalidates that they still agree once a second node has written onto it — a producer
-        that emits a column with a different row count leaves the instance RAGGED. That is not a
-        hypothetical: it crashed a run here with ``IndexError: index 208 is out of bounds for
-        axis 0 with size 208``, because :meth:`_build_palette` sizes its row map from ``id`` and
-        derives its frame selection from ``m``/``t``, so a short ``id`` beside a long ``m`` puts
-        an out-of-range index in the selection.
-
-        Clipping rather than skipping the layer, because this feeds a PAINT call and the
-        docstring of every consumer here says the same thing: a colour is never worth a crash.
-        The rows that survive are the ones every column agrees on, so the marks that are drawn
-        are drawn correctly; the tail — which no column set can describe consistently — is
-        dropped, and said once on stderr rather than silently, since a table that disagrees with
-        itself is a defect in whatever wrote it and the user should be able to find out."""
-        ds = self._dataset
-        out: Dict[tuple, Dict[str, np.ndarray]] = {}
-        if ds is None or not hasattr(ds, "attributes"):
-            return out
-        from nodegraph.tables import pixel_layers
-        # a pixel table's rows are voxels, never a track's members — and mapping millions of
-        # them into the palette on every paint is what would stall the Viewer
-        pixels = pixel_layers(ds.metadata)
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom in (Domain.POINT, Domain.LABEL) and not (
-                    dom is Domain.POINT and str(layer) in pixels):
-                out.setdefault((dom, layer), {})[name] = attr.values
-        keep = {k: v for k, v in out.items() if {"id", "y", "x"} <= set(v)}
-        for key, cols in keep.items():
-            try:
-                lens = {name: len(val) for name, val in cols.items()}
-            except TypeError:                       # a scalar attribute — not a column
-                continue
-            if len(set(lens.values())) <= 1:
-                continue
-            n = min(lens.values())
-            if not self._warned_ragged:
-                self._warned_ragged = True
-                worst = sorted(lens.items(), key=lambda kv: kv[1])
-                print(f"[overlays] {key[0].value} layer {key[1]!r} is ragged — its columns "
-                      f"disagree in length ({worst[0][0]}={worst[0][1]}, "
-                      f"{worst[-1][0]}={worst[-1][1]}); showing the first {n} row(s). Whatever "
-                      f"wrote the shorter column re-emitted it against a different row set.",
-                      file=sys.stderr, flush=True)
-            keep[key] = {name: val[:n] for name, val in cols.items()}
-        return keep
+        """``{(domain, layer): {col: values}}`` for every joinable Point/Label layer, each
+        clipped to its shortest column (:func:`nodelab_v2.overlay_geometry.member_layers`;
+        moved there, V5.00 step 3)."""
+        return OG.member_layers(self._dataset, on_ragged=self._note_ragged)
 
     def _track_layers(self):
-        """``{layer: {col: values}}`` for every Track-domain table in the dataset."""
-        ds = self._dataset
-        out: Dict[Any, Dict[str, np.ndarray]] = {}
-        if ds is None or not hasattr(ds, "attributes"):
-            return out
-        for (dom, layer, name), attr in ds.attributes.items():
-            if dom is Domain.TRACK:
-                out.setdefault(layer, {})[name] = attr.values
-        return self._drop_synth(out, Domain.TRACK)
+        """``{layer: {col: values}}`` for every Track-domain table
+        (:func:`nodelab_v2.overlay_geometry.track_layers`)."""
+        return OG.track_layers(self._dataset)
 
     @staticmethod
     def _best_member_layer(members: Dict[tuple, Dict[str, np.ndarray]],
                            member_ids: np.ndarray) -> Optional[tuple]:
-        """Which member layer a Track table is talking about.
-
-        A Track table stores only ``track_id, t, member_id`` — the geometry lives on the
-        member (Point/Label) domain, keyed by ``id``, and Point and Label ids share an id
-        space (both start at 1). So the layer is resolved by *coverage*: the one holding
-        the most of this table's member ids. Ties go to the lexicographically first key,
-        so the answer never depends on dict insertion order.
-        """
-        want = set(np.asarray(member_ids).astype(np.int64).tolist())
-        best, best_cov = None, 0
-        for key in sorted(members, key=lambda k: (str(k[0]), str(k[1]))):
-            ids = np.asarray(members[key]["id"]).astype(np.int64).tolist()
-            cov = len(want & set(ids))
-            if cov > best_cov:
-                best, best_cov = key, cov
-        return best
+        """Which member layer a Track table is talking about, by id coverage
+        (:func:`nodelab_v2.overlay_geometry.best_member_layer`)."""
+        return OG.best_member_layer(members, member_ids)
 
     # ── the identity palette (V2.17) ──────────────────────────────────────────
     def _palette(self) -> _Palette:
@@ -5954,223 +5510,24 @@ class ViewerPanel(QWidget):
         return self._pal
 
     def _build_palette(self) -> _Palette:
-        """Work out one palette slot per **physical object** and index it by member id.
+        """One palette slot per physical object, indexed by member id
+        (:func:`nodelab_v2.overlay_geometry.build_palette`; moved there, V5.00 step 3)."""
+        return OG.build_palette(self._dataset, on_ragged=self._note_ragged)
 
-        Three steps, all vectorized (this runs over every structure row in the dataset,
-        not just the viewed frame):
-
-        1. **Objects.** Every Point/Label row belongs to a track (its object is that
-           track) or to nothing (its object is itself). A track *prefers* the slot of its
-           first member, so at the frame where a cell first appears it keeps exactly the
-           colour it would have had untracked — and then holds it for the rest of the
-           series instead of flashing a new one each frame.
-        2. **Neighbours.** Per ``(m, t)``, each member's nearest few members; mapped to
-           object pairs and deduplicated across frames (the same cells are neighbours in
-           every frame, so this collapses hard — which is also why sampling
-           :data:`MAX_NEIGHBOR_FRAMES` of them costs nothing in quality).
-        3. **Slots.** :func:`~nodelab_v2.overlays.deconflict_slots` hands out the slots,
-           moving an object off its preference only when a neighbour is too close on the
-           colour wheel.
-
-        Anything unexpected in the tables is skipped rather than raised on: this feeds a
-        paint call, and a colour is never worth a crash.
-        """
-        members = self._member_layers()
-        if not members:
-            return _Palette()
-        tracks = self._track_layers()
-
-        # ── 1. member row → object id (ints, so the mapping stays vectorized) ──
-        obj_row: Dict[tuple, np.ndarray] = {}        # member layer → (N,) object id
-        ids_of: Dict[tuple, np.ndarray] = {}
-        for key, cols in members.items():
-            ids = np.asarray(cols["id"]).astype(np.int64)
-            ids_of[key] = ids
-            obj_row[key] = np.full(len(ids), -1, dtype=np.int64)
-        prefer: Dict[int, int] = {}
-        # Every layer numbers its ids from 0, so objects in two different layers would PREFER
-        # the same slots — and keep them, because the neighbour graph below is built per layer
-        # (two marks in different layers are never neighbours, so de-confliction never looks
-        # at the pair). The result was a point in one layer painted the same colour as a point
-        # in another under `per_point`: a 4-row and a 2-row Point layer gave 4 colours for 6
-        # marks. Each layer therefore gets its own disjoint band of preferences. The first
-        # band starts at 0, so a single-layer dataset — which is nearly every dataset — keeps
-        # exactly the colours it had, and a track still prefers its first member's slot
-        # because both halves are offset by the same layer's base.
-        layer_base: Dict[Any, int] = {}
-        _base = 0
-        for key in sorted(ids_of, key=str):
-            layer_base[key] = _base
-            ids = ids_of[key]
-            _base += int(max(0, int(ids.max()) + 1)) if ids.size else 0
-        track_slots: Dict[Any, Tuple[np.ndarray, np.ndarray]] = {}   # layer → (tids, objs)
-        next_obj = 0
-        for tlayer in sorted(tracks, key=str):
-            cols = tracks[tlayer]
-            if not {"track_id", "member_id"} <= set(cols):
-                continue
-            tid = np.asarray(cols["track_id"]).astype(np.int64)
-            mem = np.asarray(cols["member_id"]).astype(np.int64)
-            mkey = self._best_member_layer(members, mem)
-            if mkey is None:
-                continue
-            ids = ids_of[mkey]
-            if ids.size == 0:
-                continue
-            order = np.argsort(ids, kind="stable")
-            pos = np.searchsorted(ids[order], mem)
-            hit = (pos < len(ids)) & (ids[order][np.clip(pos, 0, len(ids) - 1)] == mem)
-            rows = order[np.clip(pos, 0, max(0, len(ids) - 1))][hit]
-            tid_hit = tid[hit]
-            if rows.size == 0:
-                continue
-            uniq, inv = np.unique(tid_hit, return_inverse=True)
-            objs = np.arange(next_obj, next_obj + len(uniq), dtype=np.int64)
-            next_obj += len(uniq)
-            obj_row[mkey][rows] = objs[inv]
-            # a track prefers the slot of its FIRST member — the colour that region
-            # already wears the frame it appears in
-            first = np.full(len(uniq), np.iinfo(np.int64).max, dtype=np.int64)
-            np.minimum.at(first, inv, ids[rows])
-            prefer.update({int(o): int(f) + layer_base.get(mkey, 0)
-                           for o, f in zip(objs.tolist(), first.tolist())})
-            track_slots[tlayer] = (uniq, objs)
-        for key, ids in ids_of.items():             # untracked rows: each is its own object
-            loose = np.nonzero(obj_row[key] < 0)[0]
-            if loose.size:
-                objs = np.arange(next_obj, next_obj + loose.size, dtype=np.int64)
-                next_obj += loose.size
-                obj_row[key][loose] = objs
-                prefer.update({int(o): int(v) + layer_base.get(key, 0)
-                               for o, v in zip(objs.tolist(), ids[loose].tolist())})
-
-        # ── 2. neighbour graph, per sampled frame, deduplicated across frames ──
-        too_many = next_obj > MAX_PALETTE_OBJECTS
-        if too_many and not self._warned_palette:
-            self._warned_palette = True
-            print(f"[overlays] {next_obj} objects (>{MAX_PALETTE_OBJECTS}) - neighbouring "
-                  f"colours not de-conflicted; each object still keeps one colour across T",
-                  file=sys.stderr, flush=True)
-        chunks: List[np.ndarray] = []
-        for key, cols in members.items():
-            ids = ids_of[key]
-            if len(ids) < 2 or too_many:
-                continue
-            ys = np.asarray(cols["y"], dtype=float)
-            xs = np.asarray(cols["x"], dtype=float)
-            zeros = np.zeros(len(ids), dtype=np.int64)
-            ms = np.asarray(cols["m"]).astype(np.int64) if "m" in cols else zeros
-            ts = np.asarray(cols["t"]).astype(np.int64) if "t" in cols else zeros
-            frame = ms * (int(ts.max()) + 1) + ts if ts.size else zeros
-            frames = np.unique(frame)
-            if len(frames) > MAX_NEIGHBOR_FRAMES:
-                frames = frames[np.linspace(0, len(frames) - 1,
-                                            MAX_NEIGHBOR_FRAMES).astype(int)]
-            for f in frames.tolist():
-                sel = np.nonzero(frame == f)[0]
-                if sel.size < 2:
-                    continue
-                # (y, x) only: the confusion this prevents is between two marks the eye
-                # compares ON THE VIEWED PLANE, which is exactly the projection to y/x
-                pairs = OV.neighbor_pairs(np.stack([ys[sel], xs[sel]], axis=1))
-                if pairs.size:
-                    chunks.append(obj_row[key][sel][pairs])
-        pairs_all = (np.unique(np.concatenate(chunks), axis=0) if chunks
-                     else np.zeros((0, 2), dtype=np.int64))
-        pairs_all = pairs_all[pairs_all[:, 0] != pairs_all[:, 1]]
-
-        # ── 3. slots, then back down onto the ids each overlay actually holds ──
-        slots = (dict(prefer) if too_many else
-                 OV.deconflict_slots(prefer, [(int(a), int(b))
-                                              for a, b in pairs_all.tolist()]))
-        lookup = np.arange(max(1, next_obj), dtype=np.int64)
-        for o, sl in slots.items():
-            lookup[o] = sl
-        pal = _Palette()
-        for key, ids in ids_of.items():
-            lut = OV.slot_lut(ids, lookup[obj_row[key]])
-            (pal.labels if key[0] is Domain.LABEL else pal.points)[key] = lut
-        for tlayer, (tids, objs) in track_slots.items():
-            pal.tracks[tlayer] = OV.slot_lut(tids, lookup[objs])
-        return pal
+    def _note_ragged(self, _key, _lens) -> None:
+        """A member layer had to be clipped: remembered per panel (the status line and
+        the probe read it); the message itself is printed once per process."""
+        self._warned_ragged = True
 
     def _label_keys(self, lab: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        """The ``label id → palette slot`` LUT for the plane :meth:`_label_plane` picked.
-
-        The plane is a Voxel raster and carries no layer name, so the Label table is
-        matched by *content*: with one Label layer there is nothing to resolve, and with
-        several the plane's top id says which id space it came from.
-        """
-        if lab is None or lab.size == 0:
-            return None
-        pal = self._palette()
-        if not pal.labels:
-            return None
-        luts = [pal.labels[k] for k in sorted(pal.labels, key=lambda k: str(k[1]))]
-        if len(luts) == 1:
-            return luts[0]
-        top = int(lab.max())
-        covering = [lut for lut in luts if top < len(lut)]
-        return covering[0] if covering else max(luts, key=len)
+        """The ``label id → palette slot`` LUT for the plane :meth:`_label_plane` picked
+        (:func:`nodelab_v2.overlay_geometry.label_keys`)."""
+        return OG.label_keys(lab, self._palette())
 
     def _track_paths(self) -> List[OV.TrackPath]:
-        """Join every Track layer to its members' positions and return, for the current
-        M, one :class:`~nodelab_v2.overlays.TrackPath` per track — its positions ordered
-        by ``t``, the index of the vertex at the viewed T, and each vertex's timepoint
-        (which is what lets the *trail* modes draw only part of a trajectory).
-
-        A Track layer only stores ``track_id, t, member_id`` — the geometry lives on the
-        member (Point/Label) domain, keyed by ``id``. Point and Label ids share an
-        id-space (both start at 1), so per Track layer we pick the member layer whose id
-        set best covers the members (:meth:`_best_member_layer` — resolves the ambiguity,
-        avoids cross-space matches). Each path also carries its **palette slot**, so a
-        trajectory is drawn in the same colour as the regions it threads through.
-        Positions stay projected over z and filtered to the viewed M."""
-        ds = self._dataset
-        if ds is None or not hasattr(ds, "attributes") or self._axes is None:
-            return []
-        m, t, _z, _c = self._payload_coords()
-        track_layers = self._track_layers()
-        if not track_layers:
-            return []
-        members = self._member_layers()
-        pal = self._palette()
-        trajectories = []
-        for tlayer, cols in track_layers.items():
-            if not {"track_id", "t", "member_id"} <= set(cols):
-                continue
-            tid = np.asarray(cols["track_id"]).astype(np.int64)
-            tt = np.asarray(cols["t"]).astype(np.int64)
-            mem = np.asarray(cols["member_id"]).astype(np.int64)
-            mkey = self._best_member_layer(members, mem)
-            if mkey is None:
-                continue
-            best_cols = members[mkey]
-            slots = pal.tracks.get(tlayer)
-            ids = np.asarray(best_cols["id"]).astype(np.int64)
-            ys = np.asarray(best_cols["y"], dtype=float)
-            xs = np.asarray(best_cols["x"], dtype=float)
-            ms = np.asarray(best_cols["m"]).astype(np.int64) if "m" in best_cols else None
-            id_to_i = {int(v): i for i, v in enumerate(ids.tolist())}
-            for track in np.unique(tid).tolist():
-                sel = tid == track
-                order = np.argsort(tt[sel], kind="stable")
-                ts_ord = tt[sel][order].tolist()
-                mem_ord = mem[sel][order].tolist()
-                path, cur, ts_kept = [], None, []
-                for tv, mv in zip(ts_ord, mem_ord):
-                    i = id_to_i.get(int(mv))
-                    if i is None or (ms is not None and int(ms[i]) != m):
-                        continue
-                    path.append((float(ys[i]), float(xs[i])))
-                    ts_kept.append(int(tv))
-                    if int(tv) == t:
-                        cur = len(path) - 1
-                if path:
-                    trajectories.append(
-                        OV.TrackPath(int(track), path, cur, ts_kept,
-                                     OV.slot_of(slots, int(track))))
-        return trajectories
+        """One :class:`~nodelab_v2.overlays.TrackPath` per track on the viewed M
+        (:func:`nodelab_v2.overlay_geometry.track_paths`; moved there, V5.00 step 3)."""
+        return OG.track_paths(self._dataset, self._payload_coords(), self._palette())
 
     def _tracks_here(self):
         """``(track_id, path, current_index, timepoints)`` per track — the tuple form kept

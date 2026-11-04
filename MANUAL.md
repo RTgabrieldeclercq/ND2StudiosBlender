@@ -439,6 +439,48 @@ workflow tuned per dish, compared on one plot.
 
 ---
 
+## 2c. Figures — the Analysis page is a figure (V5.00)
+
+Since V5.00 an **Analysis** page is not a node canvas: it opens the **Figure Editor** — a
+journal-sized page you place things on. What it can show is whatever the pages before it
+*publish* as Page Outputs, read from their metadata before anything is computed.
+
+1. **Start.** An empty Analysis page asks *What do you want to make?* — Overlay, Montage,
+   Plot + Overlay (charts arrive in step 4). Each card says what it needs and what the
+   upstream pages carry. Pick one, or press one of the image sources listed under it.
+2. **Sources** (left) lists every Page Output of the pages before this one, grouped by
+   page, with what each carries: the image and its channels, the label / point / track
+   tables and their columns, the measured fields. **Drag a source onto the page** to place
+   it as an image (double-click does the same); **drag a table or a column onto an image**
+   to draw it over that image as a layer.
+3. **Compute sources** pulls what the figure reads and is not yet in hand — a payload-only
+   pull: the Viewer stays where it was. Nothing is computed until you ask.
+4. **Items.** Move and resize with the mouse (an image keeps its aspect); arrow keys nudge,
+   Delete removes. **Alt-drag a box on an image** to make a **popout** of that region: a
+   new image item showing it magnified, with a dashed box on the parent and leader lines
+   that follow the popout wherever you put it. **Twin** (Properties) makes a second copy
+   sharing the region, frame and channels — give the twin other layers (a speed heat layer
+   over the same cells). **Share display range** on a multi-selection gives every image one
+   window per channel. The page **cursor** (M / T / Z in the toolbar) drives every image
+   whose frame reads *page cursor*.
+5. **Properties** (right) edits the page (preset size, dpi, font, type size, palette, dark
+   page, snap grid, letter style) or the selection: an image's source, frame, flips, scale
+   bar, time stamp, channel labels, its channels (colour, window: auto percentiles / the
+   Viewer's window / typed / shared, gamma, label) and its layers (labels outline / fill /
+   ids, points, tracks with a tail, a field column as a heat map with series / frame /
+   typed / **0–1 of a maximum** limits, vectors, a voxel wash, mesh sections, the
+   correlation grid). A colour bar, a histogram of a channel with its window marked, a
+   standalone scale bar, text, a letter, an arrow, a line, a shape and a measurement line
+   are items of their own.
+6. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
+   paths) or PDF (fonts embedded). The preview and the export are one set of lines.
+7. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
+   the paper-readiness checks (a missing scale bar, an inset with no box, a red / green
+   merge, twins that do not share a display range, an unlabelled colour bar). A V4 file's
+   Analysis page that held nodes opens as a Free page named *(graph)*.
+
+---
+
 ## 3. Your first graph in five minutes
 
 1. **File → Load ND2/TIFF file…** (`Ctrl+L`), pick a file (or Ctrl/Shift-select several).

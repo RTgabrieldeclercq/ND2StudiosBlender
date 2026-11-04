@@ -58,7 +58,7 @@ DISTRIBUTION_KINDS = ("histogram", "kde", "box", "violin", "ecdf", "strip", "sup
 
 LAYER_KINDS = ("points", "labels", "tracks", "vectors", "field", "voxels", "mesh", "grid")
 
-REGION_KINDS = ("full", "rect_um", "placement", "object")
+REGION_KINDS = ("full", "rect_um", "rect_frac", "placement", "object")
 
 CHANNEL_MODES = ("auto_pct", "viewer", "manual", "shared")
 
@@ -241,6 +241,15 @@ def _region(v: Any, path: str) -> Dict[str, Any]:
         r["rect_um"] = [_num(x, f"{path}.rect_um[{i}]") for i, x in enumerate(rect)]
         if not (r["rect_um"][1] > r["rect_um"][0] and r["rect_um"][3] > r["rect_um"][2]):
             raise FigureError(f"{path}.rect_um", "must have y1 > y0 and x1 > x0")
+    elif r["from"] == "rect_frac":
+        rect = r.get("rect_frac")
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            raise FigureError(f"{path}.rect_frac", "must be [fy0, fy1, fx0, fx1], fractions "
+                                                   "of the plane")
+        r["rect_frac"] = [_num(x, f"{path}.rect_frac[{i}]", lo=0, hi=1)
+                          for i, x in enumerate(rect)]
+        if not (r["rect_frac"][1] > r["rect_frac"][0] and r["rect_frac"][3] > r["rect_frac"][2]):
+            raise FigureError(f"{path}.rect_frac", "must have fy1 > fy0 and fx1 > fx0")
     elif r["from"] == "object":
         if r.get("object") is None:
             raise FigureError(f"{path}.object", "names no object id")

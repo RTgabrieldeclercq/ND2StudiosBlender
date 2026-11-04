@@ -219,6 +219,10 @@ def region_plan(doc: Mapping[str, Any], item_id: str, envelopes: Mapping[str, An
             return RegionPlan(kind, m, (y0, y1, x0, x1), None,
                               f"{item_id}: the rect lies outside the source's field")
         return RegionPlan(kind, m, (y0, y1, x0, x1), tuple(float(v) for v in win))
+    if kind == "rect_frac":
+        fy0, fy1, fx0, fx1 = (float(v) for v in region["rect_frac"])
+        sub = _as_tuple(P.sub_field_box(box, (fy0, fy1, fx0, fx1))) if box is not None else None
+        return RegionPlan(kind, m, sub, (fy0, fy1, fx0, fx1))
     if kind == "object":
         win, why = _object_window(region, tables, axes, md, m, t)
         if win is None:
@@ -245,6 +249,17 @@ def zoom_box(doc: Mapping[str, Any], link: Mapping[str, Any], envelopes: Mapping
                            "coverage": 0.0, "refusal": ""}
     if not child.ok:
         out["refusal"] = child.refusal
+        return out
+    cimg = S.effective_image(doc, child_id)
+    pimg_src = S.effective_image(doc, parent_id).get("source")
+    if child.window is not None and cimg.get("source") == pimg_src             and child.kind in ("rect_frac", "object", "rect_um"):
+        # the same source: the child's window IS its box on the parent's plane
+        penv = envelopes.get(pimg_src)
+        paxes, _pmd = envelope_parts(penv) if penv is not None else (None, {})
+        ny, nx = _size(paxes, "y"), _size(paxes, "x")
+        fy0, fy1, fx0, fx1 = child.window
+        out.update(parent_m=child.m, window=child.window, coverage=1.0,
+                   rect_px=(fy0 * ny, fy1 * ny, fx0 * nx, fx1 * nx))
         return out
     if child.box_um is None:
         out["refusal"] = f"{child_id}: its source has no stage placement"

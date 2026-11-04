@@ -47,6 +47,7 @@ from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
 from nodelab_v2.canvas import CanvasPanel, kind_icon
+from nodelab_v2.figure_editor.panel import FigureEditorPanel
 from nodelab_v2.workspace import (FREE as FREE_KIND, Workspace, build_example, kind_label,
                                   local_ids, qualify, split_run_id)
 from nodelab_v2.document import GraphDocument
@@ -351,6 +352,84 @@ class _MovieHost:
         self._w.export_movie(node_id, page_id=self._pid())
 
 
+class _FigureHost:
+    """The Figure Editor's view of the window (V5.00 step 3) — everything it may ask for,
+    and nothing else, the way :class:`_MovieHost` is the Movie Editor's. The editor holds
+    a page id; every call resolves the workspace through the window."""
+
+    def __init__(self, win: "MainWindow") -> None:
+        self._w = win
+
+    def figure_state(self, page_id: Optional[str]):
+        page = self._w.workspace.pages.get(page_id or "")
+        return page.figure if page is not None else None
+
+    def page_name(self, page_id: str) -> str:
+        page = self._w.workspace.pages.get(page_id)
+        return page.name if page is not None else page_id
+
+    def catalog(self, page_id: str) -> List[Dict[str, Any]]:
+        """Every Page Output the figure page may read, with its envelope."""
+        ws = self._w.workspace
+        out = []
+        for value, label in ws.available_sources(page_id):
+            res = ws.resolve_source(page_id, value)
+            env = None
+            pname = ""
+            if res is not None:
+                up, nid = res
+                env = ws.pages[up].doc.envs.get(nid)
+                pname = ws.pages[up].name
+            out.append({"value": value, "label": label, "page": pname,
+                        "name": value.split(":", 1)[-1], "env": env})
+        return out
+
+    def envelopes(self, page_id: str) -> Dict[str, Any]:
+        fig = self.figure_state(page_id)
+        return fig.envelopes(self._w.workspace, page_id) if fig is not None else {}
+
+    def run_ids(self, page_id: str) -> Dict[str, str]:
+        fig = self.figure_state(page_id)
+        if fig is None or not fig.sources:
+            return {}
+        comp = self._w.workspace.compose(page_id)
+        return fig.run_ids(comp, page_id)
+
+    def source_labels(self, page_id: str) -> Dict[str, str]:
+        fig = self.figure_state(page_id)
+        return fig.source_labels(self._w.workspace, page_id) if fig is not None else {}
+
+    def finished(self, run_id: str):
+        return self._w.runner.finished_result(run_id)
+
+    def fetch(self, run_id: str) -> None:
+        self._w.runner.fetch(run_id)
+
+    def commit(self, page_id: str, doc) -> bool:
+        fig = self.figure_state(page_id)
+        return bool(fig.replace(doc)) if fig is not None else False
+
+    def viewer_state(self, run_id: str, names) -> Dict[int, Dict[str, Any]]:
+        return self._w._display_state_of(run_id, list(names or []))
+
+    def own_layers(self, run_id: str) -> list:
+        try:
+            return self._w._own_layers(run_id)
+        except Exception:              # noqa: BLE001 — a preference must never break a render
+            return []
+
+    def export_path(self, fmt: str) -> str:
+        path, _f = QFileDialog.getSaveFileName(
+            self._w, f"Export the figure as {fmt.upper()}", "",
+            f"{fmt.upper()} (*.{fmt});;All files (*)")
+        if path and not path.lower().endswith(f".{fmt}"):
+            path += f".{fmt}"
+        return path
+
+    def status(self, text: str) -> None:
+        self._w.statusBar().showMessage(text, 6000)
+
+
 def _clock(seconds) -> str:
     """``42 s`` / ``3:07`` / ``1:02:09`` — elapsed time as the Node queue shows it."""
     s = int(max(0.0, float(seconds or 0.0)))
@@ -579,6 +658,7 @@ class MainWindow(QMainWindow):
         # The Movie Editor's sources arrive on their own signal (a payload-only fetch never
         # reaches a pane), and the Viewer's settled LUT edits feed its linked channels.
         self.runner.fetched.connect(self._on_movie_fetched)
+        self.runner.fetched.connect(self._on_figure_fetched)
         self.runner.fetch_started.connect(
             lambda nid: self.statusBar().showMessage(
                 f"computing {self._local(nid) or nid} for the Movie Editor…"))
@@ -1640,11 +1720,35 @@ class MainWindow(QMainWindow):
         return "modified" + (" · " + ", ".join(bits) if bits else "")
 
     # ── the Pages panel's nodes (V4.00 step 11e) ──────────────────────────────
+    # ── the Figure Editor (V5.00 step 3) ──────────────────────────────────────
+    def make_figure_editor(self, canvas: CanvasPanel) -> FigureEditorPanel:
+        """A canvas's Figure Editor — the factory :class:`CanvasPanel` calls."""
+        ed = FigureEditorPanel(_FigureHost(self))
+        ed.view.pressed.connect(lambda c=canvas: self._activate_canvas(c))
+        ed.selection_changed.connect(lambda: self.inspector.set_node(None))
+        return ed
+
+    def page_is_figure(self, page_id: str) -> bool:
+        page = self.workspace.pages.get(page_id or "")
+        return page is not None and page.figure is not None
+
+    def _figure_editors(self) -> List[FigureEditorPanel]:
+        return [c.figure for c in self.canvases() if getattr(c, "figure", None) is not None]
+
+    def _on_figure_fetched(self, node_id: str, payload, _seconds: float) -> None:
+        run_id = self._full(node_id)
+        for ed in self._figure_editors():
+            if ed.bound():
+                ed.on_fetched(run_id, payload)
+
     def show_node(self, page_id: str, node_id: str) -> None:
         """Show ``page_id`` on the active canvas with ``node_id`` selected and in view."""
         c = self._canvas
         if c.page_id != page_id:
             self._show_page(c, page_id)
+        if self.page_is_figure(page_id) and c.figure.bound() == page_id:
+            c.figure.select([node_id])            # a figure item, not a node
+            return
         sc = self._scenes.get(page_id)
         item = sc.node_items.get(node_id) if sc is not None else None
         if item is None:
@@ -2978,6 +3082,9 @@ class MainWindow(QMainWindow):
         self._sync_solo()                 # a rewired source changes the frame count
         if pid == self._movie_pid():        # the editor's movie lives on ITS page
             self.movie_editor.on_doc_changed(touched, doc.downstream_of)
+        for ed in self._figure_editors():   # a figure's sources may resolve anew
+            if ed.bound():
+                ed.on_doc_changed(pid)
         if pid == self.workspace.active:
             name = doc.path or "untitled"
             self.statusBar().showMessage(f"{name} — rev {doc.revision}")
@@ -4308,6 +4415,11 @@ class MainWindow(QMainWindow):
             self.movie_editor.shutdown()     # its render thread, for the same reason
         except Exception:                                    # noqa: BLE001 — see above
             pass
+        for ed in self._figure_editors():
+            try:
+                ed.shutdown()
+            except Exception:                                # noqa: BLE001 — see above
+                pass
         for dlg in list(getattr(self, "_demo_windows", {}).values()):
             try:
                 dlg.shutdown()                   # each demo's worker thread, likewise
@@ -4814,6 +4926,9 @@ class MainWindow(QMainWindow):
                 self.stamp_movie_links(mid, page_id=pid)
         if pid == self._movie_pid():
             self.movie_editor.on_display_changed()
+        for ed in self._figure_editors():
+            if ed.bound():
+                ed.on_display_changed()
 
     # ── Export Movie ↔ Viewer LUT link ────────────────────────────────────────────
     def _movie_doc(self, page_id: Optional[str] = None):

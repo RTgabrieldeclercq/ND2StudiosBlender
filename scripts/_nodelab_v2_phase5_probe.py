@@ -292,6 +292,209 @@ def _probe_movie_editor(win, app) -> None:
         "the only segment is refused")
 
 
+def _probe_figure_editor(win, app) -> None:
+    """The Figure Editor (V5.00 step 3), driven the way the mouse would drive it.
+
+    File → New; a synthetic stack on Image Input published as ``raw``; threshold → label on
+    Image Processing published as ``cells``. Checks, in order: showing the Analysis page
+    swaps the canvas to the editor bound to it, with the start card up; the Sources panel
+    lists both outputs from their envelopes (no pull); adding an image compiles ONE hidden
+    Page Input bound to the output and hides the card; *Compute sources* is a payload-only
+    fetch — the Viewer is not retargeted and holds what it held; the item renders at the
+    plane's size with a window per channel; a labels layer draws the label raster; an
+    alt-drag popout gets a zoom link whose box is its window on the parent and whose leader
+    follows the child when it moves; a twin shares the region; a LUT share gives the twin
+    the popout's windows; a colour bar, a histogram and a text item land; a PNG export at
+    the page's dpi is the page's pixel size and two exports are identical bytes; the SVG
+    carries paths and the text; the PDF is a PDF; undo / redo round-trip; the file carries
+    the figure and the shadow input; the checks name the bar-less twin; a property edit
+    commits; showing a graph page unbinds the editor and coming back rebinds it unchanged."""
+    import os as _os
+    import tempfile as _tempfile
+    import numpy as _np
+    from PIL import Image as _Image
+    from PySide6.QtCore import QRectF as _QRectF
+    from nodegraph.dataset import AxisSizes
+    from nodegraph.figure import schema as _FS
+    from nodegraph.metadata import MetaEnvelope
+    from nodelab_v2 import runner as _RN
+    from nodelab_v2.figure_editor.items import HistogramItem as _HistogramItem
+    from nodelab_v2.figure_editor.sources import describe_envelope as _describe
+
+    def wait(pred, timeout=120.0):
+        t0 = time.time()
+        while not pred() and time.time() - t0 < timeout:
+            app.processEvents()
+            time.sleep(0.01)
+        return pred()
+
+    def _stop(k: int) -> bool:          # a bisecting hook: NDFIG_STOP_AT=k returns early
+        return os.environ.get("NDFIG_STOP_AT") == str(k)
+
+    win.file_new()
+    app.processEvents()
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner._raw_src.clear()
+    win.runner.invalidate()
+    _RN._SYNTH_AXES = AxisSizes(m=2, t=3, z=4, c=2, y=96, x=128)
+    ws = win.workspace
+    pids = {p.kind: p.id for p in ws.pages.values()}
+    an = ws.pages[pids["analyze"]]
+    assert an.figure is not None and not an.doc.nodes, "the Analysis page is a figure page"
+    inp = ws.pages[pids["input"]].doc
+    inp.add_node("io.load", node_id="S", x=0, y=0)
+    inp.set_meta_seed("S", MetaEnvelope(axes=_RN._SYNTH_AXES, metadata=dict(_RN._SYNTH_META)))
+    inp.add_node("page.output", node_id="raw", x=300, y=0, params={"name": "raw"})
+    inp.connect("S", "image", "raw", "data")
+    pro = ws.pages[pids["process"]].doc
+    pro.add_node("page.input", node_id="in", x=0, y=0, params={"source": f"{pids['input']}:raw"})
+    pro.add_node("analysis.threshold", node_id="thr", x=300, y=0)
+    pro.add_node("analysis.label", node_id="lab", x=600, y=0)
+    pro.add_node("page.output", node_id="cells", x=900, y=0, params={"name": "cells"})
+    pro.connect("in", "out", "thr", "data")
+    pro.connect("thr", "out", "lab", "data")
+    pro.connect("lab", "out", "cells", "data")
+    app.processEvents()
+
+    c = win._canvas
+    win._show_page(c, pids["analyze"])
+    app.processEvents()
+    assert c.is_figure() and c.figure.bound() == pids["analyze"], (c.is_figure(), c.figure.bound())
+    ed = c.figure
+    if _stop(1):
+        return
+    assert ed.start.isVisible(), "the start card shows on an empty figure page"
+    cat = {r["value"]: r for r in ed.sources_panel.catalog}
+    assert f"{pids['input']}:raw" in cat and f"{pids['process']}:cells" in cat, list(cat)
+    d = _describe(cat[f"{pids['process']}:cells"]["env"])
+    assert d["image"] and d["channels"] == 2 and d["labels"], d
+    lab_layer = d["labels"][0][0]
+
+    viewed, held = win._viewed, set(win.runner._views)
+    shown = []
+    win.runner.finished.connect(lambda nid, *a: shown.append(nid))
+    iid = ed.add_image(f"{pids['process']}:cells")
+    app.processEvents()
+    sid = ed.document["sources"][0]["id"]
+    shadow = f"__fig_src__{sid}"
+    assert set(an.doc.nodes) == {shadow}, set(an.doc.nodes)
+    assert an.doc.nodes[shadow].params["source"] == f"{pids['process']}:cells"
+    assert not ed.start.isVisible()
+    assert ed._items[iid].rendered is None and "not computed" in ed._items[iid].note
+    assert ed.compute_sources() == 1
+    assert wait(lambda: bool(ed._payloads), 120), "the source never arrived"
+    assert wait(lambda: ed._items[iid].rendered is not None and not ed.busy(), 60), \
+        ed._status.text()
+    assert win._viewed == viewed and set(win.runner._views) == held \
+        and win.runner.run_id("S") not in shown, ("a figure fetch reached the Viewer",
+                                                  win._viewed, shown)
+    r = ed._items[iid].rendered
+    assert r.plane_shape == (96, 128) and set(r.clims) == {0, 1} and r.image.width() == 128, (
+        r.plane_shape, r.clims, r.image.width())
+    if _stop(2):
+        return
+
+    ed.add_layer(iid, "label", lab_layer, "labels")
+    app.processEvents()
+    ed.render_now(iid)
+    r = ed._items[iid].rendered
+    assert r.geometry is not None and r.geometry.label_plane is not None \
+        and int(r.geometry.label_plane.max()) >= 1, "the labels layer drew no raster"
+
+    zid = ed.add_popout(iid, (0.25, 0.75, 0.25, 0.75))
+    app.processEvents()
+    assert [(cid, w) for cid, w, _b in ed._items[iid].zoom_boxes] == \
+        [(zid, (0.25, 0.75, 0.25, 0.75))], ed._items[iid].zoom_boxes
+    ed.render_now(zid)
+    assert ed._items[zid].rendered.plane_shape == (48, 64), ed._items[zid].rendered.plane_shape
+    lead = ed._leaders[(iid, zid)]
+    before = _QRectF(lead.b)
+    ed.set_geometry(zid, [60.0, 10.0, 25.0, 19.0])
+    app.processEvents()
+    assert lead.b != before and lead.b.left() > lead.a.right(), (lead.a, lead.b)
+
+    tw = ed.add_twin(zid)
+    app.processEvents()
+    assert _FS.effective_image(ed.document, tw)["region"] == {
+        "from": "rect_frac", "rect_frac": [0.25, 0.75, 0.25, 0.75]}
+    ed.render_now(tw)
+    assert ed._items[tw].rendered.plane_shape == (48, 64)
+    ed.share_lut([zid, tw])
+    app.processEvents()
+    ed.render_now(zid)
+    ed.render_now(tw)
+    assert ed._items[tw].rendered.clims == ed._items[zid].rendered.clims, (
+        ed._items[tw].rendered.clims, ed._items[zid].rendered.clims)
+    assert all(ch["mode"] == "shared" for ch in _FS.item(ed.document, tw)["image"]["channels"]) \
+        or not _FS.item(ed.document, tw)["image"]["channels"]
+
+    if _stop(3):
+        return
+    ed.add_colorbar_for(zid)
+    hb = ed.add_histogram_for(zid)
+    ed.add_item("text", text="hello figure")
+    app.processEvents()
+    assert isinstance(ed._items[hb], _HistogramItem) and ed._items[hb].counts is not None
+
+    tmp = _tempfile.mkdtemp(prefix="nd2sb_figure_")
+    png = ed.export(_os.path.join(tmp, "f.png"), "png")
+    png2 = ed.export(_os.path.join(tmp, "g.png"), "png")
+    with open(png, "rb") as f1, open(png2, "rb") as f2:
+        assert f1.read() == f2.read(), "two exports of one page differ"
+    a = _np.asarray(_Image.open(png))
+    page = ed.document["page"]
+    want = (int(round(page["height_mm"] * page["dpi"] / 25.4)),
+            int(round(page["width_mm"] * page["dpi"] / 25.4)))
+    assert a.shape[:2] == want, (a.shape, want)
+    if not _os.environ.get("NDFIG_NO_SVG"):       # a bisecting hook: QtSvg loads here
+        with open(ed.export(_os.path.join(tmp, "f.svg"), "svg"), encoding="utf8") as f:
+            svg = f.read()
+        assert "<path" in svg and "hello figure" in svg, "the SVG lacks paths or the text"
+    pdf = ed.export(_os.path.join(tmp, "f.pdf"), "pdf")
+    with open(pdf, "rb") as f:
+        assert f.read(4) == b"%PDF" and _os.path.getsize(pdf) > 1000
+
+    if _stop(4):
+        return
+    n_items = len(ed.document["items"])
+    ed.undo()
+    assert len(ed.document["items"]) == n_items - 1
+    ed.redo()
+    assert len(ed.document["items"]) == n_items
+    dd = ws.to_dict()
+    rec = next(r for r in dd["workspace"]["pages"] if r["id"] == pids["analyze"])
+    assert rec["figure"]["items"] and shadow in str(rec["graph"]), "the file lacks the figure"
+    assert not any(x["code"] == "scale_bar" for x in ed.checks()), ed.checks()
+    ed.edit_item(tw, "image.decor.scale_bar_um", 0)        # a twin without its bar
+    codes = {(x["code"], x["item"]) for x in ed.checks()}
+    assert ("scale_bar", tw) in codes and ("scale_bar", zid) not in codes, codes
+    ed.select([iid])
+    app.processEvents()
+    ed.edit_item(iid, "letter", "Q")
+    assert _FS.item(ed.document, iid)["letter"] == "Q"
+
+    win._show_page(c, pids["process"])
+    app.processEvents()
+    assert not c.is_figure() and ed.bound() is None, (c.is_figure(), ed.bound())
+    win._show_page(c, pids["analyze"])
+    app.processEvents()
+    assert ed.bound() == pids["analyze"] and len(ed.document["items"]) == n_items
+    assert wait(lambda: not ed.busy(), 60), "the render thread never went idle"
+    win._show_page(c, pids["input"])
+    app.processEvents()
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
+    _ok("Figure Editor (V5.00 step 3): the Analysis page shows the editor bound to it with "
+        "the start card; the Sources panel lists the feeder outputs from envelopes; an image "
+        "compiles one hidden Page Input; Compute sources fetches without touching the "
+        "Viewer; the image renders with a window per channel and draws a labels layer; a "
+        "popout gets a zoom box and a leader that follows it; a twin shares the region and a "
+        "LUT share its windows; colour bar, histogram and text land; PNG at the page's size "
+        "and identical twice, SVG with paths and text, a PDF; undo/redo; the file carries the "
+        "figure; checks name the bar-less twin; edits commit; a graph page unbinds, coming "
+        "back rebinds")
+
+
 def main(argv) -> int:
     out = argv[1] if len(argv) > 1 else "nodelab_v2_phase5.png"
     app = QApplication(sys.argv[:1])
@@ -6516,6 +6719,7 @@ def main(argv) -> int:
         "frames tap keeping t10-19")
 
     _probe_movie_editor(win, app)
+    _probe_figure_editor(win, app)
 
     # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _PEv, QPointF as _PPF, Qt as _PQt
@@ -10134,6 +10338,10 @@ def main(argv) -> int:
     # same discipline as the LabLink panel above
     from nodegraph import parallel as _par_end
     _par_end.shutdown(threads=True)
+    # the Figure Editors' render threads (V5.00 step 3), for the same reason as the Movie
+    # Editor's: a Python thread torn down under os._exit crashes the process
+    for _ed in win._figure_editors():
+        _ed.shutdown()
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)
