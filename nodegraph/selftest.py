@@ -21017,9 +21017,10 @@ def test_lablink() -> None:
     # A client socket timeout at or below the long-poll ceiling turns every SUCCESSFUL long
     # poll into an apparent dead server.
     assert LC.HubClient("http://x", "t").timeout > LP.LONGPOLL_MAX_S
-    # Every artifact kind we advertise must have something that can write it.
+    # Every artifact kind we advertise must have something that can write it — a Dataset
+    # writer, or the run loop itself (metrics; the figure, rendered in a subprocess).
     for kind in LP.ARTIFACT_KINDS:
-        assert kind in LA.WRITERS or kind == "metrics", \
+        assert kind in LA.WRITERS or kind in ("metrics", "figure"), \
             f"hello advertises artifact kind {kind!r} with no writer for it"
     _ok("LabLink wire constants: graph format tracks nodegraph.serialize, node states are "
         "the engine's observer events, hub-only error codes are unemittable by "
@@ -36776,6 +36777,11 @@ def main() -> int:
     test_measure_pixels()
     test_table_export_split()
     test_figure_core()
+    test_figure_page()
+    test_figure_paper()
+    test_figure_recipes_builtin()
+    test_figure_headless_render()
+    test_figure_data()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
@@ -37105,6 +37111,709 @@ def test_figure_core() -> None:
         and _OR.scalar_rgba is _OM.scalar_rgba
     _ok("overlay maths: nodelab_v2.overlay_render is a shim over "
         "nodegraph.catalog._shared.overlay_math")
+
+
+def test_figure_page() -> None:
+    """V5.00 step 2: an Analysis page is a FIGURE page. It carries a
+    :class:`nodelab_v2.figure_document.FigureDocument` beside its graph document, which is
+    the figure's SHADOW graph — one hidden Page Input per figure source, added, re-bound and
+    removed by the figure's own edits and never touching a hand-placed node — so
+    ``compose`` drops the inputs and maps each source to the upstream Output's run id, the
+    page summary names the sources, the outline lists the items after them, the file
+    carries the figure on the page record and a round trip is byte-identical, a bad figure
+    is refused by page and spec path with the workspace untouched, a V4 Analysis page
+    holding nodes opens as a Free page "(graph)" (its linked pages with it) while an empty
+    one is simply a figure page, a figure page cannot be linked or be a master, a unique
+    copy has its own figure, seeding and reset know figure pages."""
+    import json as _json
+    from nodegraph.figure import schema as FS
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.figure_document import FigureDocument
+    from nodelab_v2.workspace import FIGURE_KIND, Workspace, standard_kinds
+    OPS.ensure_ops()
+
+    # File → New: the fourth page is a figure page, the others are not
+    ws = Workspace.standard(GraphDocument())
+    an = [p for p in ws.pages.values() if p.kind == FIGURE_KIND][0]
+    assert an.figure is not None and an.figure.goal is None and not an.doc.nodes
+    assert all(p.figure is None for p in ws.pages.values() if p.kind != FIGURE_KIND)
+
+    # the fixture chain + a figure page reading two outputs
+    ws, ds, env, ax = _ws_fixture()
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    rev0 = ws.revision
+    changed = fp.figure.edit(lambda d: d.update(goal="overlay", sources=[
+        {"id": "raw", "source": "pg1:raw", "label": "raw"},
+        {"id": "smooth", "source": "pg2:smooth"}]))
+    assert changed and ws.revision > rev0 and fp.figure.revision == 1
+    assert not fp.figure.edit(lambda d: None), "a no-op edit bumps nothing"
+    sid = {s: FigureDocument.shadow_id(s) for s in ("raw", "smooth")}
+    assert set(fp.doc.nodes) == set(sid.values()), set(fp.doc.nodes)
+    assert all(fp.doc.nodes[n].op_key == "page.input" for n in sid.values())
+    assert fp.doc.nodes[sid["raw"]].params["source"] == "pg1:raw"
+    assert ws.page_summary(fp.id) == (["Input · raw", "Refine · smooth"], [])
+    envs = fp.figure.envelopes(ws, fp.id)
+    assert set(envs) == {"raw", "smooth"} and envs["raw"].axes == ax
+    assert fp.figure.source_labels(ws, fp.id) == {"raw": "Input · raw",
+                                                  "smooth": "Refine · smooth"}
+    comp = ws.compose(fp.id)
+    assert not any(n.op_key == "page.input" for n in comp.graph.nodes.values())
+    assert fp.figure.run_ids(comp, fp.id) == {"raw": "pg1/O", "smooth": "pg2/O"}
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    assert eng.pull("pg2/O").axes == ax
+    # re-bind and removal follow the figure; an unbound source is labelled and has no envelope
+    fp.figure.edit(lambda d: d.__setitem__("sources", [{"id": "raw", "source": "pg2:smooth"}]))
+    assert set(fp.doc.nodes) == {sid["raw"]} \
+        and fp.doc.nodes[sid["raw"]].params["source"] == "pg2:smooth"
+    fp.figure.edit(lambda d: d.__setitem__("sources", [{"id": "raw", "source": "pg2:gone"}]))
+    assert fp.figure.envelopes(ws, fp.id) == {}
+    assert fp.figure.source_labels(ws, fp.id) == {"raw": "pg2:gone (unbound)"}
+    assert fp.figure.run_ids(ws.compose(fp.id), fp.id) == {"raw": f"{fp.id}/{sid['raw']}"}
+    # a hand-placed node is never the sync's to touch
+    fp.doc.add_node("page.input", node_id="mine", params={"source": "pg1:raw"})
+    fp.figure.edit(lambda d: d.__setitem__("sources", []))
+    assert set(fp.doc.nodes) == {"mine"}
+    # items in the outline, after the input rows
+    fp.figure.edit(lambda d: d.update(
+        sources=[{"id": "raw", "source": "pg1:raw", "label": "raw"}],
+        items=[{"id": "img", "kind": "image", "rect_mm": [0, 0, 40, 30], "letter": "A",
+                "image": {"source": "raw"}},
+               {"id": "ch", "kind": "chart", "rect_mm": [0, 32, 40, 30], "letter": "B",
+                "chart": {"kind": "xy", "source": "raw"}}]))
+    rows = ws.page_outline(fp.id)
+    assert [r.role for r in rows] == ["input", "input", "node", "node"], rows
+    assert rows[2].title == "A · image" and rows[2].detail == "Input · raw" and rows[2].why_not
+    assert rows[3].title == "B · chart" and rows[3].detail == "xy · Input · raw"
+
+    # the file: the figure rides the page record; a round trip is byte-identical
+    d = ws.to_dict()
+    rec = next(r for r in d["workspace"]["pages"] if r["id"] == fp.id)
+    assert rec["figure"]["goal"] == "overlay" and rec["figure"]["schema"] == FS.SCHEMA \
+        and "graph" in rec
+    assert all("figure" not in r for r in d["workspace"]["pages"] if r["id"] != fp.id)
+    s = _json.dumps(d, sort_keys=True)
+    ws2 = Workspace()
+    ws2.load_dict(_json.loads(s))
+    f2 = ws2.pages[fp.id]
+    assert f2.kind == FIGURE_KIND and f2.figure is not None \
+        and f2.figure.digest() == fp.figure.digest()
+    assert set(f2.doc.nodes) == {sid["raw"], "mine"}
+    assert _json.dumps(ws2.to_dict(), sort_keys=True) == s
+    assert ws2.page_outline(fp.id)[2].title == "A · image"
+    # a bad figure is refused by page and spec path, and the workspace is untouched
+    bad = _json.loads(s)
+    brec = next(r for r in bad["workspace"]["pages"] if r["id"] == fp.id)
+    brec["figure"]["items"][0]["rect_mm"] = [0, 0, -1, 1]
+    before = _json.dumps(ws2.to_dict(), sort_keys=True)
+    try:
+        ws2.load_dict(bad)
+        raise AssertionError("a bad figure loaded")
+    except ValueError as exc:
+        assert fp.id in str(exc) and "items[0].rect_mm" in str(exc), exc
+    assert _json.dumps(ws2.to_dict(), sort_keys=True) == before
+    # LEGACY: a V4 Analysis page holding nodes (no figure) opens as a Free page "(graph)",
+    # and a page linked to it follows; an EMPTY V4 Analysis page is simply a figure page
+    old = _json.loads(s)
+    orec = next(r for r in old["workspace"]["pages"] if r["id"] == fp.id)
+    del orec["figure"]
+    old["workspace"]["pages"].append({"id": "pg99", "name": "Figures (linked)",
+                                      "kind": FIGURE_KIND, "master": fp.id, "overrides": {}})
+    ws3 = Workspace()
+    ws3.load_dict(old)
+    p3 = ws3.pages[fp.id]
+    assert p3.kind == "free" and p3.name == "Figures (graph)" and p3.figure is None
+    assert set(p3.doc.nodes) == {sid["raw"], "mine"}
+    assert ws3.page_summary(fp.id)[0] == ["Input · raw", "Input · raw"]
+    lk = ws3.pages["pg99"]
+    assert lk.kind == "free" and lk.master == fp.id and lk.name == "Figures (linked) (graph)"
+    old2 = _json.loads(s)
+    orec2 = next(r for r in old2["workspace"]["pages"] if r["id"] == fp.id)
+    del orec2["figure"]
+    orec2["graph"]["nodes"] = type(orec2["graph"]["nodes"])()
+    orec2["graph"]["edges"] = type(orec2["graph"]["edges"])()
+    ws4 = Workspace()
+    ws4.load_dict(old2)
+    assert ws4.pages[fp.id].kind == FIGURE_KIND and ws4.pages[fp.id].figure is not None \
+        and ws4.pages[fp.id].figure.sources == []
+    # a current file whose linked page names a figure page as master is refused
+    bad2 = _json.loads(s)
+    bad2["workspace"]["pages"].append({"id": "pg98", "name": "L", "kind": FIGURE_KIND,
+                                       "master": fp.id, "overrides": {}})
+    try:
+        Workspace().load_dict(bad2)
+        raise AssertionError("a page linked to a figure page loaded")
+    except ValueError as exc:
+        assert "cannot be linked" in str(exc)
+
+    # a figure page cannot be linked or be a master; a unique copy carries its own figure
+    try:
+        ws.duplicate_page(fp.id, dependent=True)
+        raise AssertionError("linked a figure page")
+    except ValueError as exc:
+        assert "cannot be linked" in str(exc)
+    try:
+        ws.set_master(fp.id)
+        raise AssertionError("a figure page became a master")
+    except ValueError as exc:
+        assert "figure" in str(exc)
+    cp = ws.duplicate_page(fp.id)
+    assert cp.figure is not None and cp.figure is not fp.figure \
+        and cp.figure.digest() == fp.figure.digest()
+    assert set(cp.doc.nodes) == {sid["raw"], "mine"}
+    cp.figure.edit(lambda d: d.__setitem__("goal", "plot"))
+    assert fp.figure.goal == "overlay", "the copy's figure is its own"
+    # seeding never seeds a figure page; reset drops the figure of the page it keeps
+    assert ws.seed_input(ws.add_page("Another", FIGURE_KIND).id) is None
+    ws.set_active(fp.id)
+    ws.reset()
+    first = ws.pages[list(ws.pages)[0]]
+    assert first.id == fp.id and first.kind == "input" and first.figure is None
+    assert [p.kind for p in ws.pages.values()] == list(standard_kinds())
+    assert ws.pages[list(ws.pages)[-1]].figure is not None
+    first.doc.add_node("io.load")                 # the kept document still edits normally
+    _ok("figure page (V5.00 step 2): an Analysis page carries a FigureDocument whose sources "
+        "are hidden Page Inputs on its graph — composed, summarised and outlined like any "
+        "page; the figure rides the file and round-trips byte-identical, a bad one is "
+        "refused by path; a V4 Analysis graph opens as a Free page (graph) with its linked "
+        "pages; no linking, no mastering, a copy has its own figure; seeding and reset agree")
+
+
+def test_figure_data() -> None:
+    """The figure's Data step (V5.00 step 4): a data entry compiles into the shadow graph
+    as ``analysis.if_else`` (its filter) → ``table.aggregate`` (its summary), with
+    ``table.concat`` in front when it pools several sources; ``run_ids`` names its terminal
+    stage; the composed graph pulls through it on the real catalog; the chart modules
+    resolve series and geometry from the summary, and a chart's CSV is its values; removing
+    the entry removes its stages; the schema refuses a bad op and an unknown source."""
+    from nodegraph.figure import charts as C
+    from nodegraph.figure import schema as FS
+    from nodegraph.memo import Memo
+    from nodegraph.tables import all_tables
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.figure_document import DATA_PREFIX, FigureDocument
+    from nodelab_v2.workspace import FIGURE_KIND, Workspace
+
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+    P1.doc.add_node("analysis.label", node_id="L")
+    P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.doc.connect("X", "out", "T", "data")
+    P1.doc.connect("T", "out", "L", "data")
+    P1.doc.connect("L", "out", "O", "data")
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    entry = {"id": "d1", "from": ["cells"], "domain": "label", "table": "labels",
+             "where": [["area", ">", 1]],
+             "aggregate": {"group_by": ["t"], "value": "area", "reducers": ["mean", "count"],
+                           "name": "summary"}}
+    fp.figure.edit(lambda d: d.update(
+        goal="plot", sources=[{"id": "cells", "source": "pg3:cells"}], data=[entry],
+        items=[{"id": "ch", "kind": "chart", "rect_mm": [0, 0, 60, 45], "letter": "A",
+                "chart": {"kind": "bar", "data": "d1", "x": "t", "y": "area_mean"}}]))
+    fig = fp.figure
+    assert fig.data_stages(fig.data[0]) == ["where", "agg"], fig.data_stages(fig.data[0])
+    w_id, a_id = fig.data_id("d1", "where"), fig.data_id("d1", "agg")
+    src = FigureDocument.shadow_id("cells")
+    assert set(fp.doc.nodes) == {src, w_id, a_id}, set(fp.doc.nodes)
+    assert fp.doc.nodes[w_id].op_key == "analysis.if_else" \
+        and fp.doc.nodes[w_id].params["column1"] == "area" \
+        and fp.doc.nodes[w_id].params["op1"] == ">" \
+        and fp.doc.nodes[w_id].params["labels"] == "labels"
+    assert fp.doc.nodes[a_id].op_key == "table.aggregate" \
+        and fp.doc.nodes[a_id].params == {"table": "d1_pass", "group_by": "t", "value": "area",
+                                          "reducers": "mean,count", "name": "summary"}
+    assert (src, "out", w_id, "data") in fp.doc.edges and (w_id, "out", a_id, "data") in fp.doc.edges
+    assert fig.data_terminal("d1") == a_id and fig.data_table_name("d1") == "summary"
+    comp = ws.compose(fp.id)
+    rids = fig.run_ids(comp, fp.id)
+    assert rids == {"cells": "pg3/O", "d1": f"{fp.id}/{a_id}"}, rids
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    out = eng.pull(rids["d1"])
+    tables = all_tables(out)
+    assert ("label", "summary") in tables, sorted(tables)
+    summ = tables[("label", "summary")]
+    assert "area_mean" in summ and "n" in summ and len(summ["area_mean"]) == 1 \
+        and float(summ["area_mean"][0]) > 0 and int(summ["area_count"][0]) == 1, (
+            {k: v.tolist() for k, v in summ.items()})
+    area = float(summ["area_mean"][0])
+    # the chart modules, Qt-free: series from the table, geometry with the default measure
+    from nodelab_v2.figure_editor import charts_data as CD
+    chart = FS.normalize(fig.to_dict())["items"][0]["chart"]
+    chart = dict(chart, table=fig.data_table_name("d1"))
+    series, units, note = CD.resolve_series(chart, tables, {})
+    assert not note and len(series) == 1 and series[0]["y"] == [area], (series, note)
+    g = C.chart_geometry(chart, series, rect_mm=[0, 0, 60, 45],
+                         style={"font_pt": 8, "line_width": 1, "marker_size": 3,
+                                "palette": "colorblind"})
+    bars = [m for m in g["marks"] if m["kind"] == "rects" and m["role"] == "bars"]
+    assert bars and len(bars[0]["rects_mm"]) == 1 and g["x"]["categories"] == ["0"], (
+        bars, g["x"])
+    csv = CD.chart_csv(chart, series).splitlines()
+    assert csv[0] == "series,category,mean,err,n" and csv[1].split(",")[1:3] == ["0", str(area)], csv
+    # an XY chart over the raw labels carries the row ride-along per point
+    xy = dict(FS.chart_defaults(), kind="xy", source="cells", table="labels", x="x", y="area")
+    s2, _u, note = CD.resolve_series(xy, all_tables(eng.pull("pg3/O")), {})
+    assert not note and s2[0]["rows"] and s2[0]["rows"][0].count(",") == 4, (s2, note)
+    hit = C.nearest_mark(C.chart_geometry(xy, s2, rect_mm=[0, 0, 60, 45],
+                                          style={"font_pt": 8}), 30.0, 22.5, within_mm=60)
+    assert hit is not None and hit["series"] == 0
+    # pooling two sources adds a concat in front; removing the entry removes its stages
+    fig.edit(lambda d: d.update(
+        sources=[{"id": "cells", "source": "pg3:cells"}, {"id": "more", "source": "pg3:cells"}],
+        data=[dict(entry, **{"from": ["cells", "more"]})]))
+    c_id = fig.data_id("d1", "concat")
+    assert fig.data_stages(fig.data[0]) == ["concat", "where", "agg"]
+    assert fp.doc.nodes[c_id].op_key == "table.concat" \
+        and {e[0] for e in fp.doc.edges if e[2] == c_id} == {src, FigureDocument.shadow_id("more")}
+    assert (c_id, "out", w_id, "data") in fp.doc.edges
+    fig.edit(lambda d: d.update(data=[], items=[]))
+    assert not any(n.startswith(DATA_PREFIX) for n in fp.doc.nodes), set(fp.doc.nodes)
+    # the schema: a bad op, an unknown source, a chart naming a missing entry
+    for bad, path in (({"id": "d2", "from": ["cells"], "where": [["area", "~", 1]]}, "data[0].where[0].op"),
+                      ({"id": "d2", "from": ["nope"]}, "data[0].from[0]")):
+        try:
+            FS.normalize(dict(fig.to_dict(), data=[bad]))
+        except FS.FigureError as exc:
+            assert exc.path == path, (exc.path, path)
+        else:
+            raise AssertionError(f"accepted {bad}")
+    try:
+        FS.normalize(dict(fig.to_dict(), items=[{"id": "c", "kind": "chart", "rect_mm": [0, 0, 1, 1],
+                                                 "chart": {"data": "ghost"}}]))
+    except FS.FigureError as exc:
+        assert exc.path == "items[0].chart.data", exc.path
+    else:
+        raise AssertionError("a chart may not name a missing data entry")
+    print("[ok] figure data: where → aggregate compile into the shadow graph, pull through "
+          "the real catalog, series + geometry + CSV from the summary, concat for pooled "
+          "sources, removal, schema refusals")
+
+
+def test_figure_paper() -> None:
+    """Paper-readiness (V5.00 step 5), Qt-free: panels re-letter in reading order with a
+    popout unlettered; style sync applies the preset to the page and clears item
+    overrides; every chart palette passes the ΔE validator on both page colours as drawn
+    (a grey ramp re-spaced, black lifted on a dark page); a summary table reduces a table
+    per group with the statistics asked for and formats for print; the export bundle
+    composes the canonical document, the legend sentence, a provenance record naming the
+    sources, run ids, lineage and files, and a CSV per data file; ``write_bundle`` puts
+    them beside the picture."""
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph.catalog._shared.figure import PALETTES
+    from nodegraph.figure import bundle as FB
+    from nodegraph.figure import layout as L
+    from nodegraph.figure import schema as S
+    from nodegraph.figure import tables as FT
+
+    # re-lettering: rows top to bottom, left to right; the zoom child gets none
+    doc = S.normalize({"page": {"letters": "A"}, "sources": [{"id": "s", "source": "pg1:raw"}],
+                       "items": [{"id": "b", "kind": "chart", "rect_mm": [50, 1, 30, 20],
+                                  "chart": {"kind": "xy", "source": "s"}},
+                                 {"id": "a", "kind": "image", "rect_mm": [0, 0, 40, 30],
+                                  "image": {"source": "s"}},
+                                 {"id": "c", "kind": "image", "rect_mm": [0, 35, 40, 30],
+                                  "image": {"source": "s"}},
+                                 {"id": "z", "kind": "image", "rect_mm": [45, 35, 10, 10],
+                                  "letter": "Q", "image": {"source": "s", "region": {
+                                      "from": "rect_frac", "rect_frac": [0, .5, 0, .5]}}},
+                                 {"id": "t", "kind": "text", "rect_mm": [0, 70, 10, 5],
+                                  "text": "hi", "pt": 12.0},
+                                 {"id": "sh", "kind": "shape", "rect_mm": [0, 80, 10, 5],
+                                  "width_pt": 3.0}],
+                       "links": [{"kind": "zoom", "parent": "c", "child": "z"}]})
+    assert L.reletter(doc) == {"a": "A", "b": "B", "c": "C", "z": ""}, L.reletter(doc)
+    assert L.reletter(dict(doc, page=dict(doc["page"], letters="(A)")))["b"] == "(B)"
+    assert L.reletter(dict(doc, page=dict(doc["page"], letters="none"))) == \
+        {"a": "", "b": "", "c": "", "z": ""}
+    assert L.reading_order([{"id": "r", "rect_mm": [60, 2, 10, 10]},
+                            {"id": "l", "rect_mm": [0, 0, 50, 40]},
+                            {"id": "d", "rect_mm": [0, 45, 10, 10]}]) == ["l", "r", "d"]
+    # style sync: the preset lands on the page, overrides clear
+    synced = L.style_sync(doc, "talk")
+    assert synced["page"]["font_pt"] == 14.0 and synced["page"]["line_width"] == 1.5 \
+        and synced["page"]["style"] == "talk" and not synced["page"]["dark"]
+    assert S.item(synced, "t")["pt"] is None and S.item(synced, "sh")["width_pt"] == 1.5
+    assert L.style_sync(doc, "dark")["page"]["dark"] is True
+    S.normalize(synced)                                   # still a valid document
+    # the palette validator: every palette, both pages, as drawn
+    for name, cols in PALETTES.items():
+        for dark in (False, True):
+            eff = L.effective_palette(cols, dark=dark)
+            rep = L.palette_report(eff, background=L.DARK_PAGE if dark else L.LIGHT_PAGE)
+            assert not rep, (name, dark, rep)
+            assert len(eff) == len(cols)
+    assert L.palette_report(["#000000", "#050505"]) and \
+        L.palette_report(["#ffffff"], background=L.LIGHT_PAGE)
+    assert L.effective_palette(PALETTES["colorblind"], dark=True)[-1] != "#000000" \
+        and L.effective_palette(PALETTES["colorblind"], dark=False) == PALETTES["colorblind"]
+    assert 2.0 < L.delta_e("#ff0000", "#fe0000") < 3.0 or L.delta_e("#ff0000", "#fe0000") < 3.0
+    # a summary table
+    cols = {"id": np.arange(6), "t": np.array([0, 0, 0, 1, 1, 1]),
+            "area": np.array([10.0, 20.0, 30.0, 1.0, 2.0, np.nan]),
+            "name": np.array(["a", "b", "c", "d", "e", "f"])}
+    header, rows = FT.summary_table(cols, ["area"], group_by="t", stats=["n", "mean", "sem"])
+    assert header == ["t", "n", "area mean", "area SEM"], header
+    assert rows[0][:3] == ["0", "3", "20"] and rows[1][:2] == ["1", "2"], rows
+    header, rows = FT.summary_table(cols, [], stats=["n", "median", "max"], decimals=1)
+    assert header == ["n", "area median", "area max"] and rows == [["5", "10.0", "30.0"]], (
+        header, rows)
+    assert FT.table_csv(header, rows).splitlines()[1] == "5,10.0,30.0"
+    try:
+        FT.summary_table(cols, ["area"], stats=["mode"])
+        raise AssertionError("an unknown statistic must be ignored, not raise")
+    except ValueError:
+        raise
+    except AssertionError:
+        pass
+    # the bundle
+    ax = AxisSizes(m=1, t=3, z=1, c=2, y=64, x=64)
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_bundle_") as tmp:
+        src = _os.path.join(tmp, "cells.nd2")
+        with open(src, "wb") as f:
+            f.write(b"\0" * 10)
+        env = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.325, "dt_s": 2.0,
+                                               "channel_names": ["DAPI", "GFP"],
+                                               "source_path": [src],
+                                               "source_file": ["cells.nd2"]})
+        files = FB.bundle_files(doc, {"s": env}, data_files={"A chart": "x,y\n1,2\n"},
+                                run_ids={"s": "pg1/O"}, lineage={"s": "abc123"},
+                                lut_windows={"a": [(0, 10.0, 200.0)]}, app_version="test 1")
+        assert set(files) == {"figure.json", "legend.txt", "provenance.json",
+                              "data/A_chart.csv"}, set(files)
+        assert _json.loads(files["figure.json"]) == S.normalize(doc)
+        assert "0.325" in files["legend.txt"], files["legend.txt"]
+        prov = _json.loads(files["provenance.json"])
+        assert prov["app_version"] == "test 1" and prov["figure_digest"] == S.digest(doc)
+        s0 = prov["sources"][0]
+        assert s0["run_id"] == "pg1/O" and s0["lineage"] == "abc123" \
+            and s0["files"][0]["path"] == src and s0["files"][0]["size"] == 10 \
+            and "mtime" in s0["files"][0] and s0["channel_names"] == ["DAPI", "GFP"], s0
+        assert prov["lut_windows"] == {"a": [[0, 10.0, 200.0]]}
+        stem = _os.path.join(tmp, "fig")
+        written = FB.write_bundle(stem, files)
+        assert sorted(_os.path.basename(p) for p in written) == \
+            ["A_chart.csv", "fig.figure.json", "fig.legend.txt", "fig.provenance.json"], written
+        assert _os.path.isdir(stem + ".data")
+        assert FB.write_bundle(stem, {"legend.txt": ""}) == []
+    _ok("figure paper: re-letter in reading order (popout unlettered), style sync, every "
+        "palette passes ΔE on both pages, summary table per group, the bundle's four files")
+
+
+def test_figure_recipes_builtin() -> None:
+    """Figure templates (V5.00 step 6): every built-in recipe loads and its stubbed figure
+    passes the schema; bound to a synthetic catalog, every slot finds a row carrying what
+    it needs, every placeholder resolves (a Page Output value, a layer name, a measured
+    column) and the result normalizes; a catalog without the need reports the slot and
+    keeps the placeholder; a figure in hand round-trips to a recipe and back; the user
+    folder shadows a built-in by name and can be switched off."""
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph.figure import schema as S
+    from nodelab_v2 import figure_recipes as FR
+
+    saved = {k: _os.environ.get(k) for k in (FR.ENV_ENABLED, FR.ENV_DIR)}
+    _os.environ[FR.ENV_ENABLED] = "0"
+    try:
+        recipes = FR.list_recipes()
+        assert len(recipes) >= 5 and all(r.builtin for r in recipes), [r.name for r in recipes]
+        slugs = {r.slug for r in recipes}
+        assert {"segment-measure-summary", "tracking-summary", "standard-curve",
+                "plate-overview-with-popout"} <= slugs, slugs
+        cat = [{"value": "pg3:cells", "label": "P1 · cells", "image": True, "channels": 2,
+                "channel_names": ["DAPI", "GFP"],
+                "axes": {"m": 3, "t": 4, "z": 1, "c": 2, "y": 64, "x": 64},
+                "labels": [("labels", ["id", "m", "t", "z", "y", "x", "area", "mean_intensity"])],
+                "points": [], "fields": [("piv", ["id", "y", "x", "disp_y", "disp_x", "speed"])],
+                "tracks": [("tracks", ["id", "track_id", "t", "y", "x", "track_length"])],
+                "mesh": []},
+               {"value": "pg1:raw", "label": "Input · raw", "image": True, "channels": 1,
+                "channel_names": [], "axes": {"m": 3, "t": 4, "z": 1, "c": 1, "y": 64, "x": 64},
+                "labels": [], "points": [], "tracks": [], "fields": [], "mesh": []}]
+        for r in recipes:
+            doc, missing = FR.bind_recipe(r, cat)
+            assert not missing, (r.slug, missing)
+            nd = S.normalize(doc)
+            text = S.canonical_json(nd)
+            assert "slot:" not in text, (r.slug, [l for l in text.split(",") if "slot:" in l][:3])
+            assert nd["sources"] and all(s["source"].startswith("pg") for s in nd["sources"])
+            for it in nd["items"]:
+                if it["kind"] in ("image", "montage"):
+                    assert it["image"]["channels"], (r.slug, it["id"])
+            assert FR.applicable(r, cat)
+        seg = FR.find_recipe("Segment & measure summary")
+        assert seg is not None and seg.slug == "segment-measure-summary"
+        doc, _m = FR.bind_recipe(seg, cat)
+        field = S.item(doc, "field")
+        assert field["image"]["layers"][0]["layer"] == "labels" \
+            and S.item(doc, "areas")["chart"]["value"] == "area" \
+            and S.item(doc, "summary")["table"]["columns"] == ["area"] \
+            and field["image"]["channels"][1]["label"] == "GFP", doc["items"]
+        curve = FR.bind_recipe(FR.find_recipe("standard-curve"), cat)[0]
+        assert S.item(curve, "curve")["chart"]["x"] == "area" \
+            and S.item(curve, "curve")["chart"]["y"] == "mean_intensity"
+        strain = FR.find_recipe("strain-speed-field-panel")
+        doc, _m = FR.bind_recipe(strain, cat)
+        assert S.item(doc, "heat")["image"]["layers"][0]["column"] == "speed"
+        # the plate recipe prefers the row the caller picks; a catalog without the need
+        plate = FR.find_recipe("plate-overview-with-popout")
+        doc, _m = FR.bind_recipe(plate, cat, picks={"plate": "pg1:raw"})
+        assert doc["sources"][0]["source"] == "pg1:raw" \
+            and S.item(doc, "overview")["image"]["channels"][0]["rgb"] == "#ffffff"
+        doc, missing = FR.bind_recipe(seg, cat[1:])
+        assert missing == ["cells"] and doc["sources"][0]["source"] == "slot:cells"
+        assert not FR.applicable(seg, cat[1:]) and FR.applicable(plate, cat[1:])
+        S.normalize(FR._stub(doc, ["cells"]))
+        # a figure → recipe → figure
+        rec = FR.recipe_from_figure(S.normalize(FR.bind_recipe(seg, cat)[0]), cat,
+                                    name="Mine", description="my own")
+        assert rec.slots == [{"id": "cells", "needs": "labels", "label": "P1 · cells"}]
+        back, _m = FR.bind_recipe(rec, cat)
+        assert S.canonical_json(S.normalize(back)) == \
+            S.canonical_json(S.normalize(FR.bind_recipe(seg, cat)[0])), "the round trip drifted"
+        # a bad recipe
+        for bad, why in (({"format": "x"}, "format"),
+                         ({"format": FR.RECIPE_FORMAT, "slots": [], "figure": {}}, "slot"),
+                         ({"format": FR.RECIPE_FORMAT, "slots": [{"id": "a", "needs": "blob"}],
+                           "figure": {}}, "needs")):
+            try:
+                FR.recipe_from_dict(bad)
+            except ValueError as exc:
+                assert why in str(exc), (why, exc)
+            else:
+                raise AssertionError(f"accepted {bad}")
+        # the user folder: a saved recipe shadows the built-in of its name
+        with _tempfile.TemporaryDirectory(prefix="nd2sb_figrec_") as tmp:
+            _os.environ[FR.ENV_ENABLED] = "1"
+            _os.environ[FR.ENV_DIR] = tmp
+            mine = FR.FigureRecipe(seg.name, "shadowed", seg.slots, seg.figure)
+            path = FR.save_recipe(mine)
+            assert _os.path.exists(path)
+            got = FR.find_recipe(seg.name)
+            assert got is not None and not got.builtin and got.description == "shadowed"
+            assert len(FR.list_recipes()) == len(recipes)
+            _os.environ[FR.ENV_ENABLED] = "0"
+            assert FR.find_recipe(seg.name).builtin
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+    _ok("figure recipes: five built-ins load, bind to a catalog with every placeholder "
+        "resolved, report an unfillable slot, round-trip through recipe_from_figure, user "
+        "folder shadows by name")
+
+
+def test_figure_headless_render() -> None:
+    """The headless renderer (V5.00 step 6): a figure job built from a workspace (the
+    composed graph, the figure, its run ids, a seed per loader) renders in a subprocess
+    under the offscreen platform to a PNG of the page's pixel size with the bundle
+    beside it; two renders are identical bytes; the workspace-file route gives the same
+    picture; a LabLink draft of the figure page carries the figure and a ``figure`` output
+    the worker's validator accepts."""
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tempfile
+    from PIL import Image as _Image
+    from nodelab_v2 import figure_render as FRD
+    from nodelab_v2.lablink import protocol as LP
+    from nodelab_v2.lablink import recipe as LR
+    from nodelab_v2.workspace import FIGURE_KIND
+
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+    P1.doc.add_node("analysis.label", node_id="L")
+    P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.doc.connect("X", "out", "T", "data")
+    P1.doc.connect("T", "out", "L", "data")
+    P1.doc.connect("L", "out", "O", "data")
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    fp.figure.edit(lambda d: d.update(
+        goal="composite",
+        sources=[{"id": "cells", "source": "pg3:cells", "label": "cells"}],
+        items=[{"id": "img", "kind": "image", "rect_mm": [2, 2, 40, 30], "letter": "A",
+                "image": {"source": "cells",
+                          "channels": [{"c": 0, "rgb": "#ffffff", "mode": "auto_pct"}],
+                          "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                          "decor": {"scale_bar_um": 5.0}}},
+               {"id": "ch", "kind": "chart", "rect_mm": [45, 2, 38, 30], "letter": "B",
+                "chart": {"kind": "distribution", "sub_kind": "histogram", "source": "cells",
+                          "domain": "label", "table": "labels", "value": "area"}},
+               {"id": "tb", "kind": "table", "rect_mm": [2, 36, 60, 20], "letter": "C",
+                "table": {"source": "cells", "domain": "label", "table": "labels",
+                          "columns": ["area"], "group_by": "t", "stats": ["n", "mean"]}}]))
+    live = FRD.build_job(ws, "Figures")           # the in-memory seed sizes its stack
+    assert live["format"] == FRD.JOB_FORMAT and live["page"] == fp.id \
+        and live["run_ids"] == {"cells": "pg3/O"} and list(live["seeds"]) == ["pg1/L"] \
+        and live["seeds"]["pg1/L"]["path"] == "" and live["seeds"]["pg1/L"]["axes"]["x"] == 32, live
+    try:
+        FRD.figure_page_id(ws, "P1")
+        raise AssertionError("a graph page is not a figure page")
+    except ValueError:
+        pass
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_headless_") as tmp:
+        wsf = _os.path.join(tmp, "ws.nd2graph.json")
+        ws.save_file(wsf)
+        from nodelab_v2.workspace import Workspace as _WS
+        ws2 = _WS()
+        ws2.load_file(wsf)                        # what the file route sees: no meta seed
+        job = FRD.build_job(ws2, "Figures")
+        assert job["run_ids"] == live["run_ids"] and "axes" not in job["seeds"]["pg1/L"]
+        jp = _os.path.join(tmp, "job.json")
+        with open(jp, "w", encoding="utf8") as fh:
+            _json.dump(job, fh)
+        penv = dict(_os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1")
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        pngs = []
+        for k in (1, 2):
+            out = _os.path.join(tmp, f"f{k}.png")
+            cmd = [_sys.executable, "-B", "-m", "nodelab_v2.figure_render", "--job", jp,
+                   "--out", out] + (["--bundle"] if k == 1 else [])
+            p = _sp.run(cmd, capture_output=True, text=True, env=penv, cwd=root, timeout=600)
+            assert p.returncode == 0, (p.returncode, p.stderr[-2000:])
+            with open(out, "rb") as fh:
+                pngs.append(fh.read())
+        assert pngs[0] == pngs[1], "two headless renders of one job differ"
+        page = fp.figure.document["page"]
+        with _Image.open(_os.path.join(tmp, "f1.png")) as a:
+            size = a.size
+        want = (int(round(page["width_mm"] * page["dpi"] / 25.4)),
+                int(round(page["height_mm"] * page["dpi"] / 25.4)))
+        assert size == want, (size, want)
+        names = sorted(_os.listdir(tmp))
+        assert {"f1.svg", "f1.figure.json", "f1.legend.txt", "f1.provenance.json",
+                "f1.data"} <= set(names), names
+        data = sorted(_os.listdir(_os.path.join(tmp, "f1.data")))
+        assert any(n.endswith("_chart.csv") for n in data) \
+            and any(n.endswith("_table.csv") for n in data), data
+        with open(_os.path.join(tmp, "f1.provenance.json"), encoding="utf8") as fh:
+            prov = _json.load(fh)
+        assert prov["sources"][0]["run_id"] == "pg3/O" and prov["sources"][0]["lineage"] \
+            and "img" in prov["lut_windows"], prov["sources"]
+        out3 = _os.path.join(tmp, "f3.png")
+        p = _sp.run([_sys.executable, "-B", "-m", "nodelab_v2.figure_render", wsf,
+                     "--page", "Figures", "--out", out3], capture_output=True, text=True,
+                    env=penv, cwd=root, timeout=600)
+        assert p.returncode == 0, p.stderr[-2000:]
+        with open(out3, "rb") as fh:
+            assert fh.read() == pngs[0], "the workspace-file route drew a different page"
+    # LabLink: a draft of the figure page ships the figure and declares the output
+    draft = LR.draft_from_workspace(ws, fp.id, name="fig-recipe")
+    man = draft.to_manifest()
+    assert man["figure"]["page"] == fp.id and man["figure"]["doc"]["items"] \
+        and f'"{man["figure"]["run_ids"]["cells"]}"' in _json.dumps(draft.graph_doc), \
+        man["figure"]["run_ids"]
+    kinds = [o["kind"] for o in man["outputs"]]
+    assert "figure" in kinds and "figure" in LP.ARTIFACT_KINDS, kinds
+    assert man["targets"]["primary"] == man["figure"]["run_ids"]["cells"], man["targets"]
+    _ok("figure headless render: job from a workspace, subprocess PNG at the page size, "
+        "identical twice, bundle beside it, the file route matches, a LabLink draft ships "
+        "the figure with a figure output")
+
+
+def test_figure_polish() -> None:
+    """Step 7, Qt-free: a plane read above its pixel budget on a provider without a
+    pyramid is strided (never interpolated) with the level shape and box following the
+    stride, and the budget is for the WINDOW (a region asks for a finer level); the
+    Report's captions name what each lettered panel shows in reading order and its HTML
+    carries the picture, the captions, the legend and the provenance; ``report`` is a
+    goal the schema accepts."""
+    from nodegraph.figure import report as FRP
+    from nodegraph.figure import schema as S
+    from nodelab_v2.figure_editor import render as R
+
+    ws, ds, env, ax = _ws_fixture()                      # a 32 × 32 ArrayProvider, no pyramid
+    img = dict(S.image_defaults(), source="s", channels=[dict(S.channel_defaults(), c=0)])
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=1024)
+    assert plane.shape == (32, 32) and shape == (32, 32) and box == (0, 32, 0, 32)
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=8)
+    assert plane.shape == (8, 8) and shape == (8, 8) and box == (0, 8, 0, 8), (plane.shape, shape, box)
+    assert float(plane.max()) == 100.0, "a stride keeps the values it keeps"
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=8, window=(0.25, 0.75, 0.25, 0.75))
+    assert plane.shape == (16, 16) and shape == (32, 32) and box == (8, 24, 8, 24), (
+        plane.shape, shape, box)                          # within 2× of the budget: as read
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=4, window=(0.25, 0.75, 0.25, 0.75))
+    assert plane.shape == (4, 4) and shape == (8, 8) and box == (2, 6, 2, 6), (
+        plane.shape, shape, box)                          # strided ×4, box in strided px
+    r = R.render_image(ds, img, (0, 0, 0, 0), max_px=8)
+    assert r.image.width() == 8 and r.plane_shape == (8, 8) and r.level_shape == (8, 8)
+    r2 = R.render_image(ds, img, (0, 0, 0, 0))
+    assert r2.image.width() == 32 and r2.pixel_size_um == 0.5 and abs(r.pixel_size_um - 2.0) < 1e-9, (
+        r2.pixel_size_um, r.pixel_size_um)
+
+    # the budget is for the window: a fake two-level pyramid picks the finer level for a
+    # quarter-plane window at the same budget that the whole plane reads coarse
+    class _Pyr:
+        levels = 2
+
+        def level_axes(self, lv):
+            n = 64 >> lv
+            return AxisSizes(m=1, t=1, z=1, c=1, y=n, x=n)
+
+        def get_region(self, level, m, t, z, c, y0, y1, x0, x1):
+            return np.full((y1 - y0, x1 - x0), float(level), dtype=float)
+
+    assert R._pick_level(_Pyr(), 32)[0] == 1 and R._pick_level(_Pyr(), 33)[0] == 0
+    fake = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64), metadata={}).with_image(_Pyr())
+    whole, _s, _b = R.read_plane(fake, 0, 0, 0, 0, max_px=32)
+    part, _s, _b = R.read_plane(fake, 0, 0, 0, 0, max_px=32, window=(0.0, 0.25, 0.0, 0.25))
+    assert float(whole[0, 0]) == 1.0 and float(part[0, 0]) == 0.0, (whole[0, 0], part[0, 0])
+
+    # the report
+    doc = S.normalize({
+        "goal": "report",
+        "sources": [{"id": "cells", "source": "pg3:cells", "label": "P1 · cells"}],
+        "data": [{"id": "d1", "from": ["cells"], "where": [["area", ">", 50]],
+                  "aggregate": {"group_by": ["t"], "value": "area", "reducers": ["mean"]}}],
+        "items": [
+            {"id": "img", "kind": "image", "rect_mm": [0, 0, 40, 30], "letter": "A",
+             "image": {"source": "cells", "frame": {"m": 0, "t": 3, "z": "max"},
+                       "channels": [{"c": 0, "rgb": "#ffffff", "label": "DAPI"},
+                                    {"c": 1, "rgb": "#00ff00"}],
+                       "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                       "decor": {"scale_bar_um": 20}}},
+            {"id": "ch", "kind": "chart", "rect_mm": [45, 0, 40, 30], "letter": "B",
+             "chart": {"kind": "bar", "data": "d1", "x": "t", "y": "area_mean",
+                       "stats": {"test": "welch"}}},
+            {"id": "tb", "kind": "table", "rect_mm": [0, 35, 40, 20], "letter": "C",
+             "table": {"source": "cells", "columns": ["area"], "group_by": "t",
+                       "stats": ["n", "mean"]}},
+            {"id": "txt", "kind": "text", "rect_mm": [0, 60, 40, 5], "text": "note"}]})
+    env2 = MetaEnvelope(axes=AxisSizes(m=1, t=4, z=2, c=2, y=64, x=64),
+                        metadata={"channel_names": ["DAPI", "GFP"]})
+    caps = FRP.panel_captions(doc, {"cells": env2}, labels={"cells": "P1 · cells"})
+    assert [c[0] for c in caps] == ["A", "B", "C"], caps
+    a, b, c = (t for _l, t in caps)
+    assert a.startswith("P1 · cells — DAPI, GFP (frame 3, maximum projection); object outlines. "
+                        "Scale bar 20 µm."), a
+    assert b.startswith("Area_mean per t; welch test, from P1 · cells; kept where area > 50; "
+                        "area per t (mean)."), b
+    assert c == "Area (n, mean) per t, from P1 · cells.", c
+    html = FRP.report_html(doc, title="Study 1", picture="fig.png", legend="Images show A.",
+                           captions=caps, provenance={"sources": [
+                               {"id": "cells", "label": "P1 · cells", "source": "pg3:cells",
+                                "run_id": "pg3/O", "lineage": "abc", "files": [{"name": "x.nd2"}]}],
+                               "data": doc["data"], "app_version": "v", "written": "now",
+                               "figure_digest": "0123456789abcdef"}, svg="fig.svg",
+                           data_files=["fig.data/B_ch_chart.csv"])
+    for needle in ("<img src=\"fig.png\"", "<dt>A</dt>", "Scale bar 20 µm", "Images show A.",
+                   "pg3/O", "x.nd2", "kept where area &gt; 50", "fig.svg", "B_ch_chart.csv",
+                   "figure 0123456789ab"):
+        assert needle in html, needle
+    assert "<script" not in html and html.count("<html") == 1
+    assert S.normalize({"goal": "report"})["goal"] == "report"
+    _ok("figure polish: a plane over budget is strided with its box and level shape, the "
+        "budget is the window's, report captions per lettered panel and a self-contained "
+        "HTML with picture, captions, legend and provenance")
 
 
 if __name__ == "__main__":

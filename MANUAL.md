@@ -439,6 +439,123 @@ workflow tuned per dish, compared on one plot.
 
 ---
 
+## 2c. Figures — the Analysis page is a figure (V5.00)
+
+Since V5.00 an **Analysis** page is not a node canvas: it opens the **Figure Editor** — a
+journal-sized page you place things on. What it can show is whatever the pages before it
+*publish* as Page Outputs, read from their metadata before anything is computed.
+
+1. **Start.** An empty Analysis page asks *What do you want to make?* — Overlay, Montage,
+   Plot, Plot + Overlay (Table and Movie arrive later). Each card says what it needs and
+   what the upstream pages carry. Pick one, or press one of the image sources listed under
+   it. *Plot* places a histogram of the first table's first measured column (`area` when
+   the table has it) — something drawn at once, to edit from. Under the goals, **figure
+   templates** (V5.00 step 6): *Segment & measure summary*, *Tracking summary*, *Strain /
+   speed field panel*, *Standard curve*, *Plate overview with popout* — each a whole page
+   whose slots are filled from what the upstream pages carry (a template whose need is not
+   upstream is greyed, its tooltip saying what it needs). Your own templates live in
+   `~/.nd2studios/figure_recipes/` (`panel.save_as_recipe`) and shadow a built-in of the
+   same name.
+2. **Sources** (left) lists every Page Output of the pages before this one, grouped by
+   page, with what each carries: the image and its channels, the label / point / track
+   tables and their columns, the measured fields. **Drag a source onto the page** to place
+   it as an image (double-click does the same); **drag a table or a column onto an image**
+   to draw it over that image as a layer.
+3. **Compute sources** pulls what the figure reads and is not yet in hand — a payload-only
+   pull: the Viewer stays where it was. Nothing is computed until you ask.
+4. **Items.** Move and resize with the mouse (an image keeps its aspect); arrow keys nudge,
+   Delete removes. **Alt-drag a box on an image** to make a **popout** of that region: a
+   new image item showing it magnified, with a dashed box on the parent and leader lines
+   that follow the popout wherever you put it. **Twin** (Properties) makes a second copy
+   sharing the region, frame and channels — give the twin other layers (a speed heat layer
+   over the same cells). **Share display range** on a multi-selection gives every image one
+   window per channel. The page **cursor** (M / T / Z in the toolbar) drives every image
+   whose frame reads *page cursor*.
+5. **Properties** (right) edits the page (preset size, dpi, font, type size, palette, dark
+   page, snap grid, letter style) or the selection: an image's source, frame, flips, scale
+   bar, time stamp, channel labels, its channels (colour, window: auto percentiles / the
+   Viewer's window / typed / shared, gamma, label) and its layers (labels outline / fill /
+   ids, points, tracks with a tail, a field column as a heat map with series / frame /
+   typed / **0–1 of a maximum** limits, vectors, a voxel wash, mesh sections, the
+   correlation grid). A colour bar, a histogram of a channel with its window marked, a
+   standalone scale bar, text, a letter, an arrow, a line, a shape and a measurement line
+   are items of their own.
+6. **Charts** (V5.00 step 4) are items like any other, drawn from the tables a source
+   carries: XY (scatter / line, grouped, with error bars or a band and a linear / power /
+   exponential / Langmuir fit), time series on the frame clock, bars with SEM / SD / CI,
+   distributions (histogram, KDE, box, violin, ECDF, strip, SuperPlot) with a test and its
+   brackets, heat map, hexbin density, MSD and survival from a track table, a rose of
+   angles. **Drag a column onto a chart** to make it the chart's Y (or value); the chart
+   form in Properties picks the kind, the source or data entry, the table and the
+   columns, the draw mode, error, fit, test, axis labels and ranges, legend and colour
+   map. **Hover a marker** of an XY chart: the status line reads the point's data and
+   its object id, and that object is ringed on every image of the same source on the
+   page (or on the targets of a *highlight* link) — the plot and the image read the same
+   result. **Filter / summarise** on a chart gives it a **data entry**: its source's table
+   kept where up to four `column op value` terms hold, summarised one row per group
+   (group by `t` for one row per frame, `condition, t` per condition and frame) with mean,
+   median, sum, min, max, count, std or sem of a column. A data entry compiles into the
+   page's hidden graph as real nodes (Table Concat for pooled sources → If/Else → Table
+   Aggregate) and is fetched by *Compute sources* like a source — nothing is computed
+   until you ask, and the memo keeps what was.
+7. **Tables and legends** (V5.00 step 5). The *Table* goal — or *Reads* on a new table
+   item — places a **summary table** of a source's table or a data entry: the columns you
+   name (blank = every measured one) reduced per value of *Group by* with n, mean, SD,
+   SEM, median, min, max or sum, formatted for print (*Fit to content* sizes it to its
+   rows). **Legend** on an image adds a shared legend of its channels (a swatch in each
+   colour) and layers (an outline, a marker, a line, a colour-map ramp with its limits).
+   The Viewer's **→ Page** button (*Capture view → page*) places what the Viewer shows —
+   its frame, its visible region, its active channels with the windows and colours you
+   set there — as an image on the figure page below (one is added when the workspace has
+   none). The node must be published as a Page Output; the figure reads only those.
+8. **Paper-readiness.** The page form lists the **checks** (a missing scale bar, an inset
+   with no box, a red / green merge, twins that do not share a display range, an
+   unlabelled colour bar, type under 6 pt, letters out of order) with a button that
+   selects the item. **Re-letter panels** letters every panel in reading order (a popout
+   is part of its parent's panel); **Style sync** applies the page preset — *paper* (8 pt,
+   1 pt lines), *talk* (14 pt), *poster* (18 pt), *dark* — to the page and clears every
+   item's own type size and line width back to it. Chart palettes are validated: on a dark
+   page black is lifted and a grey ramp re-spaced, so every series stays visible.
+9. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
+   paths) or PDF (fonts embedded). The preview and the export are one set of lines.
+   **Bundle** writes the PNG and an SVG plus, beside them, `<stem>.figure.json` (the
+   document), `<stem>.legend.txt` (the generated legend paragraph — objective, pixel
+   size, z step, interval, channels, scale bars, display ranges, what each panel shows),
+   `<stem>.provenance.json` (each source as `<page>:<name>` with its run id, lineage,
+   the file it came from with size and mtime, the display windows, the app version, the
+   figure digest) and `<stem>.data/` with a CSV of the values every chart, table and heat
+   layer drew.
+10. **Report, movie, keyboard** (V5.00 step 7). The *Report* goal and **Export ▾ →
+    Report** write the bundle plus `<stem>.html` — the picture, a caption per lettered
+    panel written from what it shows (source, frame, channels, overlays, scale bar; a
+    chart's columns, fit and test; a table's statistics), the legend paragraph and the
+    provenance table — and `<stem>.report.pdf` printed from it. **Movie…** on an image
+    (or the *Movie* goal) makes an Export Movie of its source on a new Free page — its
+    channels with the windows the figure drew them with, its first layer, its position
+    and projection, its decor as annotations — and opens the Movie Editor on it; the
+    figure page is untouched. Keys on the page: arrows nudge (Shift: 5 mm), Delete
+    removes, Ctrl+D duplicates beside, Ctrl+A selects all, Esc deselects, Ctrl+Z / Ctrl+Y
+    undo and redo, Home fits the page, 0 shows it at 1:1, Ctrl+plus / Ctrl+minus zoom.
+    An export reads every image at the budget its page size and dpi need — a mosaic
+    through the pyramid level that resolution can show — and a montage splits its budget
+    over its tiles, so a 500-frame montage composites 500 thumbnails; a source without a
+    pyramid is strided, never interpolated.
+11. **Without a window** (V5.00 step 6): `python -m nodelab_v2.figure_render
+    file.nd2graph.json --out fig.png [--page NAME] [--dpi 300] [--svg] [--bundle]` renders
+    a figure page under the offscreen platform through the same editor and exports the
+    same drawing — a loader with a file path is ingested as the app ingests it, a loader
+    with no path draws the synthetic stack. `--write-job job.json` writes the **figure
+    job** (the composed graph, the figure, its run ids, a seed per loader) and `--job
+    job.json` renders one. A figure page published as a **LabLink** recipe ships its
+    figure; the worker renders it with that command in a subprocess and returns the PNG
+    as the run's `figure` artifact, the bundle beside it.
+12. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
+   the paper-readiness checks (a missing scale bar, an inset with no box, a red / green
+   merge, twins that do not share a display range, an unlabelled colour bar). A V4 file's
+   Analysis page that held nodes opens as a Free page named *(graph)*.
+
+---
+
 ## 3. Your first graph in five minutes
 
 1. **File → Load ND2/TIFF file…** (`Ctrl+L`), pick a file (or Ctrl/Shift-select several).
@@ -2911,6 +3028,14 @@ print(report.summary(), report.removed, report.added)
   names its page with `"page"` (id or name; absent = the active page) and the worker runs
   that page **composed** with every page it reads from — its knob and target ids are the run
   ids `<page>/<node>`. The window shows every page through the page switcher (§2, **Pages**).
+* **V5.00 — an Analysis page is a figure page** (step 2, 2026-11-03). Its page record
+  carries a `figure` object beside its `graph`: the figure document (sources, items,
+  links) that the Figure Editor edits, while the graph holds one hidden Page Input per
+  figure source — what a run composes. The format stays `3.0`, so an older build opens
+  the file and simply ignores the figure. A **V4 file's Analysis page that holds nodes**
+  opens as a **Free** page named `<name> (graph)` (its linked pages with it): page ids
+  never rebind, so every page that read its Outputs still does. An empty one opens as
+  an empty figure page.
 
 ### 13b. Saved analysis trials, and running analyses across every core (2026-10-09)
 
@@ -3899,6 +4024,33 @@ fitted into one canvas (the largest), and `canvas.fit = center` keeps small clip
 true size instead of enlarging them.
 
 ---
+
+### J. A figure, from a segmentation to the bundle — the Figure Editor
+
+**Goal: one journal column with the labelled field, a popout, the area distribution, a
+per-frame summary table and the legend text — then the same page from a script.**
+
+1. On the Processing page, wire `analysis.segment ─→ analysis.measure ─→ page.output`
+   and name the Output `cells`. The Analysis page below is the figure page.
+2. Open it. On the start card pick the **Segment & measure summary** template: the field
+   with its outlines, a histogram of `area`, a table of n / mean / SEM per frame and a
+   legend land, each slot bound to `cells`. *Compute sources* pulls what the page reads.
+3. **Alt-drag** a box on the field: a popout appears with its box on the parent and
+   leaders following it. *Twin* the popout and give the twin a `speed` field layer with
+   limits *0–1 of a maximum* and a colour bar.
+4. Hover a marker of the histogram turned into an XY chart (Kind = XY, X = `x`, Y =
+   `area`): the object it stands for is ringed on the field. *Filter / summarise* on the
+   chart keeps `area > 50` and summarises per frame — the data entry compiles into the
+   page's hidden graph and *Compute sources* fetches it like a source.
+5. Page form: *Re-letter panels*, *Style sync* with the preset `paper`; the Checks group
+   names anything a reviewer would flag.
+6. **Export ▾ → Bundle**: the PNG and SVG, `.figure.json`, `.legend.txt` (paste it under
+   the figure), `.provenance.json` (every source's file, run id and lineage) and
+   `.data/*.csv`.
+7. Later, without opening the app:
+   `python -m nodelab_v2.figure_render study.nd2graph.json --page Analysis --out fig.png
+   --bundle` draws the same page from the file; a LabLink hub running the published page
+   returns it as the run's `figure` artifact.
 
 ## 17. Headless / scripted use
 

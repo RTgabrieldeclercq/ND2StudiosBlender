@@ -1223,6 +1223,10 @@ class OverlayFrame:
     diff_a: Optional[np.ndarray] = None
     diff_b: Optional[np.ndarray] = None
     current_t: int = 0
+    #: 0 = the Viewer: every stroke, marker and id is a SCREEN size (cosmetic pens in device
+    #: pixels). > 0 = a FIGURE (V5.00): sizes are multiplied by this and drawn with plain
+    #: pens, so they scale with the page and are vector in an SVG / PDF export.
+    stroke_scale: float = 0.0
 
     def img_pt(self, x: float, y: float) -> QPointF:
         """A *structure* coordinate (full-resolution image pixels, pixel centre on the
@@ -1322,6 +1326,25 @@ class OverlayRenderer:
         self._cent_lab = None
 
     # ── entry point ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _k(frame: OverlayFrame) -> float:
+        """The frame's size multiplier: 1 on screen, the stroke scale on a figure."""
+        k = float(getattr(frame, "stroke_scale", 0.0) or 0.0)
+        return k if k > 0 else 1.0
+
+    @staticmethod
+    def _pen(frame: OverlayFrame, col: QColor, width: float, *, cap=None, join=None) -> QPen:
+        """A pen of ``width`` for ``frame``: cosmetic (a screen size) on the Viewer, a plain
+        pen scaled by the stroke scale on a figure."""
+        k = float(getattr(frame, "stroke_scale", 0.0) or 0.0)
+        pen = QPen(col, float(width) * (k if k > 0 else 1.0))
+        pen.setCosmetic(k <= 0)
+        if cap is not None:
+            pen.setCapStyle(cap)
+        if join is not None:
+            pen.setJoinStyle(join)
+        return pen
+
     def paint(self, p: QPainter, s: OverlaySettings, frame: OverlayFrame) -> None:
         """Draw every enabled overlay, bottom to top: labels, mesh, points, tracks.
 
@@ -1382,7 +1405,7 @@ class OverlayRenderer:
                 center_zero=bool(s.center_zero), cmap=s.colormap)
             self._paint_contours(p, arr, np.linspace(lo, hi, 9)[1:-1], s.colormap, lo, hi,
                                  lambda r, c: frame.map_pt(c + 0.5, r + 0.5),
-                                 float(s.width), s.opacity)
+                                 float(s.width), s.opacity, frame=frame)
             return
         rgba = scalar_rgba(
             arr, cmap=s.colormap,
@@ -1431,7 +1454,7 @@ class OverlayRenderer:
         flat = qcolor(s.color, s.opacity)
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
-        head_px = max(2.0, float(s.head_px))
+        head_px = max(2.0, float(s.head_px)) * self._k(frame)
         for k in range(len(tails)):
             a = frame.img_pt(tails[k][1], tails[k][0])
             b = frame.img_pt(heads[k][1], heads[k][0])
@@ -1440,7 +1463,7 @@ class OverlayRenderer:
                 col = QColor(int(r), int(g), int(bl), _alpha(s.opacity))
             else:
                 col = flat
-            p.setPen(QPen(col, float(s.width)))
+            p.setPen(self._pen(frame, col, float(s.width)))
             p.drawLine(a, b)
             # the head is drawn from the SCREEN direction, so a very short arrow still
             # points somewhere legible instead of collapsing into its own barb
@@ -1476,7 +1499,7 @@ class OverlayRenderer:
             self._paint_contours(
                 p, grid, levels, cmap, lo, hi,
                 lambda r, c: frame.img_pt(x0 + (c + 0.5) * dx, y0 + (r + 0.5) * dy),
-                float(s.width), 100)
+                float(s.width), 100, frame=frame)
         else:
             rgba = np.ascontiguousarray(scalar_rgba(
                 grid, cmap=cmap, lo=lo, hi=hi, center_zero=bool(s.center_zero),
@@ -1513,9 +1536,7 @@ class OverlayRenderer:
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
         for tension, col in ((True, QColor(235, 70, 55, 235)), (False, QColor(70, 120, 240, 235))):
-            pen = QPen(col, 1.8)
-            pen.setCosmetic(True)
-            pen.setCapStyle(Qt.RoundCap)
+            pen = self._pen(frame, col, 1.8, cap=Qt.RoundCap)
             p.setPen(pen)
             p.drawPath(paths[tension])
         p.restore()
@@ -1531,8 +1552,7 @@ class OverlayRenderer:
             path.moveTo(frame.img_pt(a[0, 1], a[0, 0]))
             for yy, xx in a[1:]:
                 path.lineTo(frame.img_pt(xx, yy))
-        pen = QPen(qcolor(s.color, s.opacity), max(0.3, float(s.width)))
-        pen.setCosmetic(True)
+        pen = self._pen(frame, qcolor(s.color, s.opacity), max(0.3, float(s.width)))
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setPen(pen)
@@ -1542,7 +1562,7 @@ class OverlayRenderer:
 
     def _paint_contours(self, p: QPainter, grid: np.ndarray, levels, cmap: str,
                         lo: float, hi: float, to_widget, width: float,
-                        opacity: int) -> None:
+                        opacity: int, *, frame: Optional[OverlayFrame] = None) -> None:
         """Iso-lines of ``grid`` (:func:`nodegraph.fieldmap.contour_lines`), one cosmetic
         path per level in that level's colour; ``to_widget(row, col)`` maps grid index
         coordinates to the widget."""
@@ -1556,8 +1576,11 @@ class OverlayRenderer:
             if not polys:
                 continue
             r, g, b = lut[int(np.clip((lv - lo) / span * 255.0, 0, 255))]
-            pen = QPen(QColor(int(r), int(g), int(b), _alpha(opacity)), max(0.4, width))
-            pen.setCosmetic(True)
+            col = QColor(int(r), int(g), int(b), _alpha(opacity))
+            pen = (self._pen(frame, col, max(0.4, width)) if frame is not None
+                   else QPen(col, max(0.4, width)))
+            if frame is None:
+                pen.setCosmetic(True)
             path = QPainterPath()
             for poly in polys:
                 path.moveTo(to_widget(float(poly[0, 0]), float(poly[0, 1])))
@@ -1626,11 +1649,11 @@ class OverlayRenderer:
         pairs, only_a, only_b = match_points(a, b, max_dist=float(s.max_dist))
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
-        r = float(s.radius_px)
+        r = float(s.radius_px) * self._k(frame)
 
         def ring(pt, key):
             col = QColor(*DIFF_COLORS[key], _alpha(s.opacity))
-            p.setPen(QPen(col, float(s.width)))
+            p.setPen(self._pen(frame, col, float(s.width)))
             p.setBrush(Qt.NoBrush)
             w = frame.img_pt(pt[1], pt[0])
             p.drawEllipse(w, r, r)
@@ -1672,8 +1695,7 @@ class OverlayRenderer:
             col = QColor(s.color if lv <= 0 else
                          self.GRID_LEVEL_COLORS[min(int(lv) - 1, len(self.GRID_LEVEL_COLORS) - 1)])
             col.setAlpha(alpha)
-            pen = QPen(col, float(max(0.1, s.width)))
-            pen.setCosmetic(True)
+            pen = self._pen(frame, col, float(max(0.1, s.width)))
             p.setPen(pen)
             path = QPainterPath()
             for y0, y1, x0, x1, _l in g[levels == lv]:
@@ -1692,9 +1714,9 @@ class OverlayRenderer:
         for sec in frame.mesh:
             col = self.mesh_color(s, sec.object_id)
             if s.style == "points":
-                p.setPen(QPen(col, 1.0))
+                p.setPen(self._pen(frame, col, 1.0))
                 p.setBrush(col)
-                rad = float(s.vertex_px)
+                rad = float(s.vertex_px) * self._k(frame)
                 if rad > 0:
                     for y, x in sec.verts:
                         p.drawEllipse(frame.img_pt(x, y), rad, rad)
@@ -1709,9 +1731,8 @@ class OverlayRenderer:
                     if is_closed:
                         p.drawPolygon(poly)
             if s.width > 0:
-                pen = QPen(col, float(s.width))
-                pen.setCapStyle(Qt.RoundCap)
-                pen.setJoinStyle(Qt.RoundJoin)
+                pen = self._pen(frame, col, float(s.width), cap=Qt.RoundCap,
+                                join=Qt.RoundJoin)
                 p.setPen(pen)
                 p.setBrush(Qt.NoBrush)
                 for poly in polys:
@@ -1867,7 +1888,7 @@ class OverlayRenderer:
         if not paths:
             return
         dpr = float(p.device().devicePixelRatio() or 1.0)
-        pens = self._outline_pens(s, dpr, keys)
+        pens = self._outline_pens(s, dpr, keys, scale=float(frame.stroke_scale or 0.0))
         mp = frame.map_pt
         o, ex, ey = mp(0.0, 0.0), mp(1.0, 0.0), mp(0.0, 1.0)
         plane = QTransform(ex.x() - o.x(), ex.y() - o.y(),
@@ -1883,7 +1904,8 @@ class OverlayRenderer:
         p.restore()
 
     def _outline_pens(self, s: LabelsOverlay, dpr: float,
-                      keys: Optional[np.ndarray] = None) -> List[QPen]:
+                      keys: Optional[np.ndarray] = None, *, scale: float = 0.0
+                      ) -> List[QPen]:
         """One cached cosmetic pen per contour group, aligned with :meth:`_outline_paths`.
 
         Cached because ``per_label`` colouring needs a colour per group and building those
@@ -1891,15 +1913,16 @@ class OverlayRenderer:
         cost more than the stroking itself.
         """
         key = (self._out_key, id(keys), s.color_mode, s.color, s.sat, s.val, s.opacity,
-               round(float(s.width), 3), round(dpr, 3))
+               round(float(s.width), 3), round(dpr, 3), round(float(scale), 4))
         if key == self._pen_key:
             return self._out_pens
-        width = max(1.0, float(s.width) * dpr)
+        # a figure's pen is plain and in the figure's units; the Viewer's is cosmetic
+        width = (float(s.width) * scale) if scale > 0 else max(1.0, float(s.width) * dpr)
         pens: List[QPen] = []
         for value, _path in self._out_paths:
             pen = QPen(self._label_color(s, value, s.opacity, keys), width)
             pen.setCapStyle(Qt.FlatCap)
-            pen.setCosmetic(True)             # width in device px → a screen-space size
+            pen.setCosmetic(scale <= 0)       # width in device px → a screen-space size
             pens.append(pen)
         self._pen_key, self._out_pens = key, pens
         self._pen_keys = keys                    # pins id(keys) against reuse
@@ -1963,17 +1986,22 @@ class OverlayRenderer:
         cxs, cys = (cxs + 0.5) * lsx, (cys + 0.5) * lsy
         wx = o.x() + cxs * (ex.x() - o.x()) + cys * (ey.x() - o.x())
         wy = o.y() + cxs * (ex.y() - o.y()) + cys * (ey.y() - o.y())
-        view = QRectF(p.viewport())
+        k = self._k(frame)
+        id_px = max(1, int(round(float(s.id_px) * k)))
+        # a figure paints in ITEM coordinates, where the device viewport means nothing:
+        # cull against the painter's clip there, the widget's viewport on screen
+        view = (p.clipBoundingRect() if float(frame.stroke_scale or 0.0) > 0
+                else QRectF(p.viewport()))
         if not view.isValid() or view.isEmpty():
             view = p.clipBoundingRect()
-        pad = 2.0 * float(s.id_px)
+        pad = 2.0 * float(id_px)
         vis = ((wx >= view.left() - pad) & (wx <= view.right() + pad)
                & (wy >= view.top() - pad) & (wy <= view.bottom() + pad))
         # a label-pixel covers this much screen area, so sqrt(area) is the region's
         # on-screen size — drop the ones that cannot hold their own digits
         px_w = float(np.hypot(ex.x() - o.x(), ex.y() - o.y())) * lsx
         px_h = float(np.hypot(ey.x() - o.x(), ey.y() - o.y())) * lsy
-        vis &= np.sqrt(areas * px_w * px_h) >= float(max(1, int(s.id_px)))
+        vis &= np.sqrt(areas * px_w * px_h) >= float(id_px)
         count = int(vis.sum())
         if count == 0:
             return
@@ -1986,7 +2014,7 @@ class OverlayRenderer:
         # centred on the centroid — the id belongs to the region under it
         for value, x, y in zip(vals[vis].tolist(), wx[vis].tolist(), wy[vis].tolist()):
             self.draw_id(p, str(value), QPointF(x, y),
-                         self._label_color(s, value, s.opacity, keys), s.id_px)
+                         self._label_color(s, value, s.opacity, keys), id_px)
 
     # ── id text (ONE implementation, shared by every domain) ──────────────────
     def draw_id(self, p: QPainter, text: str, at: QPointF, col: QColor,
@@ -2099,6 +2127,20 @@ class OverlayRenderer:
     def _paint_points(self, p: QPainter, s: PointsOverlay,
                       frame: OverlayFrame) -> None:
         dpr = float(p.device().devicePixelRatio() or 1.0)
+        k = self._k(frame)
+        if float(frame.stroke_scale or 0.0) > 0:
+            # a figure: the glyph is rendered sharp and drawn scaled into the page's units
+            p.save()
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            for mark in frame.points:
+                col = self._point_color(s, mark)
+                pm, size = self.glyph(s, col, 4.0)
+                centre = frame.img_pt(mark.x, mark.y)
+                half = size * k / 2.0
+                p.drawPixmap(QRectF(centre.x() - half, centre.y() - half, size * k, size * k),
+                             pm, QRectF(pm.rect()))
+            p.restore()
+            return
         for mark in frame.points:
             col = self._point_color(s, mark)
             pm, size = self.glyph(s, col, dpr)
@@ -2179,6 +2221,7 @@ class OverlayRenderer:
                       frame: OverlayFrame) -> None:
         p.save()
         p.setRenderHint(QPainter.Antialiasing, True)
+        k = self._k(frame)
         for tr in frame.tracks:
             keep = self._trail_mask(s, tr, frame.current_t)
             verts = [frame.img_pt(x, y)
@@ -2193,10 +2236,10 @@ class OverlayRenderer:
                         frac = 0.25 + 0.75 * ((i + 1) / n)
                         seg = QColor(col)
                         seg.setAlpha(int(round(col.alpha() * frac)))
-                        p.setPen(QPen(seg, float(s.width)))
+                        p.setPen(self._pen(frame, seg, float(s.width)))
                         p.drawLine(verts[i], verts[i + 1])
                 else:
-                    p.setPen(QPen(col, float(s.width)))
+                    p.setPen(self._pen(frame, col, float(s.width)))
                     p.setBrush(Qt.NoBrush)
                     p.drawPolyline(QPolygonF(verts))
             # the current-T vertex keeps its identity in the ORIGINAL path, so recover
@@ -2204,19 +2247,19 @@ class OverlayRenderer:
             cur_drawn = None
             if tr.current is not None and keep[tr.current]:
                 cur_drawn = int(np.count_nonzero(keep[:tr.current]))
-            p.setPen(QPen(col, 1.0))
+            p.setPen(self._pen(frame, col, 1.0))
             p.setBrush(col)
-            for k, pt in enumerate(verts):
-                rad = float(s.head_px) if k == cur_drawn else float(s.vertex_px)
+            for kk, pt in enumerate(verts):
+                rad = (float(s.head_px) if kk == cur_drawn else float(s.vertex_px)) * k
                 if rad > 0:
                     p.drawEllipse(pt, rad, rad)
             if s.show_ids:
                 anchor = verts[cur_drawn if cur_drawn is not None else -1]
-                off = QPointF(float(s.head_px) + 3.0, -float(s.head_px) - 2.0)
+                off = QPointF((float(s.head_px) + 3.0) * k, (-float(s.head_px) - 2.0) * k)
                 # beside the head, not centred on it — the head marker is the position, and
                 # the id must not cover it. Same renderer as the label ids: see draw_id.
-                self.draw_id(p, str(tr.track_id), anchor + off, col, s.id_px,
-                             center=False)
+                self.draw_id(p, str(tr.track_id), anchor + off, col,
+                             max(1, int(round(float(s.id_px) * k))), center=False)
         p.restore()
 
     @staticmethod

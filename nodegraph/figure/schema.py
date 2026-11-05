@@ -31,7 +31,7 @@ from nodegraph.figure.layout import LETTER_STYLES, PAGE_PRESETS
 
 SCHEMA = "nd2studios-figure/1"
 
-GOALS = ("plot", "overlay", "composite", "table", "montage")
+GOALS = ("plot", "overlay", "composite", "table", "montage", "report")
 
 ITEM_KINDS = ("image", "montage", "picture", "chart", "colorbar", "histogram", "scale_bar",
               "legend", "table", "text", "arrow", "line", "shape", "measure_line", "letter",
@@ -58,7 +58,7 @@ DISTRIBUTION_KINDS = ("histogram", "kde", "box", "violin", "ecdf", "strip", "sup
 
 LAYER_KINDS = ("points", "labels", "tracks", "vectors", "field", "voxels", "mesh", "grid")
 
-REGION_KINDS = ("full", "rect_um", "placement", "object")
+REGION_KINDS = ("full", "rect_um", "rect_frac", "placement", "object")
 
 CHANNEL_MODES = ("auto_pct", "viewer", "manual", "shared")
 
@@ -69,6 +69,11 @@ STYLES = ("paper", "talk", "poster", "dark")
 FONTS = ("sans", "serif")
 
 PALETTE_NAMES = ("colorblind", "tab10", "viridis", "greys")
+
+#: the operators a data entry's ``where`` filter may use (``analysis.if_else``'s)
+WHERE_OPS = (">", ">=", "<", "<=", "==", "!=", "is_finite", "is_nan")
+#: the reducers a data entry's aggregate may ask for (``table.aggregate``'s)
+AGG_REDUCERS = ("mean", "median", "sum", "min", "max", "count", "std", "sem")
 
 _ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SOURCE = re.compile(r"^[A-Za-z0-9_]+:[^:]+$")
@@ -241,6 +246,15 @@ def _region(v: Any, path: str) -> Dict[str, Any]:
         r["rect_um"] = [_num(x, f"{path}.rect_um[{i}]") for i, x in enumerate(rect)]
         if not (r["rect_um"][1] > r["rect_um"][0] and r["rect_um"][3] > r["rect_um"][2]):
             raise FigureError(f"{path}.rect_um", "must have y1 > y0 and x1 > x0")
+    elif r["from"] == "rect_frac":
+        rect = r.get("rect_frac")
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            raise FigureError(f"{path}.rect_frac", "must be [fy0, fy1, fx0, fx1], fractions "
+                                                   "of the plane")
+        r["rect_frac"] = [_num(x, f"{path}.rect_frac[{i}]", lo=0, hi=1)
+                          for i, x in enumerate(rect)]
+        if not (r["rect_frac"][1] > r["rect_frac"][0] and r["rect_frac"][3] > r["rect_frac"][2]):
+            raise FigureError(f"{path}.rect_frac", "must have fy1 > fy0 and fx1 > fx0")
     elif r["from"] == "object":
         if r.get("object") is None:
             raise FigureError(f"{path}.object", "names no object id")
@@ -552,8 +566,36 @@ def normalize(doc: Mapping[str, Any]) -> Dict[str, Any]:
             if f not in sources:
                 raise FigureError(f"{path}.from[{j}]", f"unknown source {f!r}")
         rec = _merge({"id": did, "from": list(frm), "domain": "label", "table": "",
-                      "pool": len(frm) > 1, "aggregate": None, "join": None, "where": []},
+                      "name": "combined", "pool": len(frm) > 1, "aggregate": None,
+                      "join": None, "where": [], "match": "all"},
                      dd, path)
+        _choice(rec["domain"], f"{path}.domain", ("label", "point", "track"))
+        _choice(rec["match"], f"{path}.match", ("all", "any"))
+        where = rec.get("where") or []
+        if not isinstance(where, list) or len(where) > 4:
+            raise FigureError(f"{path}.where", "must be a list of up to four [column, op, value]")
+        for k, cond in enumerate(where):
+            if not isinstance(cond, (list, tuple)) or len(cond) != 3:
+                raise FigureError(f"{path}.where[{k}]", "must be [column, op, value]")
+            _choice(cond[1], f"{path}.where[{k}].op", WHERE_OPS)
+            if not str(cond[0] or "").strip():
+                raise FigureError(f"{path}.where[{k}].column", "names no column")
+            _num(cond[2], f"{path}.where[{k}].value")
+        rec["where"] = [[str(c[0]), str(c[1]), float(c[2])] for c in where]
+        agg = rec.get("aggregate")
+        if agg is not None:
+            agg = _merge({"group_by": ["t"], "value": "area",
+                          "reducers": ["mean", "sem", "count"], "name": "summary"}, agg,
+                         f"{path}.aggregate")
+            if isinstance(agg["group_by"], str):
+                agg["group_by"] = [g.strip() for g in agg["group_by"].split(",") if g.strip()]
+            if isinstance(agg["reducers"], str):
+                agg["reducers"] = [r.strip() for r in agg["reducers"].split(",") if r.strip()]
+            for j, r in enumerate(agg["reducers"]):
+                _choice(r, f"{path}.aggregate.reducers[{j}]", AGG_REDUCERS)
+            if not str(agg["value"] or "").strip():
+                raise FigureError(f"{path}.aggregate.value", "names no column")
+            rec["aggregate"] = agg
         data_ids.append(did)
         data_out.append(rec)
 

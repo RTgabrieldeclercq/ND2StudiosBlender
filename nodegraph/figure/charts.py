@@ -316,7 +316,9 @@ def chart_geometry(chart: Mapping[str, Any], series: Any, *, rect_mm: Sequence[f
     dark = bool(style.get("dark", False))
     fg = "#e6e6e6" if dark else "#111111"
     grid_on = bool(style.get("grid", False))
-    colors = list(PALETTES.get(str(style.get("palette", "colorblind")), PALETTES["colorblind"]))
+    from nodegraph.figure.layout import effective_palette
+    colors = effective_palette(PALETTES.get(str(style.get("palette", "colorblind")),
+                                            PALETTES["colorblind"]), dark=dark)
     log_x = bool(axes_cfg.get("log_x", False))
     log_y = bool(axes_cfg.get("log_y", False))
     units = units or {}
@@ -553,6 +555,16 @@ def chart_geometry(chart: Mapping[str, Any], series: Any, *, rect_mm: Sequence[f
     aw = max(5.0, fw - left - right)
     ah = max(5.0, fh - top - bottom)
     ax, ay = fx + left, fy + top
+    # x tick labels that would overlap on a narrow axis are thinned: every k-th kept, with
+    # k the smallest that lets them stand apart by a pad (a degenerate range makes long
+    # labels — "1024.2" — that five ticks of a 30 mm axis cannot hold)
+    if xt_lab and x_kind != "category":
+        widths = [measure(s, pt)[0] for s in xt_lab]
+        k = 1
+        while k < len(xt_lab) and sum(widths[::k]) + (len(widths[::k]) - 1) * pad > aw:
+            k += 1
+        if k > 1:
+            xt_pos, xt_lab = list(xt_pos[::k]), list(xt_lab[::k])
     xs_scale = Scale(x_kind, x_lo, x_hi, ax, ax + aw, x_cats)
     if kind == "heatmap":                        # row 0 at the top, as a matrix reads
         ys_scale = Scale(y_kind, y_lo, y_hi, ay, ay + ah, y_cats)
@@ -945,6 +957,9 @@ def chart_geometry(chart: Mapping[str, Any], series: Any, *, rect_mm: Sequence[f
     # ── 6. legend and colour bar geometry ────────────────────────────────────────
     legend: Optional[Dict[str, Any]] = None
     if legend_entries:
+        # a fit appends its equation to the entry label: measure the box again, so an
+        # inside legend hugs the right edge whatever its entries grew to
+        leg_w = max((measure(e["label"], pt)[0] for e in legend_entries), default=0.0) + 6.0
         if leg_loc == "right":
             lx, ly = ax + aw + pad + (cbar_w + pad if cbar_w else 0.0), ay
         elif leg_loc == "bottom":

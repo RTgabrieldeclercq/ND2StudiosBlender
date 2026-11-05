@@ -1,0 +1,38 @@
+{
+  "format": "nd2studios.figure-recipe/1",
+  "name": "Segment & measure summary",
+  "description": "A labelled field with its objects outlined, a histogram of their areas, a per-frame summary table and a legend — the figure a segmentation page earns.",
+  "goal": "composite",
+  "tags": ["segmentation", "measure"],
+  "slots": [
+    {"id": "cells", "needs": "labels", "label": "a labelled image (Connected Components, Segmentation) with its measurements"}
+  ],
+  "figure": {
+    "goal": "composite",
+    "page": {"preset": "double_column", "width_mm": 180.0, "height_mm": 120.0, "dpi": 300,
+             "style": "paper", "font": "sans", "font_pt": 8.0, "palette": "colorblind",
+             "letters": "A"},
+    "sources": [{"id": "cells", "source": "slot:cells"}],
+    "items": [
+      {"id": "field", "kind": "image", "rect_mm": [4.0, 4.0, 84.0, 63.0], "letter": "A",
+       "image": {"source": "cells", "frame": {"m": 0, "t": "cursor", "z": "max"},
+                 "channels": [],
+                 "layers": [{"domain": "label", "layer": "slot:cells.labels", "kind": "labels",
+                             "look": {"outline": true, "fill": false, "ids": false,
+                                      "line_width": 0.6}, "opacity": 100}],
+                 "decor": {"scale_bar_um": 20.0}}},
+      {"id": "legend", "kind": "legend", "rect_mm": [4.0, 70.0, 60.0, 14.0],
+       "of": {"item": "field"}},
+      {"id": "areas", "kind": "chart", "rect_mm": [96.0, 4.0, 80.0, 56.0], "letter": "B",
+       "chart": {"kind": "distribution", "sub_kind": "histogram", "source": "cells",
+                 "domain": "label", "table": "slot:cells.labels",
+                 "value": "slot:cells.labels.column", "bins": 24,
+                 "axes": {"title": "", "x_label": "", "y_label": "objects"}}},
+      {"id": "summary", "kind": "table", "rect_mm": [96.0, 66.0, 80.0, 30.0], "letter": "C",
+       "table": {"source": "cells", "domain": "label", "table": "slot:cells.labels",
+                 "columns": ["slot:cells.labels.column"], "group_by": "t",
+                 "stats": ["n", "mean", "sem"], "decimals": -1}}
+    ],
+    "links": []
+  }
+}
