@@ -80,9 +80,12 @@ def read_plane(ds: Any, m: int, t: int, z: Any, c: int, *, max_px: int = DISPLAY
     level)`` for channel ``c`` at ``(m, t, z)``; ``z`` may be ``max`` / ``mean`` (a
     projection over every plane). The plane is a float array of the window only."""
     prov = _provider(ds)
-    level, lax = _pick_level(prov, max_px)
-    H, W = int(lax.y), int(lax.x)
     fy0, fy1, fx0, fx1 = window if window else (0.0, 1.0, 0.0, 1.0)
+    # the budget is for the WINDOW: a popout of a tenth of a mosaic wants a level ten
+    # times finer than the whole plane would (V5.00 step 7)
+    frac = max(1e-3, min(1.0, max(fy1 - fy0, fx1 - fx0)))
+    level, lax = _pick_level(prov, int(math.ceil(max_px / frac)))
+    H, W = int(lax.y), int(lax.x)
     y0, y1 = max(0, int(math.floor(fy0 * H))), min(H, int(math.ceil(fy1 * H)))
     x0, x1 = max(0, int(math.floor(fx0 * W))), min(W, int(math.ceil(fx1 * W)))
     if y1 <= y0:
@@ -108,6 +111,16 @@ def read_plane(ds: Any, m: int, t: int, z: Any, c: int, *, max_px: int = DISPLAY
     else:
         zi = min(max(int(z), 0), max(0, nz - 1))
         plane = np.asarray(prov.get_region(level, m, t, zi, c, y0, y1, x0, x1), dtype=float)
+    # a provider without a pyramid (or a window far above the budget at its finest level)
+    # is strided down — never interpolated — so a 500-tile montage composites 500 small
+    # planes, not 500 full ones; the level shape and the box follow the stride
+    longest = max(plane.shape[0], plane.shape[1]) if plane.size else 0
+    if longest > 2 * int(max_px):
+        k = int(math.ceil(longest / float(max_px)))
+        plane = np.ascontiguousarray(plane[::k, ::k])
+        H, W = int(math.ceil(H / k)), int(math.ceil(W / k))
+        y0, x0 = y0 // k, x0 // k
+        y1, x1 = y0 + plane.shape[0], x0 + plane.shape[1]
     return plane, (H, W), (y0, y1, x0, x1)
 
 

@@ -525,7 +525,22 @@ journal-sized page you place things on. What it can show is whatever the pages b
    the file it came from with size and mtime, the display windows, the app version, the
    figure digest) and `<stem>.data/` with a CSV of the values every chart, table and heat
    layer drew.
-10. **Without a window** (V5.00 step 6): `python -m nodelab_v2.figure_render
+10. **Report, movie, keyboard** (V5.00 step 7). The *Report* goal and **Export ▾ →
+    Report** write the bundle plus `<stem>.html` — the picture, a caption per lettered
+    panel written from what it shows (source, frame, channels, overlays, scale bar; a
+    chart's columns, fit and test; a table's statistics), the legend paragraph and the
+    provenance table — and `<stem>.report.pdf` printed from it. **Movie…** on an image
+    (or the *Movie* goal) makes an Export Movie of its source on a new Free page — its
+    channels with the windows the figure drew them with, its first layer, its position
+    and projection, its decor as annotations — and opens the Movie Editor on it; the
+    figure page is untouched. Keys on the page: arrows nudge (Shift: 5 mm), Delete
+    removes, Ctrl+D duplicates beside, Ctrl+A selects all, Esc deselects, Ctrl+Z / Ctrl+Y
+    undo and redo, Home fits the page, 0 shows it at 1:1, Ctrl+plus / Ctrl+minus zoom.
+    An export reads every image at the budget its page size and dpi need — a mosaic
+    through the pyramid level that resolution can show — and a montage splits its budget
+    over its tiles, so a 500-frame montage composites 500 thumbnails; a source without a
+    pyramid is strided, never interpolated.
+11. **Without a window** (V5.00 step 6): `python -m nodelab_v2.figure_render
     file.nd2graph.json --out fig.png [--page NAME] [--dpi 300] [--svg] [--bundle]` renders
     a figure page under the offscreen platform through the same editor and exports the
     same drawing — a loader with a file path is ingested as the app ingests it, a loader
@@ -534,7 +549,7 @@ journal-sized page you place things on. What it can show is whatever the pages b
     job.json` renders one. A figure page published as a **LabLink** recipe ships its
     figure; the worker renders it with that command in a subprocess and returns the PNG
     as the run's `figure` artifact, the bundle beside it.
-11. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
+12. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
    the paper-readiness checks (a missing scale bar, an inset with no box, a red / green
    merge, twins that do not share a display range, an unlabelled colour bar). A V4 file's
    Analysis page that held nodes opens as a Free page named *(graph)*.

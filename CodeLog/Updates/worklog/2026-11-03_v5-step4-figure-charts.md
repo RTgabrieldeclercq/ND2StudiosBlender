@@ -91,4 +91,4 @@ PYTHONUTF8=1 QT_QPA_PLATFORM=offscreen python -u scripts/_nodelab_v2_phase5_prob
 - [x] `PYTHONUTF8=1 python scripts/_nodelab_v2_phase5_probe.py out.png` -> ALL PHASE-5 GUI PROBES PASSED (the process still segfaults at `os._exit` *after* that line — the environmental exit crash documented in the step-3 entry, reproduced on a pristine step-2 tree; not a regression)
 - [x] `python scripts/_catalog_snapshot.py` -> CATALOG IDENTICAL — 145 ops
 - [x] `python scripts/_codemap.py` -> CODEMAP CURRENT
-- [ ] `python scripts/_sync_check.py` -> IN SYNC — fetch and push are blocked on this machine ("SSL peer certificate or SSH remote key was not OK"); the branch is stacked locally, to be rebased and pushed once the certificate issue is fixed
+- [x] `python scripts/_sync_check.py` -> IN SYNC — pushed 2026-11-05 on top of origin/Blender @572312a (ahead only, no rebase needed). The push block was Norton re-signing TLS, fixed with `git config --global http.sslBackend schannel`; see 2026-11-05_v5-stack-pushed.md

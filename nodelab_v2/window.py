@@ -449,6 +449,56 @@ class _FigureHost:
     def app_version(self) -> str:
         return f"{PRODUCT} {APP_VERSION}"
 
+    def make_movie(self, page_id: str, movie: Mapping[str, Any]) -> Optional[str]:
+        """Page → Movie (V5.00 step 7): a Free page ``movie["name"]`` holding a Page Input
+        of ``movie["source"]`` wired into an Export Movie whose timeline is the image's
+        channels with the windows it was drawn with (absolute contrast), its first layer,
+        its position and projection, its decor as annotations; the page is shown and the
+        Movie Editor opened on the node. Returns the node id."""
+        from nodegraph.catalog._shared.movie_timeline import canonical_json, flat_spec
+        from nodelab_v2.ops import MOVIE_OP as _MOVIE, PAGE_INPUT_OP, PAGE_SOURCE_KEY
+        ws = self._w.workspace
+        src = str(movie.get("source") or "")
+        if not src:
+            return None
+        chans = [int(c) for c in (movie.get("channels") or [0])]
+        display = dict(movie.get("display") or {})
+        lo_hi = [(d.get("lo"), d.get("hi")) for d in display.values()
+                 if d.get("lo") is not None and d.get("hi") is not None]
+        absolute = len(lo_hi) == len(chans) and bool(lo_hi)
+        first = display.get(chans[0]) or display.get(str(chans[0])) or {}
+        tl = flat_spec(sweep="time", z_reduce=str(movie.get("z_reduce") or "max"),
+                       channels=chans, layer=str(movie.get("layer") or ""),
+                       m=int(movie.get("m") or 0),
+                       contrast="absolute" if absolute else "auto",
+                       low_pct=0.5, high_pct=99.8,
+                       black=float(first.get("lo") or 0.0), white=float(first.get("hi") or 1.0),
+                       gamma=float(first.get("gamma") or 1.0), brightness=1.0,
+                       show=dict(movie.get("show") or {}))
+        # per-channel windows: the flat spec carries one pair; the timeline carries each
+        if absolute:
+            panel = tl["segments"][0]["panels"][0]
+            for c in chans:
+                d = display.get(c) or display.get(str(c)) or {}
+                panel["display"][str(c)] = {"gamma": float(d.get("gamma") or 1.0),
+                                            "lo": float(d["lo"]), "hi": float(d["hi"])}
+        page = ws.add_page(str(movie.get("name") or "Movie"), FREE_KIND)
+        inp = page.doc.add_node(PAGE_INPUT_OP, x=40.0, y=120.0, params={PAGE_SOURCE_KEY: src})
+        node = page.doc.add_node(_MOVIE, x=360.0, y=120.0, params={
+            "timeline": canonical_json(tl), "layer": str(movie.get("layer") or ""),
+            "channels": ",".join(str(c) for c in chans),
+            "show_scalebar": bool((movie.get("show") or {}).get("scalebar", True)),
+            "show_time": bool((movie.get("show") or {}).get("time", True)),
+            "show_channels": bool((movie.get("show") or {}).get("channels", False))})
+        page.doc.connect(inp.id, "out", node.id, "data")
+        self._w._refresh_page_views()
+        self._w._show_page(self._w._canvas, page.id)
+        self._w.open_movie_editor(node.id)
+        self._w.statusBar().showMessage(
+            f"Export Movie of {movie.get('label') or src} on page {page.name!r} — the Movie "
+            f"Editor shows it", 6000)
+        return node.id
+
     def status(self, text: str) -> None:
         self._w.statusBar().showMessage(text, 6000)
 

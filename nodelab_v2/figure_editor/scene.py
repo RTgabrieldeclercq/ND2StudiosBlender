@@ -119,8 +119,22 @@ class FigureScene(QGraphicsScene):
     def keyPressEvent(self, e) -> None:                                   # noqa: N802
         k = e.key()
         step = 1.0 if not (e.modifiers() & Qt.ShiftModifier) else 5.0
+        ctrl = bool(e.modifiers() & Qt.ControlModifier)
         if k in (Qt.Key_Delete, Qt.Key_Backspace):
             self.key_action.emit("delete", None)
+            e.accept()
+            return
+        # the keyboard the editor answers (V5.00 step 7): Esc deselects, Ctrl+A selects
+        # every item, Ctrl+D duplicates, Ctrl+Z / Ctrl+Y undo and redo, Home fits the
+        # page, Ctrl+plus / Ctrl+minus zoom, 0 shows the page at 1:1
+        chords = {(Qt.Key_Escape, False): ("deselect", None), (Qt.Key_A, True): ("select_all", None),
+                  (Qt.Key_D, True): ("duplicate", None), (Qt.Key_Z, True): ("undo", None),
+                  (Qt.Key_Y, True): ("redo", None), (Qt.Key_Home, False): ("fit", None),
+                  (Qt.Key_Plus, True): ("zoom", 1.25), (Qt.Key_Equal, True): ("zoom", 1.25),
+                  (Qt.Key_Minus, True): ("zoom", 0.8), (Qt.Key_0, False): ("zoom_1", None)}
+        hit = chords.get((k, ctrl))
+        if hit is not None:
+            self.key_action.emit(hit[0], hit[1])
             e.accept()
             return
         moves = {Qt.Key_Left: (-step, 0.0), Qt.Key_Right: (step, 0.0),

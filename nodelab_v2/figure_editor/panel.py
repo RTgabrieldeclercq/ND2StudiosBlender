@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -50,6 +51,8 @@ from nodelab_v2.figure_document import FigureDocument
 
 #: the figure's own unit for overlay looks: points → page units
 _STROKE = 25.4 / 72.0 * MM
+#: the most pixels an item is read at for an export (a 180 mm page at 600 dpi is 4252)
+MAX_EXPORT_PX = 4096
 
 
 def _panel_qss() -> str:
@@ -144,6 +147,7 @@ class FigureEditorPanel(QWidget):
         self._renders: Dict[str, Tuple[str, Any]] = {}      # item id → (key, Rendered | tiles)
         self._tables: Dict[str, Tuple[int, Any]] = {}       # run id → (id(payload), tables)
         self._hover_text = ""
+        self._export_dpi: Optional[int] = None              # set while an export renders
         self._gen = 0
         self._undo: List[str] = []
         self._redo: List[str] = []
@@ -221,7 +225,9 @@ class FigureEditorPanel(QWidget):
         for fmt, text in (("png", "PNG at the page dpi"), ("tiff", "TIFF at the page dpi"),
                           ("svg", "SVG (text stays text)"), ("pdf", "PDF (fonts embedded)"),
                           ("bundle", "Bundle — PNG + SVG, the data drawn (CSV), the legend "
-                                     "text, the provenance record")):
+                                     "text, the provenance record"),
+                          ("report", "Report — the bundle plus an HTML page and a PDF with a "
+                                     "caption per panel and the legend")):
             menu.addAction(text, lambda f=fmt: self.export_dialog(f))
         self._export_btn.setMenu(menu)
         bar.addWidget(self._export_btn)
@@ -1558,7 +1564,11 @@ class FigureEditorPanel(QWidget):
         elif goal == "table":
             if tabs:
                 self.add_table(str(tabs[0]["value"]))
-        elif goal == "composite":
+        elif goal == "movie":
+            if imgs:
+                iid = self.add_image(str(imgs[0]["value"]))
+                self.make_movie(iid)
+        elif goal in ("composite", "report"):
             if imgs:
                 self.add_image(str(imgs[0]["value"]))
             if tabs:
@@ -1659,7 +1669,7 @@ class FigureEditorPanel(QWidget):
                 self._renders.pop(iid, None)
         self._refresh_renders()
 
-    def _render_key(self, iid: str, img: Mapping[str, Any]) -> str:
+    def _render_key(self, iid: str, img: Mapping[str, Any], max_px: Optional[int] = None) -> str:
         rid = self._run_ids.get(img.get("source") or "", "")
         payload = self._payloads.get(rid)
         viewer = ""
@@ -1671,7 +1681,17 @@ class FigureEditorPanel(QWidget):
             shared = self._renders[leader][0]
         return S.digest({"img": img, "cursor": self._cursor, "payload": id(payload),
                          "viewer": viewer, "shared": shared, "kind": S.item(self._doc, iid)["kind"],
-                         "montage": S.item(self._doc, iid).get("montage")})
+                         "montage": S.item(self._doc, iid).get("montage"),
+                         "max_px": int(max_px or R.DISPLAY_MAX_PX)})
+
+    def _export_px(self, spec: Mapping[str, Any], dpi: Optional[int]) -> Optional[int]:
+        """The pixel budget an item needs at ``dpi`` (``None`` = the display budget): its
+        width on the page at that resolution, capped — a page exported at 300 dpi reads
+        its mosaics at the level that resolution can show, no finer (V5.00 step 7)."""
+        if not dpi:
+            return None
+        w_mm = float(spec["rect_mm"][2])
+        return int(min(MAX_EXPORT_PX, max(64, math.ceil(w_mm * float(dpi) / 25.4))))
 
     def _refresh_renders(self) -> None:
         """Queue a render for every image item whose key changed; feed dependents."""
@@ -1699,26 +1719,30 @@ class FigureEditorPanel(QWidget):
                 item.set_rendered(None, img, note)
                 self._renders.pop(iid, None)
                 continue
-            key = self._render_key(iid, img)
+            px = self._export_px(S.item(self._doc, iid), self._export_dpi)
+            key = self._render_key(iid, img, px)
             have = self._renders.get(iid)
             if have is not None and have[0] == key:
                 continue
             self._gen += 1
             gen = self._gen
             self._renders[iid] = (key, None)
-            fn = self._render_fn(iid, img, payload, rid)
+            fn = self._render_fn(iid, img, payload, rid, px)
             self._worker.request(iid, gen, fn)
         self._refresh_charts()
         self._refresh_tables()
         self._feed_dependents()
         self._update_leaders()
 
-    def _render_fn(self, iid: str, img: Mapping[str, Any], payload: Any, rid: str
-                   ) -> Callable[[], Any]:
-        """The closure the worker runs: everything it reads is captured now."""
+    def _render_fn(self, iid: str, img: Mapping[str, Any], payload: Any, rid: str,
+                   max_px: Optional[int] = None) -> Callable[[], Any]:
+        """The closure the worker runs: everything it reads is captured now. ``max_px`` is
+        the pixel budget of the whole item (the display's by default); a montage splits it
+        over its tiles, so a 500-frame montage composites 500 thumbnails, not 500 planes."""
         doc = self._doc
         cursor = dict(self._cursor)
         spec = S.item(doc, iid)
+        budget = int(max_px or R.DISPLAY_MAX_PX)
         env = self._envs.get(img.get("source") or "")
         md = dict(getattr(env, "metadata", None) or {})
         img = dict(img)
@@ -1742,10 +1766,10 @@ class FigureEditorPanel(QWidget):
         montage = spec.get("montage") if spec.get("kind") == "montage" else None
         axes = describe_envelope(env).get("axes") or {}
 
-        def one(coords):
+        def one(coords, px: int = budget):
             return R.render_image(payload, img, coords, window=plan.window, viewer_state=viewer,
                                   shared_clims=shared, own_layers=own, field_cache=field_cache,
-                                  palette=pal)
+                                  palette=pal, max_px=px)
 
         if montage is None:
             z = plan.z
@@ -1760,6 +1784,8 @@ class FigureEditorPanel(QWidget):
             idx = list(range(start, n, step))[:count]
             out = []
             names = img["_channel_names"]
+            cols = int(montage.get("columns", 0) or 0) or max(1, int(math.ceil(math.sqrt(len(idx)))))
+            tile_px = max(48, int(math.ceil(budget / cols)))
             for i in idx:
                 m, t, z = plan.m, plan.t, plan.z
                 c = 0 if not img.get("channels") else int(img["channels"][0].get("c", 0))
@@ -1776,7 +1802,7 @@ class FigureEditorPanel(QWidget):
                     c = i
                 r = R.render_image(payload, sub, (m, t, z, c), window=plan.window,
                                    viewer_state=viewer, shared_clims=shared, own_layers=own,
-                                   field_cache=field_cache, palette=pal)
+                                   field_cache=field_cache, palette=pal, max_px=tile_px)
                 if str(montage.get("labels", "auto")) == "none":
                     label = ""
                 elif axis == "m":
@@ -1832,8 +1858,9 @@ class FigureEditorPanel(QWidget):
         self._update_leaders()
         self._sync_status()
 
-    def render_now(self, item_id: str) -> Any:
-        """Render one image item synchronously (the probe and the export use this)."""
+    def render_now(self, item_id: str, max_px: Optional[int] = None) -> Any:
+        """Render one image item synchronously (the probe and the export use this), at
+        the display budget or at ``max_px``."""
         item = self._items.get(item_id)
         if not isinstance(item, ImageItem):
             return None
@@ -1842,18 +1869,39 @@ class FigureEditorPanel(QWidget):
         payload = self._payloads.get(rid)
         if payload is None:
             return None
-        key = self._render_key(item_id, img)
-        result = self._render_fn(item_id, img, payload, rid)()
+        if max_px is None:
+            max_px = self._export_px(S.item(self._doc, item_id), self._export_dpi)
+        key = self._render_key(item_id, img, max_px)
+        have = self._renders.get(item_id)
+        if have is not None and have[0] == key and have[1] is not None:
+            return have[1]
+        result = self._render_fn(item_id, img, payload, rid, max_px)()
         self._renders[item_id] = (key, result)
         self._on_rendered(item_id, self._gen, result)
         return result
 
-    def render_all_now(self) -> None:
+    def render_all_now(self, dpi: Optional[int] = None) -> None:
+        """Every image item synchronously — at the display budget, or at the budget each
+        item needs for an export at ``dpi`` (the leaders of share groups first). The
+        budget stays the panel's until :meth:`_restore_display_renders`, so a refresh
+        fired meanwhile (a share-group leader landing) does not re-queue display renders
+        under the export's feet."""
+        self._export_dpi = int(dpi) if dpi else None
         for grp in LK.share_groups(self._doc):
             self.render_now(grp[0])
         for it in self._doc.get("items", []):
             if it["kind"] in ("image", "montage"):
                 self.render_now(it["id"])
+
+    def _restore_display_renders(self) -> None:
+        """After an export at the page's resolution: drop the full-resolution renders and
+        re-queue the display ones on the worker, so the page does not keep a 300 dpi
+        mosaic per item in memory."""
+        self._export_dpi = None
+        for iid in list(self._renders):
+            if isinstance(self._items.get(iid), ImageItem):
+                self._renders.pop(iid, None)
+        self._refresh_renders()
 
     def _feed_dependents(self) -> None:
         """Colour bars, histograms, scale bars and measure lines read their image's render."""
@@ -1944,6 +1992,151 @@ class FigureEditorPanel(QWidget):
             self.delete_items(ids)
         elif action == "nudge" and ids:
             self.nudge(ids, float(arg[0]), float(arg[1]))
+        elif action == "duplicate" and ids:
+            self.duplicate_items(ids)
+        elif action == "select_all":
+            self.select([it["id"] for it in self._doc.get("items", [])])
+        elif action == "deselect":
+            self.select([])
+        elif action == "undo":
+            self.undo()
+        elif action == "redo":
+            self.redo()
+        elif action == "fit":
+            self.view.fit_page()
+        elif action == "zoom_1":
+            self.view.zoom_1()
+        elif action == "zoom":
+            self.view.scale(float(arg), float(arg))
+
+    def duplicate_items(self, ids: Sequence[str], offset_mm: float = 3.0) -> List[str]:
+        """Copies of ``ids`` placed ``offset_mm`` right and down, with fresh ids and no
+        letter (letters are the page's to assign); the copies are selected. Links are
+        not copied — a popout's box belongs to one parent."""
+        ids = [i for i in ids if i in {it["id"] for it in self._doc.get("items", [])}]
+        if not ids:
+            return []
+        new_ids: List[str] = []
+
+        def mut(dd):
+            taken = {it["id"] for it in dd.get("items", [])}
+            for iid in ids:
+                src = next(it for it in dd["items"] if it["id"] == iid)
+                base = "".join(ch for ch in iid if not ch.isdigit()) or "item"
+                k = 1
+                while f"{base}{k}" in taken:
+                    k += 1
+                nid = f"{base}{k}"
+                taken.add(nid)
+                copy_ = copy.deepcopy(src)
+                copy_["id"] = nid
+                copy_["letter"] = ""
+                copy_["rect_mm"] = [float(src["rect_mm"][0]) + offset_mm,
+                                    float(src["rect_mm"][1]) + offset_mm,
+                                    float(src["rect_mm"][2]), float(src["rect_mm"][3])]
+                dd["items"].append(copy_)
+                new_ids.append(nid)
+        self.commit(_mutated(self._doc, mut))
+        self.select(new_ids)
+        return new_ids
+
+    def make_movie(self, item_id: str) -> Optional[str]:
+        """Page → Movie (V5.00 step 7): an Export Movie of this image's source — its
+        channels with the windows it was drawn with, its first overlay layer, its decor —
+        on a Free page the host adds, opened in the Movie Editor. Returns the node's run
+        id, or ``None`` when the host could not (the status line says why)."""
+        spec = S.item(self._doc, item_id)
+        if spec.get("kind") not in ("image", "montage"):
+            return None
+        img = S.effective_image(self._doc, item_id)
+        sid = str(img.get("source") or "")
+        src = next((s for s in self._doc.get("sources", []) if s["id"] == sid), None)
+        if src is None:
+            self._status.setText("the image reads no source")
+            return None
+        r = self._renders.get(item_id, (None, None))[1]
+        if isinstance(r, list):
+            r = next((t[1] for t in r if t[1] is not None), None)
+        clims = dict(r.clims) if isinstance(r, R.Rendered) else {}
+        chans = [int(ch.get("c", 0)) for ch in img.get("channels") or []] or [0]
+        display = {}
+        for ch in img.get("channels") or []:
+            c = int(ch.get("c", 0))
+            d: Dict[str, Any] = {"gamma": float(ch.get("gamma") or 1.0)}
+            if c in clims:
+                d["lo"], d["hi"] = float(clims[c][0]), float(clims[c][1])
+            display[c] = d
+        layer = next((str(L.get("layer")) for L in img.get("layers") or []
+                      if L.get("layer")), "")
+        decor = img.get("decor") or {}
+        frame = img.get("frame") or {}
+        m = int(frame.get("m")) if isinstance(frame.get("m"), int) else int(self._cursor["m"])
+        z = frame.get("z")
+        movie = {"source": str(src["source"]), "label": str(src.get("label") or sid),
+                 "channels": chans, "display": display, "layer": layer, "m": m,
+                 "z_reduce": "max" if z == "max" else ("mean" if z == "mean" else "auto"),
+                 "show": {"scalebar": bool(decor.get("scale_bar_um")),
+                          "time": bool(decor.get("time_stamp")),
+                          "channels": bool(decor.get("channel_labels")), "frame": False,
+                          "position": False},
+                 "name": f"Movie — {spec.get('letter') or item_id}"}
+        try:
+            return self._host.make_movie(self._pid or "", movie)
+        except Exception as exc:               # noqa: BLE001 — told, never raised into Qt
+            self._status.setText(f"movie: {exc}")
+            return None
+
+    def export_report(self, path: str, dpi: Optional[int] = None) -> List[str]:
+        """The Report (V5.00 step 7): the bundle plus ``<stem>.html`` — the picture, a
+        caption per panel, the legend paragraph, the provenance — and ``<stem>.report.pdf``
+        printed from that page. Returns every path written."""
+        from nodegraph.figure import report as FRP
+        written = self.export_bundle(path, "png", dpi)
+        stem = os.path.splitext(written[0])[0]
+        nd = S.normalize(self._doc)
+        labels = dict(self._labels)
+        captions = FRP.panel_captions(nd, self._envs, labels=labels)
+        legend = ""
+        prov = None
+        try:
+            with open(stem + ".legend.txt", encoding="utf8") as fh:
+                legend = fh.read().strip()
+        except OSError:
+            pass
+        try:
+            with open(stem + ".provenance.json", encoding="utf8") as fh:
+                prov = json.load(fh)
+        except (OSError, ValueError):
+            prov = None
+        folder = os.path.dirname(stem)
+        data_dir = stem + ".data"
+        data_files = sorted(os.path.relpath(os.path.join(data_dir, f), folder).replace("\\", "/")
+                            for f in os.listdir(data_dir)) if os.path.isdir(data_dir) else []
+        title = self._title.text().replace("Figure — ", "") or "Figure"
+        html = FRP.report_html(nd, title=title, picture=os.path.basename(written[0]),
+                               legend=legend, captions=captions, provenance=prov,
+                               svg=os.path.basename(stem + ".svg") if os.path.exists(stem + ".svg")
+                               else "", data_files=data_files)
+        html_path = stem + ".html"
+        with open(html_path, "w", encoding="utf8", newline="") as fh:
+            fh.write(html)
+        written.append(html_path)
+        try:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument
+            tdoc = QTextDocument()
+            tdoc.setBaseUrl(QUrl.fromLocalFile(folder + os.sep))
+            tdoc.setHtml(html)
+            pdf_path = stem + ".report.pdf"
+            writer = QPdfWriter(pdf_path)
+            writer.setPageSize(QPageSize(QPageSize.A4))
+            writer.setResolution(int(dpi or self._doc.get("page", {}).get("dpi", 300)))
+            tdoc.print_(writer)
+            written.append(pdf_path)
+        except Exception as exc:               # noqa: BLE001 — the HTML stands on its own
+            self._status.setText(f"report PDF not written: {exc}")
+        self._host.status(f"report written: {html_path}")
+        return written
 
     def _on_region_dragged(self, item_id: str, rect: QRectF) -> None:
         item = self._items.get(item_id)
@@ -2016,18 +2209,25 @@ class FigureEditorPanel(QWidget):
 
     # ── export ─────────────────────────────────────────────────────────────────
     def export(self, path: str, fmt: str, dpi: Optional[int] = None) -> str:
-        self.render_all_now()
+        """The page as ``fmt`` at ``dpi`` (default: the page's). Images are re-read at the
+        budget that resolution needs — a mosaic through the pyramid level it can show —
+        and the display renders come back on the worker once the export has returned."""
         page = self._doc.get("page") or {}
-        out = self.scene.export(path, fmt, int(dpi or page.get("dpi", 300)))
+        res = int(dpi or page.get("dpi", 300))
+        self.render_all_now(res)
+        out = self.scene.export(path, fmt, res)
         self._host.status(f"figure written: {out}")
+        QTimer.singleShot(0, self._restore_display_renders)
         return out
 
     def export_dialog(self, fmt: str) -> None:
-        bundle = fmt == "bundle"
+        bundle = fmt in ("bundle", "report")
         path = self._host.export_path("png" if bundle else fmt)
         if path:
             try:
-                if bundle:
+                if fmt == "report":
+                    self.export_report(path)
+                elif bundle:
                     self.export_bundle(path, "png")
                 else:
                     self.export(path, fmt)

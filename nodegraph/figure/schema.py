@@ -31,7 +31,7 @@ from nodegraph.figure.layout import LETTER_STYLES, PAGE_PRESETS
 
 SCHEMA = "nd2studios-figure/1"
 
-GOALS = ("plot", "overlay", "composite", "table", "montage")
+GOALS = ("plot", "overlay", "composite", "table", "montage", "report")
 
 ITEM_KINDS = ("image", "montage", "picture", "chart", "colorbar", "histogram", "scale_bar",
               "legend", "table", "text", "arrow", "line", "shape", "measure_line", "letter",

@@ -37720,5 +37720,101 @@ def test_figure_headless_render() -> None:
         "the figure with a figure output")
 
 
+def test_figure_polish() -> None:
+    """Step 7, Qt-free: a plane read above its pixel budget on a provider without a
+    pyramid is strided (never interpolated) with the level shape and box following the
+    stride, and the budget is for the WINDOW (a region asks for a finer level); the
+    Report's captions name what each lettered panel shows in reading order and its HTML
+    carries the picture, the captions, the legend and the provenance; ``report`` is a
+    goal the schema accepts."""
+    from nodegraph.figure import report as FRP
+    from nodegraph.figure import schema as S
+    from nodelab_v2.figure_editor import render as R
+
+    ws, ds, env, ax = _ws_fixture()                      # a 32 × 32 ArrayProvider, no pyramid
+    img = dict(S.image_defaults(), source="s", channels=[dict(S.channel_defaults(), c=0)])
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=1024)
+    assert plane.shape == (32, 32) and shape == (32, 32) and box == (0, 32, 0, 32)
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=8)
+    assert plane.shape == (8, 8) and shape == (8, 8) and box == (0, 8, 0, 8), (plane.shape, shape, box)
+    assert float(plane.max()) == 100.0, "a stride keeps the values it keeps"
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=8, window=(0.25, 0.75, 0.25, 0.75))
+    assert plane.shape == (16, 16) and shape == (32, 32) and box == (8, 24, 8, 24), (
+        plane.shape, shape, box)                          # within 2× of the budget: as read
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=4, window=(0.25, 0.75, 0.25, 0.75))
+    assert plane.shape == (4, 4) and shape == (8, 8) and box == (2, 6, 2, 6), (
+        plane.shape, shape, box)                          # strided ×4, box in strided px
+    r = R.render_image(ds, img, (0, 0, 0, 0), max_px=8)
+    assert r.image.width() == 8 and r.plane_shape == (8, 8) and r.level_shape == (8, 8)
+    r2 = R.render_image(ds, img, (0, 0, 0, 0))
+    assert r2.image.width() == 32 and r2.pixel_size_um == 0.5 and abs(r.pixel_size_um - 2.0) < 1e-9, (
+        r2.pixel_size_um, r.pixel_size_um)
+
+    # the budget is for the window: a fake two-level pyramid picks the finer level for a
+    # quarter-plane window at the same budget that the whole plane reads coarse
+    class _Pyr:
+        levels = 2
+
+        def level_axes(self, lv):
+            n = 64 >> lv
+            return AxisSizes(m=1, t=1, z=1, c=1, y=n, x=n)
+
+        def get_region(self, level, m, t, z, c, y0, y1, x0, x1):
+            return np.full((y1 - y0, x1 - x0), float(level), dtype=float)
+
+    assert R._pick_level(_Pyr(), 32)[0] == 1 and R._pick_level(_Pyr(), 33)[0] == 0
+    fake = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64), metadata={}).with_image(_Pyr())
+    whole, _s, _b = R.read_plane(fake, 0, 0, 0, 0, max_px=32)
+    part, _s, _b = R.read_plane(fake, 0, 0, 0, 0, max_px=32, window=(0.0, 0.25, 0.0, 0.25))
+    assert float(whole[0, 0]) == 1.0 and float(part[0, 0]) == 0.0, (whole[0, 0], part[0, 0])
+
+    # the report
+    doc = S.normalize({
+        "goal": "report",
+        "sources": [{"id": "cells", "source": "pg3:cells", "label": "P1 · cells"}],
+        "data": [{"id": "d1", "from": ["cells"], "where": [["area", ">", 50]],
+                  "aggregate": {"group_by": ["t"], "value": "area", "reducers": ["mean"]}}],
+        "items": [
+            {"id": "img", "kind": "image", "rect_mm": [0, 0, 40, 30], "letter": "A",
+             "image": {"source": "cells", "frame": {"m": 0, "t": 3, "z": "max"},
+                       "channels": [{"c": 0, "rgb": "#ffffff", "label": "DAPI"},
+                                    {"c": 1, "rgb": "#00ff00"}],
+                       "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                       "decor": {"scale_bar_um": 20}}},
+            {"id": "ch", "kind": "chart", "rect_mm": [45, 0, 40, 30], "letter": "B",
+             "chart": {"kind": "bar", "data": "d1", "x": "t", "y": "area_mean",
+                       "stats": {"test": "welch"}}},
+            {"id": "tb", "kind": "table", "rect_mm": [0, 35, 40, 20], "letter": "C",
+             "table": {"source": "cells", "columns": ["area"], "group_by": "t",
+                       "stats": ["n", "mean"]}},
+            {"id": "txt", "kind": "text", "rect_mm": [0, 60, 40, 5], "text": "note"}]})
+    env2 = MetaEnvelope(axes=AxisSizes(m=1, t=4, z=2, c=2, y=64, x=64),
+                        metadata={"channel_names": ["DAPI", "GFP"]})
+    caps = FRP.panel_captions(doc, {"cells": env2}, labels={"cells": "P1 · cells"})
+    assert [c[0] for c in caps] == ["A", "B", "C"], caps
+    a, b, c = (t for _l, t in caps)
+    assert a.startswith("P1 · cells — DAPI, GFP (frame 3, maximum projection); object outlines. "
+                        "Scale bar 20 µm."), a
+    assert b.startswith("Area_mean per t; welch test, from P1 · cells; kept where area > 50; "
+                        "area per t (mean)."), b
+    assert c == "Area (n, mean) per t, from P1 · cells.", c
+    html = FRP.report_html(doc, title="Study 1", picture="fig.png", legend="Images show A.",
+                           captions=caps, provenance={"sources": [
+                               {"id": "cells", "label": "P1 · cells", "source": "pg3:cells",
+                                "run_id": "pg3/O", "lineage": "abc", "files": [{"name": "x.nd2"}]}],
+                               "data": doc["data"], "app_version": "v", "written": "now",
+                               "figure_digest": "0123456789abcdef"}, svg="fig.svg",
+                           data_files=["fig.data/B_ch_chart.csv"])
+    for needle in ("<img src=\"fig.png\"", "<dt>A</dt>", "Scale bar 20 µm", "Images show A.",
+                   "pg3/O", "x.nd2", "kept where area &gt; 50", "fig.svg", "B_ch_chart.csv",
+                   "figure 0123456789ab"):
+        assert needle in html, needle
+    assert "<script" not in html and html.count("<html") == 1
+    assert S.normalize({"goal": "report"})["goal"] == "report"
+    _ok("figure polish: a plane over budget is strided with its box and level shape, the "
+        "budget is the window's, report captions per lettered panel and a self-contained "
+        "HTML with picture, captions, legend and provenance")
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
