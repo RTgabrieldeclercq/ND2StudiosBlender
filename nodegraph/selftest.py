@@ -36777,6 +36777,7 @@ def main() -> int:
     test_table_export_split()
     test_figure_core()
     test_figure_page()
+    test_figure_paper()
     test_figure_data()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
@@ -37387,6 +37388,118 @@ def test_figure_data() -> None:
     print("[ok] figure data: where → aggregate compile into the shadow graph, pull through "
           "the real catalog, series + geometry + CSV from the summary, concat for pooled "
           "sources, removal, schema refusals")
+
+
+def test_figure_paper() -> None:
+    """Paper-readiness (V5.00 step 5), Qt-free: panels re-letter in reading order with a
+    popout unlettered; style sync applies the preset to the page and clears item
+    overrides; every chart palette passes the ΔE validator on both page colours as drawn
+    (a grey ramp re-spaced, black lifted on a dark page); a summary table reduces a table
+    per group with the statistics asked for and formats for print; the export bundle
+    composes the canonical document, the legend sentence, a provenance record naming the
+    sources, run ids, lineage and files, and a CSV per data file; ``write_bundle`` puts
+    them beside the picture."""
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph.catalog._shared.figure import PALETTES
+    from nodegraph.figure import bundle as FB
+    from nodegraph.figure import layout as L
+    from nodegraph.figure import schema as S
+    from nodegraph.figure import tables as FT
+
+    # re-lettering: rows top to bottom, left to right; the zoom child gets none
+    doc = S.normalize({"page": {"letters": "A"}, "sources": [{"id": "s", "source": "pg1:raw"}],
+                       "items": [{"id": "b", "kind": "chart", "rect_mm": [50, 1, 30, 20],
+                                  "chart": {"kind": "xy", "source": "s"}},
+                                 {"id": "a", "kind": "image", "rect_mm": [0, 0, 40, 30],
+                                  "image": {"source": "s"}},
+                                 {"id": "c", "kind": "image", "rect_mm": [0, 35, 40, 30],
+                                  "image": {"source": "s"}},
+                                 {"id": "z", "kind": "image", "rect_mm": [45, 35, 10, 10],
+                                  "letter": "Q", "image": {"source": "s", "region": {
+                                      "from": "rect_frac", "rect_frac": [0, .5, 0, .5]}}},
+                                 {"id": "t", "kind": "text", "rect_mm": [0, 70, 10, 5],
+                                  "text": "hi", "pt": 12.0},
+                                 {"id": "sh", "kind": "shape", "rect_mm": [0, 80, 10, 5],
+                                  "width_pt": 3.0}],
+                       "links": [{"kind": "zoom", "parent": "c", "child": "z"}]})
+    assert L.reletter(doc) == {"a": "A", "b": "B", "c": "C", "z": ""}, L.reletter(doc)
+    assert L.reletter(dict(doc, page=dict(doc["page"], letters="(A)")))["b"] == "(B)"
+    assert L.reletter(dict(doc, page=dict(doc["page"], letters="none"))) == \
+        {"a": "", "b": "", "c": "", "z": ""}
+    assert L.reading_order([{"id": "r", "rect_mm": [60, 2, 10, 10]},
+                            {"id": "l", "rect_mm": [0, 0, 50, 40]},
+                            {"id": "d", "rect_mm": [0, 45, 10, 10]}]) == ["l", "r", "d"]
+    # style sync: the preset lands on the page, overrides clear
+    synced = L.style_sync(doc, "talk")
+    assert synced["page"]["font_pt"] == 14.0 and synced["page"]["line_width"] == 1.5 \
+        and synced["page"]["style"] == "talk" and not synced["page"]["dark"]
+    assert S.item(synced, "t")["pt"] is None and S.item(synced, "sh")["width_pt"] == 1.5
+    assert L.style_sync(doc, "dark")["page"]["dark"] is True
+    S.normalize(synced)                                   # still a valid document
+    # the palette validator: every palette, both pages, as drawn
+    for name, cols in PALETTES.items():
+        for dark in (False, True):
+            eff = L.effective_palette(cols, dark=dark)
+            rep = L.palette_report(eff, background=L.DARK_PAGE if dark else L.LIGHT_PAGE)
+            assert not rep, (name, dark, rep)
+            assert len(eff) == len(cols)
+    assert L.palette_report(["#000000", "#050505"]) and \
+        L.palette_report(["#ffffff"], background=L.LIGHT_PAGE)
+    assert L.effective_palette(PALETTES["colorblind"], dark=True)[-1] != "#000000" \
+        and L.effective_palette(PALETTES["colorblind"], dark=False) == PALETTES["colorblind"]
+    assert 2.0 < L.delta_e("#ff0000", "#fe0000") < 3.0 or L.delta_e("#ff0000", "#fe0000") < 3.0
+    # a summary table
+    cols = {"id": np.arange(6), "t": np.array([0, 0, 0, 1, 1, 1]),
+            "area": np.array([10.0, 20.0, 30.0, 1.0, 2.0, np.nan]),
+            "name": np.array(["a", "b", "c", "d", "e", "f"])}
+    header, rows = FT.summary_table(cols, ["area"], group_by="t", stats=["n", "mean", "sem"])
+    assert header == ["t", "n", "area mean", "area SEM"], header
+    assert rows[0][:3] == ["0", "3", "20"] and rows[1][:2] == ["1", "2"], rows
+    header, rows = FT.summary_table(cols, [], stats=["n", "median", "max"], decimals=1)
+    assert header == ["n", "area median", "area max"] and rows == [["5", "10.0", "30.0"]], (
+        header, rows)
+    assert FT.table_csv(header, rows).splitlines()[1] == "5,10.0,30.0"
+    try:
+        FT.summary_table(cols, ["area"], stats=["mode"])
+        raise AssertionError("an unknown statistic must be ignored, not raise")
+    except ValueError:
+        raise
+    except AssertionError:
+        pass
+    # the bundle
+    ax = AxisSizes(m=1, t=3, z=1, c=2, y=64, x=64)
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_bundle_") as tmp:
+        src = _os.path.join(tmp, "cells.nd2")
+        with open(src, "wb") as f:
+            f.write(b"\0" * 10)
+        env = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.325, "dt_s": 2.0,
+                                               "channel_names": ["DAPI", "GFP"],
+                                               "source_path": [src],
+                                               "source_file": ["cells.nd2"]})
+        files = FB.bundle_files(doc, {"s": env}, data_files={"A chart": "x,y\n1,2\n"},
+                                run_ids={"s": "pg1/O"}, lineage={"s": "abc123"},
+                                lut_windows={"a": [(0, 10.0, 200.0)]}, app_version="test 1")
+        assert set(files) == {"figure.json", "legend.txt", "provenance.json",
+                              "data/A_chart.csv"}, set(files)
+        assert _json.loads(files["figure.json"]) == S.normalize(doc)
+        assert "0.325" in files["legend.txt"], files["legend.txt"]
+        prov = _json.loads(files["provenance.json"])
+        assert prov["app_version"] == "test 1" and prov["figure_digest"] == S.digest(doc)
+        s0 = prov["sources"][0]
+        assert s0["run_id"] == "pg1/O" and s0["lineage"] == "abc123" \
+            and s0["files"][0]["path"] == src and s0["files"][0]["size"] == 10 \
+            and "mtime" in s0["files"][0] and s0["channel_names"] == ["DAPI", "GFP"], s0
+        assert prov["lut_windows"] == {"a": [[0, 10.0, 200.0]]}
+        stem = _os.path.join(tmp, "fig")
+        written = FB.write_bundle(stem, files)
+        assert sorted(_os.path.basename(p) for p in written) == \
+            ["A_chart.csv", "fig.figure.json", "fig.legend.txt", "fig.provenance.json"], written
+        assert _os.path.isdir(stem + ".data")
+        assert FB.write_bundle(stem, {"legend.txt": ""}) == []
+    _ok("figure paper: re-letter in reading order (popout unlettered), style sync, every "
+        "palette passes ΔE on both pages, summary table per group, the bundle's four files")
 
 
 if __name__ == "__main__":

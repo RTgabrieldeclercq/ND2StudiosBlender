@@ -1259,8 +1259,220 @@ class ChartItem(FigureItem):
             p.restore()
 
 
+class TableItem(FigureItem):
+    """A summary table (V5.00 step 5): the ``(header, rows)`` of
+    :func:`nodegraph.figure.tables.summary_table` — the panel sets them — in the page font,
+    booktabs rules (top, under the header, bottom), numbers right-aligned."""
+
+    def __init__(self, spec: Mapping[str, Any], style: Mapping[str, Any]) -> None:
+        self.header: List[str] = []
+        self.rows: List[List[str]] = []
+        self.note = ""
+        super().__init__(spec, style)
+
+    def set_table(self, header: Sequence[str], rows: Sequence[Sequence[str]],
+                  note: str = "") -> None:
+        self.header = [str(h) for h in header]
+        self.rows = [[str(c) for c in r] for r in rows]
+        self.note = note
+        self.update()
+
+    def paint_content(self, p: QPainter) -> None:
+        r = self.rect()
+        if not self.header:
+            pen = QPen(QColor(T.MUTED), 0)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(r)
+            p.setFont(page_font(self.style, 7.0))
+            p.setPen(QPen(ink(self.style), 0))
+            p.drawText(r.adjusted(mm(1), mm(1), -mm(1), -mm(1)),
+                       Qt.AlignCenter | Qt.TextWordWrap, self.note or "no table yet")
+            self.paint_letter(p)
+            return
+        pt = self.spec.get("pt")
+        f = page_font(self.style, float(pt) if pt else None)
+        fb = page_font(self.style, float(pt) if pt else None, bold=True)
+        fm, fmb = QFontMetricsF(f), QFontMetricsF(fb)
+        pad = mm(0.8)
+        n = len(self.header)
+        widths = [fmb.horizontalAdvance(h) for h in self.header]
+        for row in self.rows:
+            for k, cell in enumerate(row[:n]):
+                widths[k] = max(widths[k], fm.horizontalAdvance(cell))
+        widths = [w + 2 * pad for w in widths]
+        total = sum(widths)
+        if total < r.width():                       # spread the slack over the columns
+            extra = (r.width() - total) / max(1, n)
+            widths = [w + extra for w in widths]
+        row_h = fm.height() + pad
+        col = ink(self.style)
+        lw = float(self.style.get("line_width", 1.0)) * PT
+        p.save()
+        p.setClipRect(r)
+        y = r.y() + (fmb.height() + pad - row_h) if self.spec.get("letter") else r.y()
+        if self.spec.get("letter"):
+            y = r.y() + fmb.height() * 1.25 + pad      # the letter sits above the table
+        # top rule
+        p.setPen(QPen(col, lw))
+        p.drawLine(QPointF(r.x(), y), QPointF(r.x() + min(total, r.width()), y))
+        y += pad * 0.5
+        # header
+        p.setFont(fb)
+        p.setPen(QPen(col, 0))
+        x = r.x()
+        for k, h in enumerate(self.header):
+            p.drawText(QRectF(x + pad, y, widths[k] - 2 * pad, row_h),
+                       (Qt.AlignRight if k > 0 or not self._first_is_label() else Qt.AlignLeft)
+                       | Qt.AlignVCenter, h)
+            x += widths[k]
+        y += row_h
+        p.setPen(QPen(col, lw * 0.6))
+        p.drawLine(QPointF(r.x(), y), QPointF(r.x() + min(total, r.width()), y))
+        y += pad * 0.5
+        p.setFont(f)
+        p.setPen(QPen(col, 0))
+        for row in self.rows:
+            if y + row_h > r.bottom() + pad:
+                break
+            x = r.x()
+            for k, cell in enumerate(row[:n]):
+                p.drawText(QRectF(x + pad, y, widths[k] - 2 * pad, row_h),
+                           (Qt.AlignRight if k > 0 or not self._first_is_label()
+                            else Qt.AlignLeft) | Qt.AlignVCenter, cell)
+                x += widths[k]
+            y += row_h
+        y += pad * 0.5
+        p.setPen(QPen(col, lw))
+        p.drawLine(QPointF(r.x(), y), QPointF(r.x() + min(total, r.width()), y))
+        p.restore()
+        self.paint_letter(p)
+
+    def _first_is_label(self) -> bool:
+        return bool((self.spec.get("table") or {}).get("group_by"))
+
+    def natural_size_mm(self) -> Tuple[float, float]:
+        """The width and height the table wants, in mm (for *fit to content*)."""
+        if not self.header:
+            return (to_mm(self._w), to_mm(self._h))
+        pt = self.spec.get("pt")
+        f = page_font(self.style, float(pt) if pt else None)
+        fb = page_font(self.style, float(pt) if pt else None, bold=True)
+        fm, fmb = QFontMetricsF(f), QFontMetricsF(fb)
+        pad = mm(0.8)
+        widths = [fmb.horizontalAdvance(h) + 2 * pad for h in self.header]
+        for row in self.rows:
+            for k, cell in enumerate(row[:len(widths)]):
+                widths[k] = max(widths[k], fm.horizontalAdvance(cell) + 2 * pad)
+        h = (len(self.rows) + 1) * (fm.height() + pad) + 3 * pad
+        if self.spec.get("letter"):
+            h += fmb.height() * 1.25 + pad
+        return (to_mm(sum(widths) + pad), to_mm(h))
+
+
+class LegendItem(FigureItem):
+    """A shared legend (V5.00 step 5) of an image's channels and layers — the panel
+    builds the entries (``{"kind": swatch | line | marker | ramp, "color", "label",
+    "cmap", "lo", "hi"}``) from the image's spec and its render — drawn as rows of a
+    glyph and a label in the page font; a ramp entry draws the colour map with its limits."""
+
+    def __init__(self, spec: Mapping[str, Any], style: Mapping[str, Any]) -> None:
+        self.entries: List[Dict[str, Any]] = []
+        self.note = ""
+        super().__init__(spec, style)
+
+    def set_entries(self, entries: Sequence[Mapping[str, Any]], note: str = "") -> None:
+        self.entries = [dict(e) for e in entries]
+        self.note = note
+        self.update()
+
+    def paint_content(self, p: QPainter) -> None:
+        r = self.rect()
+        f = page_font(self.style)
+        fm = QFontMetricsF(f)
+        p.setFont(f)
+        col = ink(self.style)
+        if not self.entries:
+            pen = QPen(QColor(T.MUTED), 0)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(r)
+            p.setPen(QPen(col, 0))
+            p.drawText(r.adjusted(mm(1), mm(1), -mm(1), -mm(1)),
+                       Qt.AlignCenter | Qt.TextWordWrap, self.note or "legend: pick an image")
+            self.paint_letter(p)
+            return
+        p.save()
+        p.setClipRect(r)
+        row_h = fm.height() * 1.3
+        y = r.y() + mm(0.5)
+        title = str(self.spec.get("title") or "")
+        if title:
+            p.setFont(page_font(self.style, bold=True))
+            p.setPen(QPen(col, 0))
+            p.drawText(QPointF(r.x() + mm(0.8), y + fm.ascent()), title)
+            y += row_h
+            p.setFont(f)
+        gx, gw = r.x() + mm(0.8), mm(4.0)
+        lw = float(self.style.get("line_width", 1.0)) * PT
+        for e in self.entries:
+            if y + row_h > r.bottom() + mm(0.5):
+                break
+            kind = str(e.get("kind", "swatch"))
+            c = QColor(str(e.get("color") or "#ffffff"))
+            cy = y + row_h / 2
+            if kind == "ramp":
+                from nodegraph.catalog._shared.overlay_math import colormap_lut
+                lut = colormap_lut(str(e.get("cmap") or "viridis"))
+                ramp = np.repeat(lut[None, :, :], 2, axis=0)
+                ramp = np.ascontiguousarray(np.concatenate(
+                    [ramp, np.full(ramp.shape[:2] + (1,), 255, np.uint8)], axis=2))
+                img = QImage(ramp.data, ramp.shape[1], ramp.shape[0], 4 * ramp.shape[1],
+                             QImage.Format_RGBA8888).copy()
+                bar = QRectF(gx, cy - row_h * 0.25, gw * 2.5, row_h * 0.5)
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                p.drawImage(bar, img)
+                p.setPen(QPen(col, 0.4 * PT))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(bar)
+                lo, hi = e.get("lo"), e.get("hi")
+                lab = str(e.get("label") or "")
+                if lo is not None and hi is not None:
+                    lab = f"{lab}  {lo:.3g} – {hi:.3g}" if lab else f"{lo:.3g} – {hi:.3g}"
+                p.setPen(QPen(col, 0))
+                p.drawText(QPointF(bar.right() + mm(1.0), cy + (fm.ascent() - fm.descent()) / 2),
+                           lab)
+                y += row_h
+                continue
+            if kind == "line":
+                p.setPen(QPen(c, max(lw, 0.6 * PT)))
+                p.drawLine(QPointF(gx, cy), QPointF(gx + gw, cy))
+            elif kind == "marker":
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawEllipse(QPointF(gx + gw / 2, cy), mm(0.8), mm(0.8))
+            elif kind == "outline":
+                p.setPen(QPen(c, max(lw * 0.8, 0.5 * PT)))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(QRectF(gx, cy - row_h * 0.3, gw, row_h * 0.6))
+            else:
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawRect(QRectF(gx, cy - row_h * 0.3, gw, row_h * 0.6))
+            p.setPen(QPen(col, 0))
+            p.drawText(QPointF(gx + gw + mm(1.0), cy + (fm.ascent() - fm.descent()) / 2),
+                       str(e.get("label") or ""))
+            y += row_h
+        p.restore()
+        self.paint_letter(p)
+
+
 ITEM_CLASSES = {
-    "chart": ChartItem,
+    "chart": ChartItem, "table": TableItem, "legend": LegendItem,
     "image": ImageItem, "montage": MontageItem, "colorbar": ColorbarItem,
     "histogram": HistogramItem, "scale_bar": ScaleBarItem, "text": TextItem,
     "letter": LetterItem, "shape": ShapeItem, "line": LineItem, "arrow": ArrowItem,

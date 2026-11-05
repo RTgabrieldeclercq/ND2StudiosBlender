@@ -1238,6 +1238,9 @@
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodegraph.figure.bind"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodegraph.figure.bind"}
 {"dst":"nodegraph.placement","k":"imp","lazy":false,"src":"nodegraph.figure.bind"}
+{"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodegraph.figure.bundle"}
+{"dst":"nodegraph.figure.legend_text","k":"imp","lazy":false,"src":"nodegraph.figure.bundle"}
+{"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodegraph.figure.bundle"}
 {"dst":"nodegraph.catalog._shared.figure","k":"imp","lazy":false,"src":"nodegraph.figure.charts"}
 {"dst":"nodegraph.catalog._shared.overlay_math","k":"imp","lazy":false,"src":"nodegraph.figure.charts"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodegraph.figure.charts"}
@@ -1252,6 +1255,7 @@
 {"dst":"nodegraph.catalog._shared.figure","k":"imp","lazy":false,"src":"nodegraph.figure.series"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodegraph.figure.series"}
 {"dst":"nodegraph.figure.derive","k":"imp","lazy":false,"src":"nodegraph.figure.series"}
+{"dst":"nodegraph.figure.charts","k":"imp","lazy":false,"src":"nodegraph.figure.tables"}
 {"dst":"nodegraph.parallel","k":"imp","lazy":true,"src":"nodegraph.governor"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.graph"}
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodegraph.groups"}
@@ -1354,6 +1358,7 @@
 {"dst":"nodegraph.fieldmap","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.bind","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.figure.bundle","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.charts","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.derive","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1361,6 +1366,7 @@
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.series","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.figure.stats","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.figure.tables","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.file_sequence","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.governor","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.gpu","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1570,8 +1576,10 @@
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.links"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.bind","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodegraph.figure.bundle","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodegraph.figure.tables","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_document","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}

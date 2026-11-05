@@ -1071,6 +1071,9 @@ class ViewerPanel(QWidget):
     #: than on every tick: the Movie Editor stamps these values into a timeline, and every
     #: stamp is a document edit.
     display_changed = Signal(str)
+    #: *Capture view → page* (V5.00 step 5): the window places what this Viewer shows on
+    #: the figure page.
+    capture_page = Signal()
     #: the M/T/Z picks changed — the window re-scopes the runner and re-pulls.
     selection_changed = Signal()
     #: the troubleshooting REGION box was dragged (or cleared): what a scoped pull runs
@@ -1387,6 +1390,13 @@ class ViewerPanel(QWidget):
         tools = ChannelColumns(min_col_w=78, spacing=6)
         tools.addWidget(self._lut_auto)
         tools.addWidget(self._lut_fit)
+        self._page_btn = QPushButton("→ Page")
+        self._page_btn.setCursor(Qt.PointingHandCursor)
+        self._page_btn.setToolTip("Capture view → page (V5.00): place what this Viewer shows "
+                                  "— its frame, visible region, channels and display windows "
+                                  "— as an image on the figure page")
+        self._page_btn.clicked.connect(lambda _=False: self.capture_page.emit())
+        tools.addWidget(self._page_btn)
         tools.addWidget(self._split_btn)
         # ONE overlay control: the popup owns every domain's look (and its on/off), so the
         # strip no longer grows a checkbox per domain as domains are added.
@@ -1786,6 +1796,15 @@ class ViewerPanel(QWidget):
 
     def channels(self) -> Tuple[int, ...]:
         return tuple(sorted(self._active_channels)) or (0,)
+
+    def visible_rect01(self) -> Tuple[float, float, float, float]:
+        """The visible part of the shown plane, ``(x0, y0, x1, y1)`` as fractions — what
+        *Capture view → page* places as a region (the whole plane is ``(0, 0, 1, 1)``)."""
+        surf = getattr(self, "_view", None)
+        try:
+            return tuple(float(v) for v in surf.visible_rect01())   # type: ignore[union-attr]
+        except Exception:              # noqa: BLE001 — no surface yet: the whole plane
+            return (0.0, 0.0, 1.0, 1.0)
 
     def sub(self) -> int:
         """The Play-all sub-tick inside the current primary T frame (0 at rest)."""

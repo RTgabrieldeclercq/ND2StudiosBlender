@@ -20,8 +20,12 @@ cursor). This package holds everything about such a document that is *not painti
 * :mod:`charts` — a chart's GEOMETRY in millimetres (axes, ticks, marks, legend), computed
   once so the GUI item and the offscreen renderer paint the same lines;
 * :mod:`layout` — page presets, panel letters, snapping, alignment, the paper-readiness
-  checks the community checklists ask for;
-* :mod:`legend_text` — the legend / methods sentence generated from the acquisition record.
+  checks the community checklists ask for; style presets, re-lettering in reading order,
+  style sync and the palette validator (step 5);
+* :mod:`legend_text` — the legend / methods sentence generated from the acquisition record;
+* :mod:`tables` — a ``table`` item's rows: one table's columns reduced per group (step 5);
+* :mod:`bundle` — the export bundle beside the picture: the document, the legend text, the
+  provenance record, the values every chart and table drew (step 5).
 
 Nothing here imports Qt or matplotlib's drawing: tick placement uses ``matplotlib.ticker``
 (pure Python). The design record is ``CodeLog/ClaudesPlan/V5.00_figure_editor.md``.
@@ -29,4 +33,4 @@ Nothing here imports Qt or matplotlib's drawing: tick placement uses ``matplotli
 from __future__ import annotations
 
 __all__ = ["schema", "bind", "derive", "series", "stats", "charts", "layout",
-           "legend_text"]
+           "legend_text", "tables", "bundle"]
