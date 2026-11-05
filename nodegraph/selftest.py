@@ -36776,6 +36776,7 @@ def main() -> int:
     test_measure_pixels()
     test_table_export_split()
     test_figure_core()
+    test_figure_page()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
@@ -37105,6 +37106,174 @@ def test_figure_core() -> None:
         and _OR.scalar_rgba is _OM.scalar_rgba
     _ok("overlay maths: nodelab_v2.overlay_render is a shim over "
         "nodegraph.catalog._shared.overlay_math")
+
+
+def test_figure_page() -> None:
+    """V5.00 step 2: an Analysis page is a FIGURE page. It carries a
+    :class:`nodelab_v2.figure_document.FigureDocument` beside its graph document, which is
+    the figure's SHADOW graph — one hidden Page Input per figure source, added, re-bound and
+    removed by the figure's own edits and never touching a hand-placed node — so
+    ``compose`` drops the inputs and maps each source to the upstream Output's run id, the
+    page summary names the sources, the outline lists the items after them, the file
+    carries the figure on the page record and a round trip is byte-identical, a bad figure
+    is refused by page and spec path with the workspace untouched, a V4 Analysis page
+    holding nodes opens as a Free page "(graph)" (its linked pages with it) while an empty
+    one is simply a figure page, a figure page cannot be linked or be a master, a unique
+    copy has its own figure, seeding and reset know figure pages."""
+    import json as _json
+    from nodegraph.figure import schema as FS
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.figure_document import FigureDocument
+    from nodelab_v2.workspace import FIGURE_KIND, Workspace, standard_kinds
+    OPS.ensure_ops()
+
+    # File → New: the fourth page is a figure page, the others are not
+    ws = Workspace.standard(GraphDocument())
+    an = [p for p in ws.pages.values() if p.kind == FIGURE_KIND][0]
+    assert an.figure is not None and an.figure.goal is None and not an.doc.nodes
+    assert all(p.figure is None for p in ws.pages.values() if p.kind != FIGURE_KIND)
+
+    # the fixture chain + a figure page reading two outputs
+    ws, ds, env, ax = _ws_fixture()
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    rev0 = ws.revision
+    changed = fp.figure.edit(lambda d: d.update(goal="overlay", sources=[
+        {"id": "raw", "source": "pg1:raw", "label": "raw"},
+        {"id": "smooth", "source": "pg2:smooth"}]))
+    assert changed and ws.revision > rev0 and fp.figure.revision == 1
+    assert not fp.figure.edit(lambda d: None), "a no-op edit bumps nothing"
+    sid = {s: FigureDocument.shadow_id(s) for s in ("raw", "smooth")}
+    assert set(fp.doc.nodes) == set(sid.values()), set(fp.doc.nodes)
+    assert all(fp.doc.nodes[n].op_key == "page.input" for n in sid.values())
+    assert fp.doc.nodes[sid["raw"]].params["source"] == "pg1:raw"
+    assert ws.page_summary(fp.id) == (["Input · raw", "Refine · smooth"], [])
+    envs = fp.figure.envelopes(ws, fp.id)
+    assert set(envs) == {"raw", "smooth"} and envs["raw"].axes == ax
+    assert fp.figure.source_labels(ws, fp.id) == {"raw": "Input · raw",
+                                                  "smooth": "Refine · smooth"}
+    comp = ws.compose(fp.id)
+    assert not any(n.op_key == "page.input" for n in comp.graph.nodes.values())
+    assert fp.figure.run_ids(comp, fp.id) == {"raw": "pg1/O", "smooth": "pg2/O"}
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    assert eng.pull("pg2/O").axes == ax
+    # re-bind and removal follow the figure; an unbound source is labelled and has no envelope
+    fp.figure.edit(lambda d: d.__setitem__("sources", [{"id": "raw", "source": "pg2:smooth"}]))
+    assert set(fp.doc.nodes) == {sid["raw"]} \
+        and fp.doc.nodes[sid["raw"]].params["source"] == "pg2:smooth"
+    fp.figure.edit(lambda d: d.__setitem__("sources", [{"id": "raw", "source": "pg2:gone"}]))
+    assert fp.figure.envelopes(ws, fp.id) == {}
+    assert fp.figure.source_labels(ws, fp.id) == {"raw": "pg2:gone (unbound)"}
+    assert fp.figure.run_ids(ws.compose(fp.id), fp.id) == {"raw": f"{fp.id}/{sid['raw']}"}
+    # a hand-placed node is never the sync's to touch
+    fp.doc.add_node("page.input", node_id="mine", params={"source": "pg1:raw"})
+    fp.figure.edit(lambda d: d.__setitem__("sources", []))
+    assert set(fp.doc.nodes) == {"mine"}
+    # items in the outline, after the input rows
+    fp.figure.edit(lambda d: d.update(
+        sources=[{"id": "raw", "source": "pg1:raw", "label": "raw"}],
+        items=[{"id": "img", "kind": "image", "rect_mm": [0, 0, 40, 30], "letter": "A",
+                "image": {"source": "raw"}},
+               {"id": "ch", "kind": "chart", "rect_mm": [0, 32, 40, 30], "letter": "B",
+                "chart": {"kind": "xy", "source": "raw"}}]))
+    rows = ws.page_outline(fp.id)
+    assert [r.role for r in rows] == ["input", "input", "node", "node"], rows
+    assert rows[2].title == "A · image" and rows[2].detail == "Input · raw" and rows[2].why_not
+    assert rows[3].title == "B · chart" and rows[3].detail == "xy · Input · raw"
+
+    # the file: the figure rides the page record; a round trip is byte-identical
+    d = ws.to_dict()
+    rec = next(r for r in d["workspace"]["pages"] if r["id"] == fp.id)
+    assert rec["figure"]["goal"] == "overlay" and rec["figure"]["schema"] == FS.SCHEMA \
+        and "graph" in rec
+    assert all("figure" not in r for r in d["workspace"]["pages"] if r["id"] != fp.id)
+    s = _json.dumps(d, sort_keys=True)
+    ws2 = Workspace()
+    ws2.load_dict(_json.loads(s))
+    f2 = ws2.pages[fp.id]
+    assert f2.kind == FIGURE_KIND and f2.figure is not None \
+        and f2.figure.digest() == fp.figure.digest()
+    assert set(f2.doc.nodes) == {sid["raw"], "mine"}
+    assert _json.dumps(ws2.to_dict(), sort_keys=True) == s
+    assert ws2.page_outline(fp.id)[2].title == "A · image"
+    # a bad figure is refused by page and spec path, and the workspace is untouched
+    bad = _json.loads(s)
+    brec = next(r for r in bad["workspace"]["pages"] if r["id"] == fp.id)
+    brec["figure"]["items"][0]["rect_mm"] = [0, 0, -1, 1]
+    before = _json.dumps(ws2.to_dict(), sort_keys=True)
+    try:
+        ws2.load_dict(bad)
+        raise AssertionError("a bad figure loaded")
+    except ValueError as exc:
+        assert fp.id in str(exc) and "items[0].rect_mm" in str(exc), exc
+    assert _json.dumps(ws2.to_dict(), sort_keys=True) == before
+    # LEGACY: a V4 Analysis page holding nodes (no figure) opens as a Free page "(graph)",
+    # and a page linked to it follows; an EMPTY V4 Analysis page is simply a figure page
+    old = _json.loads(s)
+    orec = next(r for r in old["workspace"]["pages"] if r["id"] == fp.id)
+    del orec["figure"]
+    old["workspace"]["pages"].append({"id": "pg99", "name": "Figures (linked)",
+                                      "kind": FIGURE_KIND, "master": fp.id, "overrides": {}})
+    ws3 = Workspace()
+    ws3.load_dict(old)
+    p3 = ws3.pages[fp.id]
+    assert p3.kind == "free" and p3.name == "Figures (graph)" and p3.figure is None
+    assert set(p3.doc.nodes) == {sid["raw"], "mine"}
+    assert ws3.page_summary(fp.id)[0] == ["Input · raw", "Input · raw"]
+    lk = ws3.pages["pg99"]
+    assert lk.kind == "free" and lk.master == fp.id and lk.name == "Figures (linked) (graph)"
+    old2 = _json.loads(s)
+    orec2 = next(r for r in old2["workspace"]["pages"] if r["id"] == fp.id)
+    del orec2["figure"]
+    orec2["graph"]["nodes"] = type(orec2["graph"]["nodes"])()
+    orec2["graph"]["edges"] = type(orec2["graph"]["edges"])()
+    ws4 = Workspace()
+    ws4.load_dict(old2)
+    assert ws4.pages[fp.id].kind == FIGURE_KIND and ws4.pages[fp.id].figure is not None \
+        and ws4.pages[fp.id].figure.sources == []
+    # a current file whose linked page names a figure page as master is refused
+    bad2 = _json.loads(s)
+    bad2["workspace"]["pages"].append({"id": "pg98", "name": "L", "kind": FIGURE_KIND,
+                                       "master": fp.id, "overrides": {}})
+    try:
+        Workspace().load_dict(bad2)
+        raise AssertionError("a page linked to a figure page loaded")
+    except ValueError as exc:
+        assert "cannot be linked" in str(exc)
+
+    # a figure page cannot be linked or be a master; a unique copy carries its own figure
+    try:
+        ws.duplicate_page(fp.id, dependent=True)
+        raise AssertionError("linked a figure page")
+    except ValueError as exc:
+        assert "cannot be linked" in str(exc)
+    try:
+        ws.set_master(fp.id)
+        raise AssertionError("a figure page became a master")
+    except ValueError as exc:
+        assert "figure" in str(exc)
+    cp = ws.duplicate_page(fp.id)
+    assert cp.figure is not None and cp.figure is not fp.figure \
+        and cp.figure.digest() == fp.figure.digest()
+    assert set(cp.doc.nodes) == {sid["raw"], "mine"}
+    cp.figure.edit(lambda d: d.__setitem__("goal", "plot"))
+    assert fp.figure.goal == "overlay", "the copy's figure is its own"
+    # seeding never seeds a figure page; reset drops the figure of the page it keeps
+    assert ws.seed_input(ws.add_page("Another", FIGURE_KIND).id) is None
+    ws.set_active(fp.id)
+    ws.reset()
+    first = ws.pages[list(ws.pages)[0]]
+    assert first.id == fp.id and first.kind == "input" and first.figure is None
+    assert [p.kind for p in ws.pages.values()] == list(standard_kinds())
+    assert ws.pages[list(ws.pages)[-1]].figure is not None
+    first.doc.add_node("io.load")                 # the kept document still edits normally
+    _ok("figure page (V5.00 step 2): an Analysis page carries a FigureDocument whose sources "
+        "are hidden Page Inputs on its graph — composed, summarised and outlined like any "
+        "page; the figure rides the file and round-trips byte-identical, a bad one is "
+        "refused by path; a V4 Analysis graph opens as a Free page (graph) with its linked "
+        "pages; no linking, no mastering, a copy has its own figure; seeding and reset agree")
 
 
 if __name__ == "__main__":

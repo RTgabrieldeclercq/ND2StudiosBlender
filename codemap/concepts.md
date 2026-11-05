@@ -483,6 +483,17 @@ each page's nodes as `OutlineRow`s in data-flow order — entries first, a chain
 branch one level under the node it leaves, reroutes left out — with why a node cannot be
 switched off (`document.pass_through_reason`, CON-18).
 
+**A figure page (V5.00 step 2).** An Analysis page (`FIGURE_KIND`, the kind key `analyze`
+unchanged) carries a `nodelab_v2.figure_document.FigureDocument` — the figure document of
+`nodegraph.figure.schema` — beside its graph document, which is then the figure's SHADOW
+graph: `FigureDocument.sync_shadow` keeps one hidden `page.input` per figure source
+(`__fig_src__<id>`), so `compose`, `_input_seeds`, `page_summary`, the cross-page signature
+and the LabLink publisher work on it unchanged, and `FigureDocument.run_ids` maps each
+source to the upstream Output's run id in the composed graph. The figure rides the page
+record as `"figure"`; a V4 file's Analysis page holding nodes opens as a Free page named
+`<name> (graph)`, its linked pages with it. A figure page is never linked or a master;
+`seed_input` never seeds one; `reset` drops the figure of the page it keeps.
+
 see: WF-08 · CON-18 · [MANUAL §2 Pages, §2b](../MANUAL.md)
 
 ---
