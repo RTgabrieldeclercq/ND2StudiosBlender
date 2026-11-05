@@ -510,6 +510,7 @@ class Worker:
 
         self.recipe = recipe
         self.graph = graph
+        self.graph_path = str(graph_path)
         self.targets = tuple(graph.topo_order())
         self.knobs = {}
         self.effective = {}
@@ -1306,6 +1307,8 @@ class Worker:
             if kind == "metrics":
                 art = A.write_metrics(self._metrics(engine, counters, started),
                                       self.out_dir, filename, policy=policy)
+            elif kind == "figure":
+                art = self._write_figure(filename, policy)
             else:
                 writer = A.WRITERS.get(kind)
                 if writer is None:
@@ -1328,6 +1331,84 @@ class Worker:
             out.append(art)
             emit(id=self._current_id, ev="artifact", **art.event())
         return out
+
+    def _write_figure(self, filename: str, policy: str) -> Optional[Any]:
+        """The recipe's figure page (V5.00 step 6) rendered by ``python -m
+        nodelab_v2.figure_render`` in a SUBPROCESS — Qt never loads in this process — from
+        a figure job written beside the output: the graph as it runs now (knobs applied),
+        the figure document, its run ids, and a seed per loader (the uploaded file and
+        its ingest store, or the synthetic stack). The PNG comes back as the artifact; the
+        bundle (SVG, document, legend, provenance, CSVs) lands beside it and is listed in
+        the artifact's ``extra``. A render that fails is REPORTED and skipped."""
+        import subprocess
+        from nodegraph.serialize import to_dict
+        from nodelab_v2.lablink import artifacts as A
+        fig = self.recipe.get("figure")
+        if not isinstance(fig, dict) or not isinstance(fig.get("doc"), dict):
+            note("output 'figure': the recipe carries no figure; skipped")
+            return None
+        seeds, meta_seeds = self._build_seeds()
+        specs: Dict[str, Any] = {}
+        by_node = {v["node"]: (role, v) for role, v in self.inputs.items() if v.get("node")}
+        for nid in seeds:
+            _role, sent = by_node.get(nid, ("", None))
+            env = meta_seeds.get(nid)
+            spec: Dict[str, Any] = {"metadata": sanitize(dict(getattr(env, "metadata", {}) or {}))}
+            if sent is not None:
+                spec["path"] = str(sent["path"])
+                spec["store"] = self._store_path_for(str(sent["path"]))
+            else:
+                path = str(self.graph.nodes[nid].params.get("path") or "").strip()
+                if path:
+                    spec["path"] = os.path.abspath(path)
+                    spec["store"] = self._store_path_for(spec["path"])
+                axes = getattr(env, "axes", None)
+                if axes is not None:
+                    spec["axes"] = {k: int(getattr(axes, k, 1) or 1)
+                                    for k in ("m", "t", "z", "c", "y", "x")}
+            specs[nid] = spec
+        os.makedirs(self.out_dir, exist_ok=True)
+        out_path = os.path.join(self.out_dir, filename if filename.lower().endswith(".png")
+                                else filename + ".png")
+        job = {"format": "nd2studios.figure-job/1", "page": str(fig.get("page") or "figure"),
+               "page_name": str(fig.get("page_name") or self.recipe.get("title")
+                                or self.recipe.get("name") or "figure"),
+               "graph": to_dict(self.graph), "figure": fig["doc"],
+               "run_ids": dict(fig.get("run_ids") or {}), "labels": dict(fig.get("labels") or {}),
+               "seeds": specs}
+        job_path = os.path.splitext(out_path)[0] + ".job.json"
+        with open(job_path, "w", encoding="utf-8") as fh:
+            json.dump(job, fh, indent=1, sort_keys=True, ensure_ascii=False)
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env.setdefault("PYTHONUTF8", "1")
+        cmd = [sys.executable, "-m", "nodelab_v2.figure_render", "--job", job_path,
+               "--out", out_path, "--bundle"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                                  timeout=float(self.recipe.get("limits", {}).get(
+                                      "figure_timeout_s") or 900), check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            note(f"output 'figure': the renderer did not run ({exc}); skipped")
+            return None
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            note(f"output 'figure': the renderer failed (exit {proc.returncode}): "
+                 + " | ".join(tail))
+            return None
+        sha, nbytes = A.sha256_file(out_path)
+        stem = os.path.splitext(out_path)[0]
+        beside = [p for p in (f"{stem}.svg", f"{stem}.figure.json", f"{stem}.legend.txt",
+                              f"{stem}.provenance.json") if os.path.exists(p)]
+        data_dir = f"{stem}.data"
+        if os.path.isdir(data_dir):
+            beside += [os.path.join(data_dir, f) for f in sorted(os.listdir(data_dir))]
+        note(f"figure rendered: {os.path.basename(out_path)} + {len(beside)} bundle file(s)")
+        return A.Artifact(name=os.path.basename(out_path), kind="figure", path=out_path,
+                          nbytes=nbytes, sha256=sha, policy=policy,
+                          extra={"bundle": [os.path.basename(p) if os.path.dirname(p) ==
+                                            self.out_dir else os.path.relpath(p, self.out_dir)
+                                            for p in beside]})
 
     def _pull_quietly(self, engine: Any, node_id: str) -> Any:
         """Pull a node an output needs, without it appearing in the plan's progress.

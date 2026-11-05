@@ -23,9 +23,15 @@ Viewer already renders it.
 
 **Where the tabulation itself lives.** The four grouping functions moved to the Qt-free
 :mod:`nodelab_v2.tables` when the LabLink worker landed — a headless process needs them
-and must not import PySide6 to get them. They are re-exported here unchanged, so every
-existing ``from nodelab_v2.spreadsheet import all_tables`` keeps working and there is
-still exactly one implementation.
+and must not import PySide6 to get them — and on into the engine as
+:mod:`nodegraph.tables` when ``io.write_table`` needed them (2026-11-02). They are
+re-exported here unchanged, so every existing ``from nodelab_v2.spreadsheet import
+all_tables`` keeps working and there is still exactly one implementation.
+
+**A pixel table opens as its pixels** (2026-11-02). Measure with Members = pixel writes one
+row per voxel; the panel shows that table as :class:`~nodelab_v2.pixel_strip.PixelStripView`
+— a wrapping strip of the pixels, sortable by any column, a rounded card per hovered pixel
+— with a Pixels / Table toggle beside the picker for the numbers.
 
 Qt; reads only the numpy columns off the Dataset.
 """
@@ -38,16 +44,17 @@ import numpy as np
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QHBoxLayout, QLabel, QTabBar, QTableView,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QComboBox, QHBoxLayout, QLabel, QStackedWidget,
+    QTabBar, QTableView, QToolButton, QVBoxLayout, QWidget,
 )
 
 from nodegraph.domains import AXIS_ORDER, Domain, axes_of, is_lattice, is_structure
 from nodegraph.structure import COORD_COLUMNS
 from nodelab_v2 import theme as T
+from nodelab_v2.pixel_strip import PixelStripView
 from nodelab_v2.tables import (
     _COORD_ORDER, _STRUCTURE_NAMES, SOURCE_FILE_COLUMN, _ordered_columns,
-    all_tables, lattice_tables, structure_tables,
+    all_tables, is_pixel_table, lattice_tables, structure_tables,
 )
 
 
@@ -145,6 +152,30 @@ class SpreadsheetPanel(QWidget):
         self._pick.currentIndexChanged.connect(self._show_current)
         head.addWidget(QLabel("Domain"))
         head.addWidget(self._pick, 1)
+        # ── a pixel table's two views (2026-11-02) ───────────────────────────────
+        # Measure's Members = pixel writes one row per voxel; as a grid that is a million
+        # near-identical rows, so it opens as the strip of its pixels. The toggle is shown
+        # only for a pixel table, and the choice is remembered across pulls.
+        self._view_btns = QButtonGroup(self)
+        self._view_btns.setExclusive(True)
+        self._view_row = QWidget()
+        vr = QHBoxLayout(self._view_row)
+        vr.setContentsMargins(0, 0, 0, 0)
+        vr.setSpacing(0)
+        for i, (text, tip) in enumerate((
+                ("Pixels", "Show the pixel table as its pixels — a strip you can sort and "
+                           "hover for each pixel's row."),
+                ("Table", "Show the pixel table as rows of numbers."))):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setChecked(i == 0)
+            self._view_btns.addButton(b, i)
+            vr.addWidget(b)
+        self._view_btns.idClicked.connect(lambda _i: self._show_rows())
+        self._view_row.hide()
+        head.addWidget(self._view_row)
         v.addLayout(head)
         # ── per-file tabs (V3.01) ────────────────────────────────────────────────
         # When several files ran through one pipeline, every row in this table belongs to
@@ -165,7 +196,11 @@ class SpreadsheetPanel(QWidget):
         self._table.setModel(self._model)
         self._table.setAlternatingRowColors(False)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        v.addWidget(self._table, 1)
+        self._strip = PixelStripView()
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._table)
+        self._stack.addWidget(self._strip)
+        v.addWidget(self._stack, 1)
         self._status = QLabel("")
         self._status.setProperty("role", "muted")
         v.addWidget(self._status)
@@ -221,12 +256,10 @@ class SpreadsheetPanel(QWidget):
         vals = cols.get(SOURCE_FILE_COLUMN)
         if vals is None:
             return []
-        out: List[str] = []
-        for v in vals:
-            s = str(v)
-            if s.strip() and s not in out:      # a row with no file names no tab of its own
-                out.append(s)
-        return out
+        # dict.fromkeys keeps first appearance at C speed; a per-row Python pass took seconds
+        # on a pixel table's millions of rows. A row with no file names no tab of its own.
+        firsts = dict.fromkeys(np.asarray(vals, dtype=object).tolist())
+        return [s for s in dict.fromkeys(str(v) for v in firsts) if s.strip()]
 
     def _show_current(self, *_a) -> None:
         """Re-read the selected table and rebuild the file tabs for it."""
@@ -280,21 +313,33 @@ class SpreadsheetPanel(QWidget):
         # filter in exactly the cases where the panel is being populated before display
         tabbed = self._files.count() > 1
         idx = self._files.currentIndex() if tabbed else 0
-        rows: Optional[List[int]] = None
+        rows: Optional[np.ndarray] = None
         picked = ""
         if tabbed and idx > 0 and (idx - 1) < len(files):
             picked = files[idx - 1]
-            vals = cols.get(SOURCE_FILE_COLUMN)
             # the row header keeps the ORIGINAL row number while a file is selected, so a
             # row can still be found in the full table and in the exported CSV, which is
-            # not filtered — a renumbered view would quietly disagree with the file on disk
-            rows = [r for r in range(total)
-                    if r < len(vals) and str(vals[r]) == picked]
+            # not filtered — a renumbered view would quietly disagree with the file on disk.
+            # Matched on the column's few distinct values, then one vectorized compare each.
+            col = np.asarray(cols.get(SOURCE_FILE_COLUMN), dtype=object)
+            keep = np.zeros(col.shape[0], dtype=bool)
+            for v in dict.fromkeys(col.tolist()):
+                if str(v) == picked:
+                    keep |= col == v
+            rows = np.flatnonzero(keep)
         n = total if rows is None else len(rows)
-        self._model.set_table(names, cols, rows, total)
-        self._size_columns(names)
+        pixel = is_pixel_table(self.dataset, key)
+        self._view_row.setVisible(pixel)
+        if pixel and self._view_btns.checkedId() == 0:
+            self._strip.set_table(cols, rows)
+            self._stack.setCurrentWidget(self._strip)
+        else:
+            self._model.set_table(names, cols, rows, total)
+            self._size_columns(names)
+            self._stack.setCurrentWidget(self._table)
         dom, layer = key
-        unit = "elements" if dom in _STRUCTURE_NAMES else "index rows"
+        unit = ("pixels" if pixel else
+                "elements" if dom in _STRUCTURE_NAMES else "index rows")
         note = f"{dom}" + (f" · {layer}" if layer else "")
         if picked:
             note += f" · {picked} — {n} of {total} {unit}"

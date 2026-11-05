@@ -128,7 +128,7 @@ EMITTABLE_ERROR_CODES = WORKER_ERROR_CODES - HUB_ONLY_ERROR_CODES
 #: Artifact kinds we can produce, reported in ``hello.features.artifact_kinds`` so a
 #: recipe declaring an output we cannot make is a tier-2 ``bad_recipe`` at ``open``
 #: rather than a missing file after a forty-minute run.
-ARTIFACT_KINDS = ("table", "quicklook", "metrics", "image_stack")
+ARTIFACT_KINDS = ("table", "quicklook", "metrics", "image_stack", "figure")
 
 #: Per-recipe return policy for an output. ``auto`` rides back to the node with the
 #: result; ``pull`` is held on the hub until asked for (a 3 GB label volume nobody opens

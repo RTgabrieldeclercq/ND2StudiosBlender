@@ -47,6 +47,7 @@ from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
 from nodelab_v2.canvas import CanvasPanel, kind_icon
+from nodelab_v2.figure_editor.panel import FigureEditorPanel
 from nodelab_v2.workspace import (FREE as FREE_KIND, Workspace, build_example, kind_label,
                                   local_ids, qualify, split_run_id)
 from nodelab_v2.document import GraphDocument
@@ -351,6 +352,157 @@ class _MovieHost:
         self._w.export_movie(node_id, page_id=self._pid())
 
 
+class _FigureHost:
+    """The Figure Editor's view of the window (V5.00 step 3) — everything it may ask for,
+    and nothing else, the way :class:`_MovieHost` is the Movie Editor's. The editor holds
+    a page id; every call resolves the workspace through the window."""
+
+    def __init__(self, win: "MainWindow") -> None:
+        self._w = win
+
+    def figure_state(self, page_id: Optional[str]):
+        page = self._w.workspace.pages.get(page_id or "")
+        return page.figure if page is not None else None
+
+    def page_name(self, page_id: str) -> str:
+        page = self._w.workspace.pages.get(page_id)
+        return page.name if page is not None else page_id
+
+    def catalog(self, page_id: str) -> List[Dict[str, Any]]:
+        """Every Page Output the figure page may read, with its envelope."""
+        ws = self._w.workspace
+        out = []
+        for value, label in ws.available_sources(page_id):
+            res = ws.resolve_source(page_id, value)
+            env = None
+            pname = ""
+            if res is not None:
+                up, nid = res
+                env = ws.pages[up].doc.envs.get(nid)
+                pname = ws.pages[up].name
+            out.append({"value": value, "label": label, "page": pname,
+                        "name": value.split(":", 1)[-1], "env": env})
+        return out
+
+    def envelopes(self, page_id: str) -> Dict[str, Any]:
+        """Per source id, and per data entry id (step 4: its terminal stage's envelope on
+        the figure page's own graph)."""
+        fig = self.figure_state(page_id)
+        if fig is None:
+            return {}
+        ws = self._w.workspace
+        out = dict(fig.envelopes(ws, page_id))
+        page = ws.pages.get(page_id)
+        if page is not None and fig.data:
+            out.update(fig.data_envelopes(page))
+        return out
+
+    def run_ids(self, page_id: str) -> Dict[str, str]:
+        fig = self.figure_state(page_id)
+        if fig is None or not (fig.sources or fig.data):
+            return {}
+        comp = self._w.workspace.compose(page_id)
+        return fig.run_ids(comp, page_id)
+
+    def source_labels(self, page_id: str) -> Dict[str, str]:
+        fig = self.figure_state(page_id)
+        return fig.source_labels(self._w.workspace, page_id) if fig is not None else {}
+
+    def finished(self, run_id: str):
+        return self._w.runner.finished_result(run_id)
+
+    def fetch(self, run_id: str) -> None:
+        self._w.runner.fetch(run_id)
+
+    def commit(self, page_id: str, doc) -> bool:
+        fig = self.figure_state(page_id)
+        return bool(fig.replace(doc)) if fig is not None else False
+
+    def viewer_state(self, run_id: str, names) -> Dict[int, Dict[str, Any]]:
+        return self._w._display_state_of(run_id, list(names or []))
+
+    def own_layers(self, run_id: str) -> list:
+        try:
+            return self._w._own_layers(run_id)
+        except Exception:              # noqa: BLE001 — a preference must never break a render
+            return []
+
+    def export_path(self, fmt: str) -> str:
+        path, _f = QFileDialog.getSaveFileName(
+            self._w, f"Export the figure as {fmt.upper()}", "",
+            f"{fmt.upper()} (*.{fmt});;All files (*)")
+        if path and not path.lower().endswith(f".{fmt}"):
+            path += f".{fmt}"
+        return path
+
+    def lineage(self, run_id: str) -> str:
+        """The session-stable identity of what ``run_id`` computes (the bundle's provenance),
+        blank when the runner holds no engine for it."""
+        eng = getattr(self._w.runner, "_engine", None)
+        try:
+            if eng is not None and run_id in eng.graph.nodes:
+                return str(eng.lineage(run_id))
+        except Exception:              # noqa: BLE001 — provenance never blocks an export
+            pass
+        return ""
+
+    def app_version(self) -> str:
+        return f"{PRODUCT} {APP_VERSION}"
+
+    def make_movie(self, page_id: str, movie: Mapping[str, Any]) -> Optional[str]:
+        """Page → Movie (V5.00 step 7): a Free page ``movie["name"]`` holding a Page Input
+        of ``movie["source"]`` wired into an Export Movie whose timeline is the image's
+        channels with the windows it was drawn with (absolute contrast), its first layer,
+        its position and projection, its decor as annotations; the page is shown and the
+        Movie Editor opened on the node. Returns the node id."""
+        from nodegraph.catalog._shared.movie_timeline import canonical_json, flat_spec
+        from nodelab_v2.ops import MOVIE_OP as _MOVIE, PAGE_INPUT_OP, PAGE_SOURCE_KEY
+        ws = self._w.workspace
+        src = str(movie.get("source") or "")
+        if not src:
+            return None
+        chans = [int(c) for c in (movie.get("channels") or [0])]
+        display = dict(movie.get("display") or {})
+        lo_hi = [(d.get("lo"), d.get("hi")) for d in display.values()
+                 if d.get("lo") is not None and d.get("hi") is not None]
+        absolute = len(lo_hi) == len(chans) and bool(lo_hi)
+        first = display.get(chans[0]) or display.get(str(chans[0])) or {}
+        tl = flat_spec(sweep="time", z_reduce=str(movie.get("z_reduce") or "max"),
+                       channels=chans, layer=str(movie.get("layer") or ""),
+                       m=int(movie.get("m") or 0),
+                       contrast="absolute" if absolute else "auto",
+                       low_pct=0.5, high_pct=99.8,
+                       black=float(first.get("lo") or 0.0), white=float(first.get("hi") or 1.0),
+                       gamma=float(first.get("gamma") or 1.0), brightness=1.0,
+                       show=dict(movie.get("show") or {}))
+        # per-channel windows: the flat spec carries one pair; the timeline carries each
+        if absolute:
+            panel = tl["segments"][0]["panels"][0]
+            for c in chans:
+                d = display.get(c) or display.get(str(c)) or {}
+                panel["display"][str(c)] = {"gamma": float(d.get("gamma") or 1.0),
+                                            "lo": float(d["lo"]), "hi": float(d["hi"])}
+        page = ws.add_page(str(movie.get("name") or "Movie"), FREE_KIND)
+        inp = page.doc.add_node(PAGE_INPUT_OP, x=40.0, y=120.0, params={PAGE_SOURCE_KEY: src})
+        node = page.doc.add_node(_MOVIE, x=360.0, y=120.0, params={
+            "timeline": canonical_json(tl), "layer": str(movie.get("layer") or ""),
+            "channels": ",".join(str(c) for c in chans),
+            "show_scalebar": bool((movie.get("show") or {}).get("scalebar", True)),
+            "show_time": bool((movie.get("show") or {}).get("time", True)),
+            "show_channels": bool((movie.get("show") or {}).get("channels", False))})
+        page.doc.connect(inp.id, "out", node.id, "data")
+        self._w._refresh_page_views()
+        self._w._show_page(self._w._canvas, page.id)
+        self._w.open_movie_editor(node.id)
+        self._w.statusBar().showMessage(
+            f"Export Movie of {movie.get('label') or src} on page {page.name!r} — the Movie "
+            f"Editor shows it", 6000)
+        return node.id
+
+    def status(self, text: str) -> None:
+        self._w.statusBar().showMessage(text, 6000)
+
+
 def _clock(seconds) -> str:
     """``42 s`` / ``3:07`` / ``1:02:09`` — elapsed time as the Node queue shows it."""
     s = int(max(0.0, float(seconds or 0.0)))
@@ -579,6 +731,7 @@ class MainWindow(QMainWindow):
         # The Movie Editor's sources arrive on their own signal (a payload-only fetch never
         # reaches a pane), and the Viewer's settled LUT edits feed its linked channels.
         self.runner.fetched.connect(self._on_movie_fetched)
+        self.runner.fetched.connect(self._on_figure_fetched)
         self.runner.fetch_started.connect(
             lambda nid: self.statusBar().showMessage(
                 f"computing {self._local(nid) or nid} for the Movie Editor…"))
@@ -609,7 +762,8 @@ class MainWindow(QMainWindow):
         for sig in (self.runner.started, self.runner.finished, self.runner.failed,
                     self.runner.cancelled, self.runner.queued, self.runner.baked,
                     self.runner.fetched, self.runner.fetch_started,
-                    self.runner.ingest_started, self.runner.ingest_finished):
+                    self.runner.ingest_started, self.runner.ingest_finished,
+                    self.runner.queue_changed):
             sig.connect(lambda *_a: self._refresh_queue_ui())
         # (each viewer's own signals are wired where it is made — `_make_viewer`)
         self.runner.preload_progress.connect(self._on_preload_progress)
@@ -759,6 +913,8 @@ class MainWindow(QMainWindow):
         part = functools.partial
         slots = {
             "request_changed": part(self._on_view_request, viewer=v),
+            # Capture view → page (V5.00 step 5): what this viewer shows, as a figure item
+            "capture_page": part(self.capture_view_to_page, viewer=v),
             "selection_changed": part(self._on_frame_selection, viewer=v),
             "region_changed": part(self._on_region_changed, viewer=v),
             "iteration_changed": part(self._on_iteration_changed, viewer=v),
@@ -766,6 +922,8 @@ class MainWindow(QMainWindow):
             # setting, a pin is a graph edit — the viewer does neither itself
             "overlay_step": part(self._on_overlay_step, viewer=v),
             "overlay_pin": part(self._on_overlay_pin, viewer=v),
+            # a union canvas's per-source M/T/Z strips (2026-10-14): display-only, like a step
+            "overlay_select": part(self._on_overlay_select, viewer=v),
             # What the live surface can hold decides whether a big frame is shown WHOLE at
             # full resolution or off the pyramid (V2.23). The surface knows the number, the
             # runner makes the decision, and neither should know about the other.
@@ -1637,11 +1795,88 @@ class MainWindow(QMainWindow):
         return "modified" + (" · " + ", ".join(bits) if bits else "")
 
     # ── the Pages panel's nodes (V4.00 step 11e) ──────────────────────────────
+    # ── the Figure Editor (V5.00 step 3) ──────────────────────────────────────
+    def make_figure_editor(self, canvas: CanvasPanel) -> FigureEditorPanel:
+        """A canvas's Figure Editor — the factory :class:`CanvasPanel` calls."""
+        ed = FigureEditorPanel(_FigureHost(self))
+        ed.view.pressed.connect(lambda c=canvas: self._activate_canvas(c))
+        ed.selection_changed.connect(lambda: self.inspector.set_node(None))
+        return ed
+
+    def page_is_figure(self, page_id: str) -> bool:
+        page = self.workspace.pages.get(page_id or "")
+        return page is not None and page.figure is not None
+
+    def capture_view_to_page(self, viewer: Optional[ViewerPanel] = None) -> Optional[str]:
+        """*Capture view → page* (V5.00 step 5): place what ``viewer`` (default: the active
+        one) shows on a figure page — its frame, visible region, active channels and the
+        windows and colours it holds — as an image item, and show that page. The viewed
+        node must be published as a Page Output (a figure reads only those); the figure
+        page is the first one that can read it, else a new Analysis page. Returns the new
+        item's id, or ``None`` with a status message saying why."""
+        from nodelab_v2.workspace import FIGURE_KIND
+        v = viewer if viewer is not None else self._active_viewer()
+        full = self._binding_full(v) if v is not None else None
+        if v is None or full is None:
+            self.statusBar().showMessage("Capture view → page: the Viewer shows nothing yet")
+            return None
+        pid, nid = split_run_id(full)
+        ws = self.workspace
+        page = ws.pages.get(pid)
+        if page is None:
+            return None
+        name = None
+        for rec in page.doc.nodes.values():
+            if rec.op_key != PAGE_OUTPUT_OP:
+                continue
+            edge = page.doc.edge_into(rec.id, "data")
+            if (rec.id == nid or (edge is not None and edge[0] == nid)) \
+                    and str(rec.params.get(PAGE_NAME_KEY) or "").strip():
+                name = str(rec.params[PAGE_NAME_KEY]).strip()
+                break
+        if name is None:
+            self.statusBar().showMessage(
+                "Capture view → page: publish this node first — wire it into a Page Output "
+                "with a name; a figure reads only what a page publishes", 8000)
+            return None
+        value = f"{pid}:{name}"
+        fig_pid = next((p.id for p in ws.pages.values() if p.figure is not None
+                        and any(val == value for val, _l in ws.available_sources(p.id))), None)
+        if fig_pid is None:
+            fig_pid = ws.add_page("Figure", FIGURE_KIND).id
+            self._refresh_page_views()
+        c = self._canvas
+        self._show_page(c, fig_pid)
+        ed = c.figure
+        if not c.is_figure() or ed.bound() != fig_pid:
+            self.statusBar().showMessage("Capture view → page: the figure page did not open")
+            return None
+        names = list((page.doc.envs.get(nid).metadata.get("channel_names") or [])
+                     if page.doc.envs.get(nid) is not None else [])
+        display = v.display_state(full, names)
+        iid = ed.capture_view(value, coords=v.coords(), channels=v.channels(),
+                              rect01=v.visible_rect01(), display=display)
+        self.statusBar().showMessage(f"captured the view as {iid} on {ws.pages[fig_pid].name}",
+                                     6000)
+        return iid
+
+    def _figure_editors(self) -> List[FigureEditorPanel]:
+        return [c.figure for c in self.canvases() if getattr(c, "figure", None) is not None]
+
+    def _on_figure_fetched(self, node_id: str, payload, _seconds: float) -> None:
+        run_id = self._full(node_id)
+        for ed in self._figure_editors():
+            if ed.bound():
+                ed.on_fetched(run_id, payload)
+
     def show_node(self, page_id: str, node_id: str) -> None:
         """Show ``page_id`` on the active canvas with ``node_id`` selected and in view."""
         c = self._canvas
         if c.page_id != page_id:
             self._show_page(c, page_id)
+        if self.page_is_figure(page_id) and c.figure.bound() == page_id:
+            c.figure.select([node_id])            # a figure item, not a node
+            return
         sc = self._scenes.get(page_id)
         item = sc.node_items.get(node_id) if sc is not None else None
         if item is None:
@@ -2752,9 +2987,10 @@ class MainWindow(QMainWindow):
 
         A request below a dock's minimum (or against a fixed size) is clamped by Qt, so the
         Viewer sits at its minimum height on a short window, and the Properties column is
-        today held at the LabLink tab's minimum width (868 px, measured 2026-10-06) with the
-        panel itself fixed at 376 (``InspectorPanel.setFixedWidth``) — that request is a
-        no-op until those panels can shrink."""
+        today held at the LabLink tab's minimum width (868 px, measured 2026-10-06), and the
+        panel's own floor is 376 (``InspectorPanel.setMinimumWidth``) — that request is a
+        no-op until those panels can shrink. A floor, so the panel FILLS whatever width the
+        column has (it was fixed at 376 until 2026-10-14 and left a blank strip beside it)."""
         viewers = self.shell.docks_of(VIEWER_KIND)
         if viewers:
             d = viewers[0]
@@ -2974,6 +3210,9 @@ class MainWindow(QMainWindow):
         self._sync_solo()                 # a rewired source changes the frame count
         if pid == self._movie_pid():        # the editor's movie lives on ITS page
             self.movie_editor.on_doc_changed(touched, doc.downstream_of)
+        for ed in self._figure_editors():   # a figure's sources may resolve anew
+            if ed.bound():
+                ed.on_doc_changed(pid)
         if pid == self.workspace.active:
             name = doc.path or "untitled"
             self.statusBar().showMessage(f"{name} — rev {doc.revision}")
@@ -3043,9 +3282,14 @@ class MainWindow(QMainWindow):
             rec = self.doc.nodes.get(req.node_id)
             prm = rec.params if rec is not None else {}
             from nodegraph.placement import canvas_flip
+            on_canvas = md.get("canvas_flip") is not None
             req = _dc_replace(req, base=tuple(
                 (n, float(prm.get(n, 0.0) or 0.0)) for n in req.bounds),
-                mirror=canvas_flip(md) if md.get("canvas_flip") is not None else None)
+                mirror=canvas_flip(md) if on_canvas else None,
+                # off a canvas the primary runs the camera's way — the Overlay's own Flip X/Y
+                # (`placement.frame_mapping`), with the sockets' defaults
+                frame=None if on_canvas else (bool(prm.get("flip_x", True)),
+                                              bool(prm.get("flip_y", False))))
         v = v if v is not None else self._ensure_viewer()
         self._open_viewer(v)
         # the pick is for a node of the ACTIVE page: say so, so that it is written back
@@ -3224,8 +3468,28 @@ class MainWindow(QMainWindow):
             sub = pane.sub() if hasattr(pane, "sub") else 0
             rows = self.runner.overlay_frame_readout(node_id, m, t, sub, z)
             pane.set_overlay_frames(rows, self.runner.overlay_sub_ticks(node_id))
+            pane.set_overlay_field_rects(self.runner.overlay_field_rects(node_id))
         except Exception:  # noqa: BLE001 — a readout must never cost the frame
             pass
+
+    def _sync_overlay_lut_refs(self, pane, node_id: str) -> None:
+        """Hand ``pane`` each overlaid source's OWN plane at the frame it shows — what its
+        overlay channels' histograms and Auto read (2026-10-14) — before the frame is drawn.
+        A lookup of what the worker read beside the composite; never a read here."""
+        try:
+            m, t, z, _c = pane.coords()
+            sub = pane.sub() if hasattr(pane, "sub") else 0
+            pane.set_overlay_lut_refs(self.runner.overlay_lut_refs(node_id, m, t, sub, z),
+                                      node_id)
+        except Exception:  # noqa: BLE001 — a histogram sample must never cost the frame
+            pass
+
+    def _on_overlay_select(self, picks, viewer: Optional[ViewerPanel] = None) -> None:
+        """A union canvas source's own M/T/Z strip moved (or Play all moved several):
+        show each named source at its ``(m, t, z)``. A runner setting, like a stepper —
+        nothing re-runs, nothing is saved."""
+        self.runner.set_source_select(dict(picks or {}))
+        self._on_view_request(viewer)
 
     def _on_overlay_step(self, ovl_id: str, dt: int, dz: int,
                          viewer: Optional[ViewerPanel] = None) -> None:
@@ -4279,6 +4543,11 @@ class MainWindow(QMainWindow):
             self.movie_editor.shutdown()     # its render thread, for the same reason
         except Exception:                                    # noqa: BLE001 — see above
             pass
+        for ed in self._figure_editors():
+            try:
+                ed.shutdown()
+            except Exception:                                # noqa: BLE001 — see above
+                pass
         for dlg in list(getattr(self, "_demo_windows", {}).values()):
             try:
                 dlg.shutdown()                   # each demo's worker thread, likewise
@@ -4785,6 +5054,9 @@ class MainWindow(QMainWindow):
                 self.stamp_movie_links(mid, page_id=pid)
         if pid == self._movie_pid():
             self.movie_editor.on_display_changed()
+        for ed in self._figure_editors():
+            if ed.bound():
+                ed.on_display_changed()
 
     # ── Export Movie ↔ Viewer LUT link ────────────────────────────────────────────
     def _movie_doc(self, page_id: Optional[str] = None):
@@ -5539,7 +5811,8 @@ class MainWindow(QMainWindow):
             # decided for EVERY axis, not just T: a cold Z step through a whole-volume chain
             # is the same 130 s wait, and the first one pays it for the rest of the volume
             v.set_play_pacing(not reads)
-        if axis != "t":
+        # Play all (2026-10-14) plays the primary's T with every source, so it preloads as T
+        if axis not in ("t", "all"):
             return
         if not on:
             if self._preload_viewer in (None, v):      # never another viewer's preload
@@ -5665,6 +5938,7 @@ class MainWindow(QMainWindow):
             # result re-served while its planes follow on the decode lane: a viewer already
             # showing the node KEEPS its frame rather than blanking to "no image"
             keep = not planes and pane.showing()[0] == run_id and pane.has_image()
+            self._sync_overlay_lut_refs(pane, run_id)
             pane.show_result(run_id, planes, axes, seconds, dataset=payload,
                              overlay=self.runner.overlay_channels(run_id),
                              overlay_note=self.runner.overlay_note(run_id),
@@ -5780,8 +6054,14 @@ class MainWindow(QMainWindow):
                 badge = {"running": "RUNNING", "stopping": "STOPPING"}.get(state, state.upper())
                 if kind == "ingest":
                     badge = "INGEST"
-                bits = [f"running {_clock(e['elapsed'])}" if e.get("elapsed") is not None
-                        else ("stopping…" if state == "stopping" else "running")]
+                if state == "stopping" and kind != "bake":
+                    # cancelled, still finishing the step it was on (2026-10-13)
+                    bits = ["cancelled — stopping at its next step"
+                            + (f" (ran {_clock(e['elapsed'])})"
+                               if e.get("elapsed") is not None else "")]
+                else:
+                    bits = [f"running {_clock(e['elapsed'])}" if e.get("elapsed") is not None
+                            else ("stopping…" if state == "stopping" else "running")]
                 step = e.get("step")
                 if step and kind != "ingest":
                     event, rnode, info = step
@@ -5801,7 +6081,9 @@ class MainWindow(QMainWindow):
                          "why_not": "" if e.get("cancellable") else (
                              "An ingest finishes on its own: stopping it half-way would "
                              "leave a torn copy of the file" if kind == "ingest"
-                             else "Already stopping")})
+                             else "Already stopping — a node stops at its next step (a "
+                                  "node boundary or progress tick), and what it already "
+                                  "finished stays cached")})
         return rows
 
     def _queue_names(self, run_id: str) -> Tuple[str, str]:
@@ -5966,6 +6248,7 @@ class MainWindow(QMainWindow):
         for pane, pl in self._route_planes(self._viewers_for(run_id), planes, request):
             if pl is None:
                 continue                  # another viewer's frame of the same node
+            self._sync_overlay_lut_refs(pane, run_id)
             pane.show_planes(run_id, pl, axes, seconds)
             self._sync_overlay_frames(pane, run_id)
         # A COLD frame is decoded off the GUI thread and announces itself as "reading
@@ -6002,11 +6285,13 @@ class MainWindow(QMainWindow):
             self._console_dock.raise_()
 
     def _on_run_failed(self, node_id, trace) -> None:
-        # The Viewer shows the failing line (status) + full trace (tooltip), and the card
-        # that raised keeps its red 'error' state (the engine's error event named it, which
-        # is more precise than the pulled node). The CONSOLE gets the whole trace,
-        # selectable, because the other three are all uncopyable: a status line is truncated
-        # to the window width, a tooltip cannot be selected, and a red card is not text.
+        # The Viewer shows the failing line (status line only — since 2026-10-13 no tooltip
+        # carries the trace: one on the image outlived the failure and popped a stale
+        # traceback over every later result), and the card that raised keeps its red
+        # 'error' state (the engine's error event named it, which is more precise than the
+        # pulled node). The CONSOLE gets the whole trace, selectable, because the others are
+        # uncopyable: a status line is truncated to the window width and a red card is not
+        # text.
         run_id = self._full(node_id)
         pid, nid = split_run_id(run_id)
         for p, sc in list(self._scenes.items()):
@@ -6596,7 +6881,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"saved {path}")
 
     def file_export(self) -> None:
-        from nodelab_v2.export import export_dataset
+        import os
+        from nodelab_v2.export import export_dataset_files
+        from nodelab_v2.tables import pixel_layers
         ds = self.sheet.dataset
         if ds is None:
             QMessageBox.information(self, "Nothing to export",
@@ -6604,17 +6891,26 @@ class MainWindow(QMainWindow):
                                     "(the Spreadsheet tab shows what's exportable).")
             return
         nid = self.sheet.node_id or "table"
+        # a pixel table defaults to Parquet: a million-row CSV is ~1 GB and past what a
+        # spreadsheet opens (it is written to a file of its own either way)
+        filters = ["CSV (*.csv)", "Parquet (*.parquet)", "Arrow IPC (*.arrow)"]
+        pixels = bool(pixel_layers(getattr(ds, "metadata", None)))
+        if pixels:
+            filters.insert(0, filters.pop(1))
         path, _f = QFileDialog.getSaveFileName(
-            self, "Export structure tables", f"{nid}.csv",
-            "CSV (*.csv);;Parquet (*.parquet);;Arrow IPC (*.arrow)")
+            self, "Export structure tables", f"{nid}{'.parquet' if pixels else '.csv'}",
+            ";;".join(filters))
         if not path:
             return
         try:
-            n = export_dataset(ds, path)
+            files = export_dataset_files(ds, path)
         except (ValueError, OSError, ImportError) as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
-        self.statusBar().showMessage(f"exported {n} rows → {path}")
+        n = sum(k for _p, k in files)
+        where = (path if len(files) == 1 else
+                 ", ".join(os.path.basename(p) for p, _k in files))
+        self.statusBar().showMessage(f"exported {n:,} rows → {where}")
 
     # ── empty canvas / example content ────────────────────────────────────────
     def _sync_welcome(self, *_a) -> None:

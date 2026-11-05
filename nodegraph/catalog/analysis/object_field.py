@@ -16,7 +16,7 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import on_layer
 from nodegraph.catalog._shared.objects import (
     _InFrameInterval,
-    _frame_interval_s,
+    _frame_timebase,
     _object_table,
     _object_velocity,
 )
@@ -126,9 +126,9 @@ def _compute_object_field(ctx: EvalContext) -> Dataset:
     names = _object_field_names(ctx.params.get("fields", ""))
     px = ctx.calib("pixel_size_um") or 0.1
     need_track = bool(set(names) & _OBJECT_FIELDS_TRACKED)
-    dt_s = _frame_interval_s(ctx, needed=need_track,
-                             wanted=set(names) & _OBJECT_FIELDS_TRACKED,
-                             node="object field")
+    dt_s = _frame_timebase(ctx, int(ax.t), needed=need_track,
+                           wanted=set(names) & _OBJECT_FIELDS_TRACKED,
+                           node="object field", metadata=ds.metadata)
     step_um = float(ctx.params.get("grid_step", 10.0))
     step_px = max(1, int(round(to_pixels_v2(step_um, "um", pixel_size_um=px))))
     smooth_um = max(0.0, float(ctx.params.get("smooth", 20.0)))

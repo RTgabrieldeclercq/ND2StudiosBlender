@@ -444,7 +444,9 @@ WRITERS = {
     "quicklook": write_quicklook,
     "image_stack": write_image_stack,
     # "metrics" is not here on purpose: it takes a payload the run assembles, not a
-    # Dataset, so the run loop calls write_metrics directly.
+    # Dataset, so the run loop calls write_metrics directly. Neither is "figure" (V5.00
+    # step 6): the run loop renders the recipe's figure page in a subprocess
+    # (``Worker._write_figure`` → ``python -m nodelab_v2.figure_render``).
 }
 
 

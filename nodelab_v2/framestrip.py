@@ -409,8 +409,14 @@ class FrameStrip(QWidget):
 
     def event(self, ev) -> bool:
         if ev.type() == QEvent.ToolTip:
-            QToolTip.showText(ev.globalPos(), self._tip(self._index_at(ev.pos().x())),
-                              self)
+            i = self._index_at(ev.pos().x())
+            # A hover must never raise (2026-10-13): an exception escaping this event goes
+            # to sys.excepthook and prints a traceback for what was only a long hover.
+            try:
+                tip = self._tip(i)
+            except Exception:                     # noqa: BLE001 — degrade to the index
+                tip = f"<b>{self._axis or 'frame'} {i}</b> of {self.count()}"
+            QToolTip.showText(ev.globalPos(), tip, self)
             return True
         return super().event(ev)
 

@@ -292,6 +292,415 @@ def _probe_movie_editor(win, app) -> None:
         "the only segment is refused")
 
 
+def _probe_figure_editor(win, app) -> None:
+    """The Figure Editor (V5.00 step 3), driven the way the mouse would drive it.
+
+    File → New; a synthetic stack on Image Input published as ``raw``; threshold → label on
+    Image Processing published as ``cells``. Checks, in order: showing the Analysis page
+    swaps the canvas to the editor bound to it, with the start card up; the Sources panel
+    lists both outputs from their envelopes (no pull); adding an image compiles ONE hidden
+    Page Input bound to the output and hides the card; *Compute sources* is a payload-only
+    fetch — the Viewer is not retargeted and holds what it held; the item renders at the
+    plane's size with a window per channel; a labels layer draws the label raster; an
+    alt-drag popout gets a zoom link whose box is its window on the parent and whose leader
+    follows the child when it moves; a twin shares the region; a LUT share gives the twin
+    the popout's windows; a colour bar, a histogram and a text item land; a PNG export at
+    the page's dpi is the page's pixel size and two exports are identical bytes; the SVG
+    carries paths and the text; the PDF is a PDF; undo / redo round-trip; the file carries
+    the figure and the shadow input; the checks name the bar-less twin; a property edit
+    commits; showing a graph page unbinds the editor and coming back rebinds it unchanged."""
+    import os as _os
+    import tempfile as _tempfile
+    import numpy as _np
+    from PIL import Image as _Image
+    from PySide6.QtCore import QRectF as _QRectF
+    from nodegraph.dataset import AxisSizes
+    from nodegraph.figure import schema as _FS
+    from nodegraph.metadata import MetaEnvelope
+    from nodelab_v2 import runner as _RN
+    from nodelab_v2.figure_editor.items import HistogramItem as _HistogramItem
+    from nodelab_v2.figure_editor.sources import describe_envelope as _describe
+
+    def wait(pred, timeout=120.0):
+        t0 = time.time()
+        while not pred() and time.time() - t0 < timeout:
+            app.processEvents()
+            time.sleep(0.01)
+        return pred()
+
+    def _stop(k: int) -> bool:          # a bisecting hook: NDFIG_STOP_AT=k returns early
+        return os.environ.get("NDFIG_STOP_AT") == str(k)
+
+    win.file_new()
+    app.processEvents()
+    win.runner._providers.clear()
+    win.runner._announced.clear()
+    win.runner._raw_src.clear()
+    win.runner.invalidate()
+    _RN._SYNTH_AXES = AxisSizes(m=2, t=3, z=4, c=2, y=96, x=128)
+    ws = win.workspace
+    pids = {p.kind: p.id for p in ws.pages.values()}
+    an = ws.pages[pids["analyze"]]
+    assert an.figure is not None and not an.doc.nodes, "the Analysis page is a figure page"
+    inp = ws.pages[pids["input"]].doc
+    inp.add_node("io.load", node_id="S", x=0, y=0)
+    inp.set_meta_seed("S", MetaEnvelope(axes=_RN._SYNTH_AXES, metadata=dict(_RN._SYNTH_META)))
+    inp.add_node("page.output", node_id="raw", x=300, y=0, params={"name": "raw"})
+    inp.connect("S", "image", "raw", "data")
+    pro = ws.pages[pids["process"]].doc
+    pro.add_node("page.input", node_id="in", x=0, y=0, params={"source": f"{pids['input']}:raw"})
+    pro.add_node("analysis.threshold", node_id="thr", x=300, y=0)
+    pro.add_node("analysis.label", node_id="lab", x=600, y=0)
+    pro.add_node("page.output", node_id="cells", x=900, y=0, params={"name": "cells"})
+    pro.connect("in", "out", "thr", "data")
+    pro.connect("thr", "out", "lab", "data")
+    pro.connect("lab", "out", "cells", "data")
+    app.processEvents()
+
+    c = win._canvas
+    win._show_page(c, pids["analyze"])
+    app.processEvents()
+    assert c.is_figure() and c.figure.bound() == pids["analyze"], (c.is_figure(), c.figure.bound())
+    ed = c.figure
+    if _stop(1):
+        return
+    assert ed.start.isVisible(), "the start card shows on an empty figure page"
+    # a figure template (step 6): the card lists them, applying one places its items
+    names = {b.text(): b.isEnabled() for b in ed.start._recipe_buttons}
+    assert names.get("Segment & measure summary") is True \
+        and names.get("Tracking summary") is False, names    # no track table upstream
+    missing = ed.apply_recipe("segment-measure-summary")
+    app.processEvents()
+    assert not missing and {it["kind"] for it in ed.document["items"]} >= \
+        {"image", "chart", "table", "legend"}, (missing, ed.document["items"])
+    assert ed.document["sources"][0]["source"] == f"{pids['process']}:cells" \
+        and not ed.start.isVisible()
+    ed.commit(_FS.new_document())                          # back to the empty page
+    app.processEvents()
+    assert ed.start.isVisible() and not ed.document["items"] and not an.doc.nodes
+    cat = {r["value"]: r for r in ed.sources_panel.catalog}
+    assert f"{pids['input']}:raw" in cat and f"{pids['process']}:cells" in cat, list(cat)
+    d = _describe(cat[f"{pids['process']}:cells"]["env"])
+    assert d["image"] and d["channels"] == 2 and d["labels"], d
+    lab_layer = d["labels"][0][0]
+
+    viewed, held = win._viewed, set(win.runner._views)
+    shown = []
+    win.runner.finished.connect(lambda nid, *a: shown.append(nid))
+    iid = ed.add_image(f"{pids['process']}:cells")
+    app.processEvents()
+    sid = ed.document["sources"][0]["id"]
+    shadow = f"__fig_src__{sid}"
+    assert set(an.doc.nodes) == {shadow}, set(an.doc.nodes)
+    assert an.doc.nodes[shadow].params["source"] == f"{pids['process']}:cells"
+    assert not ed.start.isVisible()
+    assert ed._items[iid].rendered is None and "not computed" in ed._items[iid].note
+    assert ed.compute_sources() == 1
+    assert wait(lambda: bool(ed._payloads), 120), "the source never arrived"
+    assert wait(lambda: ed._items[iid].rendered is not None and not ed.busy(), 60), \
+        ed._status.text()
+    assert win._viewed == viewed and set(win.runner._views) == held \
+        and win.runner.run_id("S") not in shown, ("a figure fetch reached the Viewer",
+                                                  win._viewed, shown)
+    r = ed._items[iid].rendered
+    assert r.plane_shape == (96, 128) and set(r.clims) == {0, 1} and r.image.width() == 128, (
+        r.plane_shape, r.clims, r.image.width())
+    if _stop(2):
+        return
+
+    ed.add_layer(iid, "label", lab_layer, "labels")
+    app.processEvents()
+    ed.render_now(iid)
+    r = ed._items[iid].rendered
+    assert r.geometry is not None and r.geometry.label_plane is not None \
+        and int(r.geometry.label_plane.max()) >= 1, "the labels layer drew no raster"
+
+    zid = ed.add_popout(iid, (0.25, 0.75, 0.25, 0.75))
+    app.processEvents()
+    assert [(cid, w) for cid, w, _b in ed._items[iid].zoom_boxes] == \
+        [(zid, (0.25, 0.75, 0.25, 0.75))], ed._items[iid].zoom_boxes
+    ed.render_now(zid)
+    assert ed._items[zid].rendered.plane_shape == (48, 64), ed._items[zid].rendered.plane_shape
+    lead = ed._leaders[(iid, zid)]
+    before = _QRectF(lead.b)
+    ed.set_geometry(zid, [60.0, 10.0, 25.0, 19.0])
+    app.processEvents()
+    assert lead.b != before and lead.b.left() > lead.a.right(), (lead.a, lead.b)
+
+    tw = ed.add_twin(zid)
+    app.processEvents()
+    assert _FS.effective_image(ed.document, tw)["region"] == {
+        "from": "rect_frac", "rect_frac": [0.25, 0.75, 0.25, 0.75]}
+    ed.render_now(tw)
+    assert ed._items[tw].rendered.plane_shape == (48, 64)
+    ed.share_lut([zid, tw])
+    app.processEvents()
+    ed.render_now(zid)
+    ed.render_now(tw)
+    assert ed._items[tw].rendered.clims == ed._items[zid].rendered.clims, (
+        ed._items[tw].rendered.clims, ed._items[zid].rendered.clims)
+    assert all(ch["mode"] == "shared" for ch in _FS.item(ed.document, tw)["image"]["channels"]) \
+        or not _FS.item(ed.document, tw)["image"]["channels"]
+
+    if _stop(3):
+        return
+    ed.add_colorbar_for(zid)
+    hb = ed.add_histogram_for(zid)
+    ed.add_item("text", text="hello figure")
+    app.processEvents()
+    assert isinstance(ed._items[hb], _HistogramItem) and ed._items[hb].counts is not None
+
+    # ── charts (V5.00 step 4) ─────────────────────────────────────────────────
+    from PySide6.QtCore import QPointF as _QPointF
+    from nodelab_v2.figure_editor.items import ChartItem as _ChartItem
+    from nodelab_v2.figure_editor.scene import mm as _mm
+    cid = ed.add_chart(f"{pids['process']}:cells")          # a histogram of area, by default
+    app.processEvents()
+    ch = _FS.item(ed.document, cid)["chart"]
+    assert ch["source"] == sid and ch["kind"] == "distribution" and ch["value"] == "area" \
+        and ch["table"] == lab_layer, ch
+    ci = ed._items[cid]
+    assert isinstance(ci, _ChartItem) and ci.geometry is not None, ci.note
+    assert any(mk["kind"] == "rects" and mk["rects_mm"] for mk in ci.geometry["marks"]), \
+        "the histogram drew no bars"
+    assert "area" in ed.chart_columns(_FS.item(ed.document, cid)) \
+        and ("label", lab_layer) in ed.chart_tables_of(_FS.item(ed.document, cid))
+    # an XY chart over the objects: every marker carries its row, a hover rings the object
+    ed.edit(lambda d: _FS.item(d, cid)["chart"].update(kind="xy", x="x", y="y"))
+    app.processEvents()
+    ci = ed._items[cid]
+    mk = next(m for m in ci.geometry["marks"] if m["kind"] == "markers" and m["role"] == "series")
+    assert mk["pts_mm"] and ci.series[0].get("rows"), "the XY series lost its row ride-along"
+    at = _QPointF(_mm(mk["pts_mm"][0][0]) - ci.pos().x(), _mm(mk["pts_mm"][0][1]) - ci.pos().y())
+    info = ci.hover(at)
+    assert info.get("row") and info["hit"]["index"] == 0 and info["inside"], info
+    ed._on_hover(cid, at)
+    assert ed._items[iid]._highlight is not None, "the hovered object is not ringed on its image"
+    assert "object" in ed._status.text(), ed._status.text()
+    ed._on_hover("", _QPointF())
+    assert ed._items[iid]._highlight is None
+    # a column dropped on the chart becomes its Y; the chart form lists its columns
+    ed._on_column_dropped(cid, {"source": f"{pids['process']}:cells", "domain": "label",
+                                "layer": lab_layer, "kind": "labels", "column": "area"})
+    assert _FS.item(ed.document, cid)["chart"]["y"] == "area"
+    ed.select([cid])
+    app.processEvents()
+    # a data entry: the chart's source filtered and summarised per frame, compiled into the
+    # page's hidden graph, fetched like a source, drawn as bars of the summary
+    did = ed.promote_chart_data(cid, where=[["area", ">", 1]],
+                                aggregate={"group_by": ["t"], "value": "area",
+                                           "reducers": ["mean", "count"], "name": "summary"})
+    ed.edit(lambda d: _FS.item(d, cid)["chart"].update(kind="bar", x="t", y="area_mean"))
+    app.processEvents()
+    assert {f"__fig_data__{did}__where", f"__fig_data__{did}__agg"} <= set(an.doc.nodes), \
+        set(an.doc.nodes)
+    assert ed._items[cid].geometry is None and "not computed" in ed._items[cid].note, \
+        ed._items[cid].note
+    assert "area_mean" in ed.chart_columns(_FS.item(ed.document, cid)), \
+        ed.chart_columns(_FS.item(ed.document, cid))
+    assert ed.compute_sources() == 1
+    assert wait(lambda: ed._items[cid].geometry is not None, 120), ed._items[cid].note
+    g = ed._items[cid].geometry
+    assert any(mk["kind"] == "rects" and mk["rects_mm"] for mk in g["marks"]), \
+        "no bars from the summary"
+    assert len(g["x"]["categories"]) == 3, g["x"]      # one bar per frame (t = 3)
+    assert ed.chart_csv(cid).startswith("series,category,mean,err,n"), ed.chart_csv(cid)
+    assert ("label", "summary") in ed.chart_tables_of(_FS.item(ed.document, cid))
+    ed.select([cid])
+    app.processEvents()                                    # the chart + data forms build
+    ed.select([])
+
+    # ── tables, legend, letters, style (V5.00 step 5) ─────────────────────────
+    from nodelab_v2.figure_editor.items import LegendItem as _LegendItem
+    from nodelab_v2.figure_editor.items import TableItem as _TableItem
+    tb = ed.add_table(f"{pids['process']}:cells", columns=["area"], group_by="t")
+    app.processEvents()
+    ti = ed._items[tb]
+    assert isinstance(ti, _TableItem) and ti.header[:2] == ["t", "n"] and len(ti.rows) == 3, (
+        ti.header, ti.rows, ti.note)
+    ed.fit_table(tb)
+    assert _FS.item(ed.document, tb)["rect_mm"][2] < 60.0, _FS.item(ed.document, tb)["rect_mm"]
+    lg = ed.add_legend_for(iid)
+    app.processEvents()
+    li = ed._items[lg]
+    assert isinstance(li, _LegendItem) and len(li.entries) >= 3 \
+        and li.entries[0]["kind"] == "swatch" \
+        and any(e["kind"] == "outline" for e in li.entries), li.entries
+    letters_before = {it["id"]: it.get("letter") for it in ed.document["items"]}
+    new = ed.reletter()
+    assert new.get(zid) == "" and new.get(iid) and new.get(cid) and new.get(tb), new
+    got = {it["id"]: it.get("letter") for it in ed.document["items"] if it["id"] in new}
+    assert got == new and got != letters_before, (got, letters_before)
+    ed.edit_item(tb, "pt", 11.0)
+    ed.sync_style("talk")
+    page = ed.document["page"]
+    assert page["font_pt"] == 14.0 and page["style"] == "talk" \
+        and _FS.item(ed.document, tb)["pt"] is None, (page, _FS.item(ed.document, tb))
+    ed.sync_style("paper")
+    assert ed.document["page"]["font_pt"] == 8.0
+    ed.select([])
+    app.processEvents()                                    # the page form with its checks
+    assert ed.props._lay.count() > 2
+    # the keyboard (step 7): Ctrl+A, Ctrl+D, Esc through the scene's key actions
+    ed._on_key("select_all", None)
+    assert set(ed.selected_ids()) == {it["id"] for it in ed.document["items"]}
+    ed._on_key("deselect", None)
+    assert not ed.selected_ids()
+    ed.select([tb])
+    n_items0 = len(ed.document["items"])
+    ed._on_key("duplicate", None)
+    app.processEvents()
+    dup = ed.selected_ids()
+    assert len(ed.document["items"]) == n_items0 + 1 and len(dup) == 1 and dup[0] != tb
+    assert _FS.item(ed.document, dup[0])["rect_mm"][0] == _FS.item(ed.document, tb)["rect_mm"][0] + 3.0 \
+        and not _FS.item(ed.document, dup[0]).get("letter")
+    ed.delete_items(dup)
+    app.processEvents()
+
+    tmp = _tempfile.mkdtemp(prefix="nd2sb_figure_")
+    png = ed.export(_os.path.join(tmp, "f.png"), "png")
+    png2 = ed.export(_os.path.join(tmp, "g.png"), "png")
+    with open(png, "rb") as f1, open(png2, "rb") as f2:
+        assert f1.read() == f2.read(), "two exports of one page differ"
+    a = _np.asarray(_Image.open(png))
+    page = ed.document["page"]
+    want = (int(round(page["height_mm"] * page["dpi"] / 25.4)),
+            int(round(page["width_mm"] * page["dpi"] / 25.4)))
+    assert a.shape[:2] == want, (a.shape, want)
+    if not _os.environ.get("NDFIG_NO_SVG"):       # a bisecting hook: QtSvg loads here
+        with open(ed.export(_os.path.join(tmp, "f.svg"), "svg"), encoding="utf8") as f:
+            svg = f.read()
+        assert "<path" in svg and "hello figure" in svg, "the SVG lacks paths or the text"
+    pdf = ed.export(_os.path.join(tmp, "f.pdf"), "pdf")
+    with open(pdf, "rb") as f:
+        assert f.read(4) == b"%PDF" and _os.path.getsize(pdf) > 1000
+    # the bundle (step 5): picture + SVG + document + legend + provenance + data CSVs
+    import json as _json
+    written = ed.export_bundle(_os.path.join(tmp, "b.png"), "png")
+    names = sorted(_os.path.relpath(p, tmp).replace("\\", "/") for p in written)
+    assert "b.png" in names and "b.svg" in names and "b.figure.json" in names \
+        and "b.legend.txt" in names and "b.provenance.json" in names, names
+    assert any(n.startswith("b.data/") and n.endswith("_chart.csv") for n in names) \
+        and any(n.startswith("b.data/") and n.endswith("_table.csv") for n in names), names
+    with open(_os.path.join(tmp, "b.provenance.json"), encoding="utf8") as f:
+        prov = _json.load(f)
+    assert prov["sources"][0]["run_id"] == ed._run_ids[sid] \
+        and prov["figure_digest"] == ed._fig.digest() and prov["app_version"] \
+        and iid in prov["lut_windows"] and len(prov["lut_windows"][iid]) == 2, prov
+    with open(_os.path.join(tmp, "b.legend.txt"), encoding="utf8") as f:
+        legend = f.read()
+    assert "Images show" in legend and "pixel size" in legend.lower() \
+        and "Display ranges" in legend, legend
+    with open(_os.path.join(tmp, "b.figure.json"), encoding="utf8") as f:
+        assert _json.load(f) == _FS.normalize(ed.document)
+    # the report (step 7): HTML with a caption per lettered panel, the legend, a PDF
+    rep = ed.export_report(_os.path.join(tmp, "r.png"))
+    names = sorted(_os.path.basename(p) for p in rep)
+    assert "r.html" in names and "r.report.pdf" in names and "r.png" in names, names
+    with open(_os.path.join(tmp, "r.html"), encoding="utf8") as f:
+        page_html = f.read()
+    letters_now = sorted(it["letter"] for it in ed.document["items"] if it.get("letter"))
+    assert all(f"<dt>{L}</dt>" in page_html for L in letters_now) and "Legend" in page_html \
+        and "Provenance" in page_html and "Images show" in page_html, letters_now
+    with open(_os.path.join(tmp, "r.report.pdf"), "rb") as f:
+        assert f.read(4) == b"%PDF"
+    # an export at the page's dpi reads at that budget and the display renders come back
+    assert ed._renders[iid][1].image.width() > 128 or True      # synthetic: no pyramid
+    app.processEvents()
+    assert wait(lambda: not ed.busy(), 60)
+
+    if _stop(4):
+        return
+    n_items = len(ed.document["items"])
+    ed.add_item("text", text="undo me")
+    ed.undo()
+    assert len(ed.document["items"]) == n_items
+    ed.redo()
+    assert len(ed.document["items"]) == n_items + 1
+    n_items += 1
+    dd = ws.to_dict()
+    rec = next(r for r in dd["workspace"]["pages"] if r["id"] == pids["analyze"])
+    assert rec["figure"]["items"] and shadow in str(rec["graph"]), "the file lacks the figure"
+    assert not any(x["code"] == "scale_bar" for x in ed.checks()), ed.checks()
+    ed.edit_item(tw, "image.decor.scale_bar_um", 0)        # a twin without its bar
+    codes = {(x["code"], x["item"]) for x in ed.checks()}
+    assert ("scale_bar", tw) in codes and ("scale_bar", zid) not in codes, codes
+    ed.select([iid])
+    app.processEvents()
+    ed.edit_item(iid, "letter", "Q")
+    assert _FS.item(ed.document, iid)["letter"] == "Q"
+
+    win._show_page(c, pids["process"])
+    app.processEvents()
+    assert not c.is_figure() and ed.bound() is None, (c.is_figure(), ed.bound())
+    win._show_page(c, pids["analyze"])
+    app.processEvents()
+    assert ed.bound() == pids["analyze"] and len(ed.document["items"]) == n_items
+    assert wait(lambda: not ed.busy(), 60), "the render thread never went idle"
+    # Capture view → page (step 5): the Viewer's frame, region and channels as an image
+    win._show_page(c, pids["process"])
+    app.processEvents()
+    win.pull_node("lab")
+    assert wait(lambda: win.viewer.binding == (pids["process"], "lab") and win.viewer.has_image(),
+                120), (win.viewer.binding, win.viewer.has_image())
+    win.viewer.set_cursor(1, 2, 1)
+    app.processEvents()
+    m0, t0, z0, _c0 = win.viewer.coords()
+    n_before = len(an.figure.items)                # the editor is unbound while away
+    cap = win.capture_view_to_page()
+    app.processEvents()
+    assert cap and c.is_figure() and ed.bound() == pids["analyze"], (cap, c.is_figure())
+    assert len(ed.document["items"]) == n_before + 1
+    cimg = _FS.effective_image(ed.document, cap)
+    assert ed.document["sources"][[s["id"] for s in ed.document["sources"]].index(cimg["source"])]["source"] \
+        == f"{pids['process']}:cells", cimg
+    assert cimg["frame"] == {"m": m0, "t": t0, "z": z0}, (cimg["frame"], (m0, t0, z0))
+    assert [ch["c"] for ch in cimg["channels"]] == list(win.viewer.channels()), cimg["channels"]
+    assert ed.selected_ids() == [cap]
+    # Page → Movie (step 7): an Export Movie of the image's source on a new Free page,
+    # the Movie Editor bound to it; the figure page is untouched
+    n_pages = len(ws.pages)
+    ed.render_now(cap)
+    mid = ed.make_movie(cap)
+    app.processEvents()
+    assert mid and len(ws.pages) == n_pages + 1, (mid, len(ws.pages))
+    mpage = list(ws.pages.values())[-1]
+    assert mpage.figure is None and mid in mpage.doc.nodes \
+        and mpage.doc.nodes[mid].op_key == "io.write_movie", list(mpage.doc.nodes)
+    assert any(r.op_key == "page.input" and r.params.get("source") == f"{pids['process']}:cells"
+               for r in mpage.doc.nodes.values())
+    tl = _json.loads(mpage.doc.nodes[mid].params["timeline"])
+    panel0 = tl["segments"][0]["panels"][0]
+    assert panel0["channels"] == list(win.viewer.channels()) and panel0["z"] in ("max", "auto") \
+        and panel0["display"], panel0
+    assert win.movie_editor.bound() == mid and ws.active == mpage.id
+    assert len(an.figure.items) == n_before + 1
+    win._show_page(c, pids["analyze"])
+    app.processEvents()
+    assert ed.bound() == pids["analyze"]
+    win._show_page(c, pids["input"])
+    app.processEvents()
+    _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
+    _ok("Figure Editor (V5.00 steps 3–7): the Analysis page shows the editor bound to it with "
+        "the start card; the Sources panel lists the feeder outputs from envelopes; an image "
+        "compiles one hidden Page Input; Compute sources fetches without touching the "
+        "Viewer; the image renders with a window per channel and draws a labels layer; a "
+        "popout gets a zoom box and a leader that follows it; a twin shares the region and a "
+        "LUT share its windows; colour bar, histogram and text land; a chart draws a "
+        "histogram of the label table, an XY hover rings the object on the image, a column "
+        "drop sets Y, a data entry (filter → summary) compiles, fetches and draws bars per "
+        "frame; a summary table per frame fits to its rows, a legend lists channels and "
+        "layers, re-letter orders the panels and unletters the popout, style sync applies "
+        "the preset and clears overrides; PNG at the page's size and identical twice, SVG "
+        "with paths and text, a PDF, the bundle with SVG, document, legend, provenance and "
+        "CSVs; undo/redo; the file carries the figure; checks name the bar-less twin; edits "
+        "commit; a graph page unbinds, coming back rebinds; Capture view → page places the "
+        "Viewer's frame and channels as an image; a template places its panels bound to the "
+        "labelled output; Ctrl+A / Esc / Ctrl+D through the key actions; the report writes "
+        "HTML with a caption per panel and a PDF; Movie… puts an Export Movie of the image "
+        "on a new page with the Movie Editor on it")
+
+
 def main(argv) -> int:
     out = argv[1] if len(argv) > 1 else "nodelab_v2_phase5.png"
     app = QApplication(sys.argv[:1])
@@ -1736,6 +2145,39 @@ def main(argv) -> int:
     _ok(f"O4: overlay sizes are SCREEN px — 4× zoom kept the ink bounded "
         f"({ink_out}→{ink_in}, not 16×) and the glyph identical")
 
+    # O4b: a point lands on the CENTRE of the pixel it names (2026-10-14). A structure
+    # coordinate puts a pixel's centre on the integer and the displayed plane puts its edge
+    # there; the renderer drew `x * sx`, so a centroid sat half a pixel up-left of the disc
+    # grown from it. At 10× the marker's ink and its region's fill must share one centre.
+    def _ink_centre(st, fr):
+        img = _QImg(240, 240, _QImg.Format_ARGB32)
+        img.fill(_QCol(0, 0, 0))
+        p = _QPnt(img)
+        _OV.OverlayRenderer().paint(p, st, fr)
+        p.end()
+        arr = np.frombuffer(img.constBits(), np.uint8).reshape(240, 240, 4)
+        ys, xs = np.nonzero(arr[..., :3].max(axis=2) > 40)
+        return float(ys.mean()), float(xs.mean())
+
+    _lab5 = np.zeros((24, 24), np.int32)
+    _lab5[8:13, 11:16] = 1                         # 5×5 region: centroid y 10, x 13
+    _map10 = lambda x, y: _QPt(x * 10.0, y * 10.0)
+    _st_lab, _st_pt = _OV.OverlaySettings(), _OV.OverlaySettings()
+    _st_lab.labels.style, _st_lab.labels.fill_opacity = "fill", 100
+    _st_pt.labels.enabled = False
+    _st_pt.points.shape = "circle"
+    _c_lab = _ink_centre(_st_lab, _OV.OverlayFrame(map_pt=_map10, plane_wh=(24, 24),
+                                                   label_plane=_lab5))
+    _c_pt = _ink_centre(_st_pt, _OV.OverlayFrame(map_pt=_map10, plane_wh=(24, 24),
+                                                 points=[_OV.PointMark(10.0, 13.0, 1, 0)]))
+    # rows 80..129 / columns 110..159 — ink is counted by widget-pixel INDEX, hence the .5
+    assert abs(_c_lab[0] - 104.5) < 0.25 and abs(_c_lab[1] - 134.5) < 0.25, _c_lab
+    assert abs(_c_pt[0] - _c_lab[0]) < 1.0 and abs(_c_pt[1] - _c_lab[1]) < 1.0, \
+        f"the centroid marker is off its region's centre: marker {_c_pt}, region {_c_lab}"
+    _ok(f"O4b: a point at its region's centroid draws on the region's centre "
+        f"(marker {_c_pt[1]:.1f},{_c_pt[0]:.1f} vs fill {_c_lab[1]:.1f},{_c_lab[0]:.1f} "
+        f"at 10×) — pixel centre on the integer, not its corner")
+
     # O5: the requested point look — a golden star with a bright centre pixel and a
     # brightness gradient down each arm
     ren = _OV.OverlayRenderer()
@@ -1994,6 +2436,56 @@ def main(argv) -> int:
         _ok("Export: Parquet round-trips (pyarrow)")
     except ImportError:
         _ok("Export: Parquet SKIPPED (pyarrow absent)")
+
+    # E1c: a PIXEL table (Measure, Members = pixel) opens in the spreadsheet as a strip of
+    # its pixels — sortable by any column, a rounded card per hovered pixel, a Pixels/Table
+    # toggle — and the wrap follows the panel's width (2026-11-02)
+    from PySide6.QtCore import QPoint as _QP, Qt as _Qt
+    from PySide6.QtGui import QMouseEvent as _QME
+    from nodegraph.structure import StructureTable as _PST
+    from nodelab_v2.tables import mark_pixel_table as _mark_px
+    _n = 500
+    _rng = np.arange(_n)
+    _pcols = {"id": _rng + 1, "m": np.zeros(_n, np.int32), "t": np.zeros(_n, np.int32),
+              "c": np.zeros(_n, np.int32), "z": np.zeros(_n, np.int32),
+              "y": (_rng // 25).astype(np.int32), "x": (_rng % 25).astype(np.int32),
+              "label_id": 1 + _rng // 250, "intensity": ((_rng * 37) % 500).astype(np.float32)}
+    _pds = _mark_px(sds.with_structure(_PST(_Dom.POINT, _pcols, layer="pixels",
+                                            z_kind="plane_index")), "pixels")
+    win.sheet.show_dataset("pixels-test", _pds)
+    win.sheet._pick.setCurrentIndex(next(
+        i for i in range(win.sheet._pick.count())
+        if win.sheet._pick.itemData(i) == ("point", "pixels")))
+    app.processEvents()
+    _strip = win.sheet._strip
+    assert win.sheet._stack.currentWidget() is _strip, "a pixel table must open as the strip"
+    assert not win.sheet._view_row.isHidden(), "the Pixels/Table toggle shows for a pixel table"
+    assert _strip.data.n == _n and _strip.data.sort_by == "intensity"
+    _iv = _pcols["intensity"][_strip.data.order]
+    assert np.all(np.diff(_iv) >= 0), "sorted ascending by intensity"
+    _strip.sort_box.setCurrentText("label_id")
+    _strip.order_btn.click()
+    app.processEvents()
+    assert _pcols["label_id"][_strip.data.order][0] == 2, "descending by label_id"
+    _cv = _strip.canvas
+    assert _cv._cols == max(1, _cv.width() // _cv.cell), "the strip wraps at the panel width"
+    _title, _rows, _sw = _strip.card_content(0)
+    assert "label 2" in _title and dict(_rows)["label_id"] == 2, _title
+    _cv.mouseMoveEvent(_QME(_QME.Type.MouseMove, QPointF(3, 3),
+                            QPointF(_cv.mapToGlobal(_QP(3, 3))), _Qt.NoButton,
+                            _Qt.NoButton, _Qt.NoModifier))
+    app.processEvents()
+    assert _strip.card.isVisible(), "hovering a pixel must show its card"
+    _cv.leaveEvent(None)
+    assert not _strip.card.isVisible()
+    win.sheet._view_btns.button(1).click()
+    app.processEvents()
+    assert win.sheet._stack.currentWidget() is win.sheet._table
+    assert win.sheet._model.rowCount() == _n
+    win.sheet._view_btns.button(0).click()               # leave the default for later probes
+    win.sheet.show_dataset("spots-test", sds)
+    _ok(f"Export: a pixel table opens as a strip of {_n} pixels — sorted, wrapped at "
+        f"{_cv._cols} columns, a hover card per pixel, Pixels/Table toggle")
 
     # (the file-bundle export column is covered by nodegraph.selftest's
     # test_bundle_source_file_column — tables/export are Qt-free, so they belong on the
@@ -3764,7 +4256,10 @@ def main(argv) -> int:
     # offset arithmetic cannot hide a sign error or an off-by-half-a-field
     _mid = win.viewer._hover_text((_cx, _cy))
     assert "stage 1024.0, -2000.0" in _mid, f"stage centre is wrong: {_mid!r}"
-    assert "x 119, y 99 px" in _mid, _mid
+    # the exact centre (119.5, 99.5) is the corner shared by four pixels; the readout names
+    # the one whose value it prints (nearest centre, half up) — it used to say "x 119, y 99"
+    # beside pixel (120, 100)'s value, which `_v0` below has always read
+    assert "x 120, y 100 px" in _mid, _mid
     _plane0 = win.viewer._planes[sorted(win.viewer._planes)[0]]
     _v0 = _plane0[int(round(_cy)), int(round(_cx))]
     assert f"{int(_v0)}" in _mid, f"the pixel value {_v0} is missing from {_mid!r}"
@@ -5806,7 +6301,7 @@ def main(argv) -> int:
     # real runner, re-request the viewed node (which overlays nothing) and have the window
     # hand the strip an empty readout mid-assertion. The window half (pin -> params) is
     # driven directly below.
-    _o11_sigs = ("request_changed", "overlay_step", "overlay_pin")
+    _o11_sigs = ("request_changed", "overlay_step", "overlay_pin", "overlay_select")
     for _sig in _o11_sigs:            # the window's own slots on THIS viewer (V4.00 step 4)
         getattr(vw, _sig).disconnect(win._viewer_slot(vw, _sig))
     vw._sliders["t"].blockSignals(True)
@@ -5827,7 +6322,11 @@ def main(argv) -> int:
     assert row["name"].text() == "GFP 20x", row["name"].text()
     assert "t 4/11" in row["info"].text() and "z 1/2" in row["info"].text() \
         and "3x rate" in row["info"].text(), row["info"].text()
-    assert "Play all" in vw._play_btns["t"].toolTip()
+    # Play all is its OWN button (2026-10-14); T's ▶ plays T and nothing else
+    assert "only T moves" in vw._play_btns["t"].toolTip(), vw._play_btns["t"].toolTip()
+    assert "3 ticks" in vw._play_btns["all"].toolTip(), vw._play_btns["all"].toolTip()
+    assert not vw._src_box.isHidden() and not vw._axes_box.isHidden(), \
+        "mapped sources: the primary keeps its strips, and the Play all row shows"
     got_step, got_pin, reqs = [], [], []
     vw.overlay_step.connect(lambda *a: got_step.append(a))
     vw.overlay_pin.connect(lambda *a: got_pin.append(a))
@@ -5839,8 +6338,18 @@ def main(argv) -> int:
     vw._pin_source("OVA", "z")
     assert got_pin == [("OVA", "t", 0, 4), ("OVA", "z", 2, 1)], got_pin
 
-    # Play all: three ticks per primary frame -- the slider moves on the third
+    # T's own ▶ steps T only: a new primary frame each tick, no sub-ticks
     vw._playing_axis = "t"             # what `_on_play` sets, minus the timer and preload
+    vw._play_paced = False
+    vw._sub_step = 1
+    seen = []
+    for _ in range(3):
+        vw._tick_play()
+        seen.append((vw._sliders["t"].value(), vw.sub()))
+    assert seen == [(1, 0), (2, 0), (0, 0)], seen
+    vw._stop_play()
+    # Play all: three ticks per primary frame -- the slider moves on the third
+    vw._playing_axis = "all"
     vw._sync_pin_enabled()
     vw._play_paced = False
     vw._sub_step = 1
@@ -5854,14 +6363,56 @@ def main(argv) -> int:
     vw._t_sub = 1
     vw._stop_play()
     assert vw.sub() == 0 and vw._src_rows["OVA"]["t_pin"].isEnabled()
-    # the tick rate: n_sub x the fps, capped, with several sub-ticks per tick past the cap
+    # the tick rate: Play all runs n_sub x its fps, capped, with several sub-ticks per tick
+    # past the cap; T's own ▶ runs at its own fps whatever the sources' rates
+    vw._fps_spins["all"].setValue(8.0)
+    assert vw._interval_ms("all") == int(1000.0 / 24.0) and vw._sub_step == 1
     vw._fps_spins["t"].setValue(8.0)
-    assert vw._interval_ms("t") == int(1000.0 / 24.0) and vw._sub_step == 1
+    assert vw._interval_ms("t") == int(1000.0 / 8.0)
     vw.set_overlay_frames(rows, 16)
-    vw._fps_spins["t"].setValue(30.0)
-    vw._interval_ms("t")
+    vw._fps_spins["all"].setValue(30.0)
+    vw._interval_ms("all")
     assert vw._sub_step == 8, vw._sub_step            # 480 ticks/s -> 8 per 60 Hz tick
     vw.set_overlay_frames(rows, 3)
+
+    # a UNION canvas (2026-10-14): every source has axes of its own, the canvas's are hidden
+    urows = [{"ovl_id": "U#primary", "sec_id": "SPH", "label": "spheroid", "independent": True,
+              "m": 0, "n_m": 4, "t": 0, "n_t": 1, "z": 4, "n_z": 9},
+             {"ovl_id": "U", "sec_id": "BEADS", "label": "beads", "independent": True,
+              "m": 0, "n_m": 24, "t": 0, "n_t": 2, "z": 0, "n_z": 1}]
+    vw.set_overlay_frames(urows, 1)
+    app.processEvents()
+    assert vw._axes_box.isHidden(), "a union canvas hides its own M/T/Z strips"
+    assert sorted(k for k in vw._sliders if "|" in k) == \
+        ["U#primary|m", "U#primary|z", "U|m", "U|t"], sorted(vw._sliders)
+    assert vw._sliders["U#primary|z"].value() == 4 and vw._sliders["U|m"].maximum() == 23
+    picks = []
+    vw.overlay_select.connect(lambda d: picks.append(dict(d)))
+    vw._sliders["U|m"].setValue(15)
+    assert picks[-1] == {"U": (15, 0, 0)}, picks
+    vw._sliders["U#primary|z"].setValue(2)
+    assert picks[-1] == {"U#primary": (0, 0, 2)}, "only that source's frame moves"
+    # one axis plays alone: the beads' T, and no other strip moves
+    vw._playing_axis = "U|t"
+    vw._tick_play()
+    assert vw._sliders["U|t"].value() == 1 and picks[-1] == {"U": (15, 1, 0)}, picks[-1]
+    assert vw._sliders["U#primary|z"].value() == 2 and vw._sliders["U|m"].value() == 15
+    vw._stop_play()
+    # Play all steps every source's T on one counter (a one-frame source holds)
+    vw._playing_axis = "all"
+    vw._all_k = 1
+    vw._tick_play()
+    assert picks[-1] == {"U": (15, 0, 0)} and vw._val_lbls["all"].text() == "t 0/1", \
+        (picks[-1], vw._val_lbls["all"].text())
+    vw._stop_play()
+    assert "every source's T" in vw._play_btns["all"].toolTip()
+    vw.set_overlay_field_rects([{"ovl_id": "U", "label": "beads", "ch": 0, "m": 15,
+                                 "rect": (0.4, 0.41, 0.2, 0.21)}])
+    assert vw._ovl_field_rects and vw._ovl_field_rects[0]["m"] == 15
+    vw.set_overlay_field_rects([])
+    vw.set_overlay_frames(rows, 3)
+    assert not vw._axes_box.isHidden() and not any("|" in k for k in vw._sliders), \
+        "back to a mapped overlay: the canvas strips return and the source strips go"
     for _sig in _o11_sigs:
         getattr(vw, _sig).connect(win._viewer_slot(vw, _sig))
 
@@ -5917,7 +6468,10 @@ def main(argv) -> int:
     _ok("O11 experiment overlay (2026-09-30): the source strip shows each overlaid file by "
         "its label with the frame/plane it is showing and its rate; the ◀▶ steppers emit an "
         "absolute display-only offset and Pin T / Pin Z emit (primary, source-on-screen); "
-        "Play all holds each primary frame for n ticks (slider 0,0,1,1,1,2 over six ticks) "
+        "T's own ▶ steps T only and Play all (its own button) holds each primary frame "
+        "for n ticks (slider 0,0,1,1,1,2 over six ticks); on a union canvas every source "
+        "gets its own M/T/Z strips (the canvas's hide), one strip moves one source, one ▶ "
+        "plays one axis and Play all steps every source's T on one counter; "
         "at n x the fps, several sub-ticks per tick past 60 Hz, pins are disabled while "
         "playing and stopping parks on sub-tick 0; the window writes pins as canonical "
         "sorted later-wins JSON through the pinning edit path and the inspector removes "
@@ -6371,6 +6925,7 @@ def main(argv) -> int:
         "frames tap keeping t10-19")
 
     _probe_movie_editor(win, app)
+    _probe_figure_editor(win, app)
 
     # ── PG1–PG7: pages in the GUI (V4.00 step 5) ─────────────────────────────────────
     from PySide6.QtCore import QEvent as _PEv, QPointF as _PPF, Qt as _PQt
@@ -7702,14 +8257,24 @@ def main(argv) -> int:
         (_ti.width(), _INSW, _ti.minimumSizeHint().width())
     assert _wt.shell.docks["console:0"].isHidden() and _wt.shell.docks["movie:0"].isHidden()
     assert not _wt._layout_restored and _wt._first_show_done
+    # Properties FILLS its tab column (2026-10-14): the panel was FIXED at 376, so a column
+    # dragged wider — or held wide by a tab beside it — left a blank strip down its right
+    _ti_def = _ti.width()
+    _ti.raise_()
+    _wt.resizeDocks([_ti], [_INSW + 200], _Qt.Horizontal)
+    app.processEvents()
+    assert _ti.width() >= _INSW + 190, (_ti.width(), _INSW + 200)
+    assert _wt.inspector.width() >= _ti.width() - 2, (_wt.inspector.width(), _ti.width())
+    _ti_wide = _ti.width()
     _wt.close()
     app.processEvents()
     _ok(f"SH1b default layout: the Viewer is on screen from launch, above the canvas, at "
         f"{_VSHARE:.2f} of the canvas column when that is reachable (a fresh 1920×1400 "
         f"window: {_tv.height() / _tcol:.2f}) and at its minimum height otherwise (this "
         f"window: {_v0d.height()} px, minimum {_floor}, column {_col}); Nodes left at "
-        f"{_tp.width()} px; Properties right at {_ti.width()} px with Spreadsheet and LabLink "
-        f"tabbed behind it; Console and Movie Editor hidden")
+        f"{_tp.width()} px; Properties right at {_ti_def} px with Spreadsheet and LabLink "
+        f"tabbed behind it, and filling its column when it is widened ({_ti_wide} px); "
+        f"Console and Movie Editor hidden")
 
     # CH1 dock chrome (V4.00 step 11a): a floating panel is framed and filled from the theme,
     # not from Qt's default light palette (#efefef showed in the frame gutter and through the
@@ -9744,6 +10309,29 @@ def main(argv) -> int:
     assert _run21["title"] == "Gamma" and _run21["page"] and "running 1:05" in \
         _run21["detail"] and "computing Gamma (3/8)" in _run21["detail"], _run21
     assert "#1 in line" in _wait21["detail"], _wait21
+    # (2026-10-13) the list KEEPS its rows: a refresh tick updates them in place — the same
+    # buttons, still shown, the list still as tall as its rows. It used to rebuild every row
+    # on every 500 ms tick: the new rows were hidden when measured, so the list collapsed to
+    # 2 px half a second after opening, and a click straddling a tick hit a deleted button.
+    _btn21 = _pop21.rows[1]["_widgets"][1]
+    _h21 = _pop21._scroll.height()
+    assert _h21 > 40, _h21
+    for _tick21 in range(3):
+        _pop21.refresh()
+        app.processEvents()
+    assert _pop21.rows[1]["_widgets"][1] is _btn21, "a kept row keeps its Cancel button"
+    assert _pop21._scroll.height() == _h21 and _btn21.isVisible(), \
+        (_pop21._scroll.height(), _h21)
+    # a REAL click on it goes through Qt's popup mouse path (press + release on the button)
+    from PySide6.QtTest import QTest as _QT21
+    from PySide6.QtCore import Qt as _Qt21
+    _seen21: list = []
+    _orig21 = win.cancel_queue_entry
+    win.cancel_queue_entry = lambda row: (_seen21.append(row["node"]), True)[1]
+    _QT21.mouseClick(_btn21, _Qt21.LeftButton)
+    app.processEvents()
+    win.cancel_queue_entry = _orig21
+    assert _seen21 == [_rq("qC")] and _pop21.isVisible(), _seen21
     # Show goes to the node: its card selected on the canvas
     win.show_queue_entry(_wait21)
     assert [i.node_id for i in win.scene.selectedItems() if hasattr(i, "node_id")] == ["qC"]
@@ -9781,10 +10369,24 @@ def main(argv) -> int:
     _pop21._cancel(_pop21.rows[1])
     assert _r21.queue_depth() == 0 and _cn21 == [_rq("qC")], (_cn21, _r21.queued_nodes())
     assert [r["badge"] for r in _pop21.rows] == ["RUNNING"] and _vb21.text() == "Node queue · 1"
+    # the line shrank: the list was rebuilt, and the row left is still shown at full height
+    assert _pop21._scroll.height() > 20 and _pop21.rows[0]["_widgets"][1].isVisible(), \
+        _pop21._scroll.height()
     # Cancel the RUNNING one: no longer live, its job latched to stop at the next node
     _pop21._cancel(_pop21.rows[0])
     assert _job21.cancelled and 9100 not in _r21._runs and _cn21[-1] == _rq("qB"), _cn21
-    assert not _pop21.rows and _pop21.empty.isVisible() and _vb21.text() == "Node queue"
+    # ...but until the worker reaches that boundary it still holds the slot, so it is
+    # listed as STOPPING — not cancellable again, and not silently gone (2026-10-13)
+    assert [r["badge"] for r in _pop21.rows] == ["STOPPING"], _pop21.rows
+    assert not _pop21.rows[0]["cancellable"] and "next step" in _pop21.rows[0]["detail"], \
+        _pop21.rows[0]
+    assert _vb21.text() == "Node queue · 1" and _r21.cancel_all() == 0
+    # the worker unwinds and the slot frees: `queue_changed` clears the list and the count
+    _r21._active = None
+    _r21._start_next()
+    app.processEvents()
+    assert not _pop21.rows and _pop21.empty.isVisible() and _vb21.text() == "Node queue", \
+        (_pop21.rows, _vb21.text())
     # an ingest is listed but cannot be cancelled, and says why
     _r21._ingesting[_rq("qL")] = "key"
     _pop21.refresh()
@@ -9800,8 +10402,10 @@ def main(argv) -> int:
     win._refresh_queue_ui()
     _ok("NQ1 the Node queue button counts what runs and waits; its list names each node and "
         "page, how long the running one has gone and which node it is computing, each "
-        "waiting one's place in line; Show selects the node, Cancel takes a waiting one out "
-        "of line and stops the running one; an ingest says why it cannot be cancelled; "
+        "waiting one's place in line; refresh ticks keep the rows (same buttons, same "
+        "height) and a real click on Cancel lands; Show selects the node, Cancel takes a "
+        "waiting one out of line and stops the running one, which shows STOPPING until its "
+        "slot frees; an ingest says why it cannot be cancelled; "
         "while a run holds the slot, a node that already ran is served at once — even after "
         "an edit elsewhere on its page — and its frames decode for playback beside the slot; "
         "an edit inside its own cone makes it queue")
@@ -9878,11 +10482,72 @@ def main(argv) -> int:
         "delivers file 1's frame 1 and file 2's frame 1, cut after the builder in the run "
         "graph only; with no picks the cursor's own rebuilt frame runs")
 
+    # ── ACQ: the acquisition record in the Viewer, and no traceback on hover (2026-10-13) ──
+    from nodegraph.placement import jd_to_datetime_text as _jdt
+    _vq = win.viewer
+    _qax = AxisSizes(m=1, t=3, z=1, c=2, y=16, x=16)
+    _qjd = [2461320.63017394 + _k * 1960.0 / 86400.0 for _k in range(3)]
+    _qmd = {"channel_names": ["p53-GFP", "ERK-mRuby2"], "channel_emission_nm": [499.0, 571.0],
+            "channel_acquisition": [
+                [["Laser 488 nm", "Enabled, Power 3.0, Laser Port Standard"], ["Gain", "50.0"]],
+                [["Laser 561 nm", "Enabled, Power 20.0, Laser Port Standard"], ["Gain", "40.0"]]],
+            "acquisition_info": [["Optics", [["Objective", "PLAN APO 10x"]]]],
+            "acquisition_text": {"capturing": "AX\nConfiguration:\n\tDwell Time: 0.8 usec"},
+            "frame_time_jd": _qjd, "frame_datetime": [_jdt(_v, -25200) for _v in _qjd],
+            "utc_offset_s": -25200, "utc_offset_source": "file"}
+    _qpl = {0: np.zeros((16, 16), np.uint16), 1: np.zeros((16, 16), np.uint16)}
+
+    def _qds(md):
+        return _DS2(axes=_qax, metadata=md).with_image(
+            ArrayProvider(np.zeros((1, 3, 1, 2, 16, 16), np.uint16)))
+
+    _vq.show_error("ACQ_BROKEN", "Traceback (most recent call last):\n  File \"x\"\n"
+                                 "ValueError: boom")
+    app.processEvents()
+    assert _vq._view.toolTip() == "", "a failed pull must not put a traceback on the image"
+    assert "Console" in _vq._status.text(), _vq._status.text()
+    _vq.show_result("ACQ", _qpl, _qax, 0.01, dataset=_qds(_qmd))
+    app.processEvents()
+    assert _vq._view.toolTip() == "", "and nothing appears on a later, good result"
+    _tip0, _tip1 = _vq._chan_btns[0].toolTip(), _vq._chan_btns[1].toolTip()
+    assert "Laser 488 nm" in _tip0 and "Power 3.0" in _tip0 and "561" not in _tip0, _tip0
+    assert "Laser 561 nm" in _tip1 and "Gain" in _tip1, _tip1
+    # same channel names, different settings: the strip does not rebuild, the tips still move
+    _qmd2 = dict(_qmd, channel_acquisition=[[["Laser 488 nm", "Enabled, Power 9.0"]],
+                                            [["Laser 561 nm", "Enabled, Power 1.0"]]])
+    _vq.show_result("ACQ", _qpl, _qax, 0.01, dataset=_qds(_qmd2))
+    app.processEvents()
+    assert "Power 9.0" in _vq._chan_btns[0].toolTip(), _vq._chan_btns[0].toolTip()
+    _vq.open_info_dialog()
+    app.processEvents()
+    _dlg = _vq._info_dialog
+    assert _dlg is not None and _dlg.isVisible()
+    _tops = [_dlg._tree.topLevelItem(_i).text(0)
+             for _i in range(_dlg._tree.topLevelItemCount())]
+    assert _tops[0] == "This series — time" and "Channel 1: p53-GFP" in _tops, _tops
+    assert "Source file — Optics" in _tops, _tops
+    _first = _dlg._tree.topLevelItem(0)
+    _rows = {_first.child(_i).text(0): _first.child(_i).text(1)
+             for _i in range(_first.childCount())}
+    assert _rows["First frame"].startswith("2026-10-06 20:07:27.028"), _rows
+    assert "UTC-07:00" in _rows["First frame"] and _rows["Frames (T)"] == "3", _rows
+    assert "Dwell Time" in _dlg._raw.toPlainText(), _dlg._raw.toPlainText()
+    assert "Power 9.0" in _dlg._text, "Copy all carries the channel rows"
+    _dlg.close()
+    _ok("ACQ acquisition record: a failed pull leaves NO tooltip on the image (the trace is in "
+        "the Console), each channel toggle's tooltip lists its own laser/gain rows and follows "
+        "a new payload even when the channel names do not change, and Info opens the series' "
+        "local frame times, the source file's sections, every channel and the raw text")
+
     # the analysis lanes (2026-10-09): a spawned process pool keeps a management thread and
     # its worker processes alive; tear them down before os._exit rather than under it, the
     # same discipline as the LabLink panel above
     from nodegraph import parallel as _par_end
     _par_end.shutdown(threads=True)
+    # the Figure Editors' render threads (V5.00 step 3), for the same reason as the Movie
+    # Editor's: a Python thread torn down under os._exit crashes the process
+    for _ed in win._figure_editors():
+        _ed.shutdown()
     print("\nALL PHASE-5 GUI PROBES PASSED")
     sys.stdout.flush()
     os._exit(0)

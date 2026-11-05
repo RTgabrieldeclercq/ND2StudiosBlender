@@ -1,0 +1,2110 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg4",
+    "next_page_seq": 5,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n3",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n5",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n7",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n9",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n12",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n11",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n14",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n13",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n16",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n15",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n18",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n17",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n20",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n19",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n32",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n31",
+              "src_socket": "image"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T1.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_2_T1.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T1"
+              }
+            },
+            {
+              "id": "n3",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T2.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_2_T2.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n4",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T2"
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T3.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_2_T3.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n6",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T3"
+              }
+            },
+            {
+              "id": "n7",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T4.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_2_T4.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n8",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T4"
+              }
+            },
+            {
+              "id": "n9",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T5.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261006_194721_215/CRC_2_T5.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T5"
+              }
+            },
+            {
+              "id": "n11",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T6.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261007_163114_482/CRC_2_T6.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n12",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T6"
+              }
+            },
+            {
+              "id": "n13",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T7.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261007_163114_482/CRC_2_T7.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n14",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T7"
+              }
+            },
+            {
+              "id": "n15",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T8.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261007_163114_482/CRC_2_T8.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n16",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T8"
+              }
+            },
+            {
+              "id": "n17",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T9.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261007_163114_482/CRC_2_T9.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n18",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T9"
+              }
+            },
+            {
+              "id": "n19",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  }
+                ],
+                "__title__": "CRC_2_T10.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/20261007_163114_482/CRC_2_T10.nd2",
+                "pixel_size_um": 0.8591388800740613,
+                "z_step_um": 15.0
+              }
+            },
+            {
+              "id": "n20",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2_T10"
+              }
+            },
+            {
+              "id": "n31",
+              "modes": {},
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 499.0,
+                    "name": "p53-GFP"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "ERK-mRuby2"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 655.0,
+                    "name": "H2B-iRFP670"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": null,
+                    "name": "TD"
+                  }
+                ],
+                "__title__": "10.6.26_5_20p_Bolus_printing.nd2",
+                "path": "G:/McGhee Lab/CRC_TF_ELISA/10.6.26_5_20p_Bolus_printing.nd2",
+                "pixel_size_um": 4.330678733005948,
+                "z_step_um": 100.0
+              }
+            },
+            {
+              "id": "n32",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "Bolus"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "input",
+        "master": null,
+        "name": "Image Input",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 142.0
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 142.0
+            },
+            "n3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 484.0
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 484.0
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 826.0
+            },
+            "n6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 826.0
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 1168.0
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 1168.0
+            },
+            "n9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 1510.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 1510.0
+            },
+            "n11": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 1852.0
+            },
+            "n12": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 1852.0
+            },
+            "n13": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 2194.0
+            },
+            "n14": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 2194.0
+            },
+            "n15": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 2536.0
+            },
+            "n16": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 2536.0
+            },
+            "n17": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 2878.0
+            },
+            "n18": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 2878.0
+            },
+            "n19": {
+              "collapsed": false,
+              "muted": false,
+              "x": 417.0,
+              "y": 3220.0
+            },
+            "n20": {
+              "collapsed": false,
+              "muted": false,
+              "x": 723.0,
+              "y": 3220.0
+            },
+            "n31": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1100.0,
+              "y": 142.0
+            },
+            "n32": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1406.0,
+              "y": 142.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n7",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n10",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n14",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n13",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n17",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n16",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n20",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n19",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n23",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n22",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n26",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n25",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n29",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n28",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_2",
+              "kind": "forward",
+              "src": "n5",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_3",
+              "kind": "forward",
+              "src": "n8",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_4",
+              "kind": "forward",
+              "src": "n11",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_5",
+              "kind": "forward",
+              "src": "n14",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_6",
+              "kind": "forward",
+              "src": "n17",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_7",
+              "kind": "forward",
+              "src": "n20",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_8",
+              "kind": "forward",
+              "src": "n23",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_9",
+              "kind": "forward",
+              "src": "n26",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n40",
+              "dst_socket": "file_10",
+              "kind": "forward",
+              "src": "n29",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n41",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n40",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n42",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n41",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n43",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n40",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T1"
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T1"
+              }
+            },
+            {
+              "id": "n4",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T2"
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T2"
+              }
+            },
+            {
+              "id": "n7",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T3"
+              }
+            },
+            {
+              "id": "n8",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T3"
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T4"
+              }
+            },
+            {
+              "id": "n11",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T4"
+              }
+            },
+            {
+              "id": "n13",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T5"
+              }
+            },
+            {
+              "id": "n14",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T5"
+              }
+            },
+            {
+              "id": "n16",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T6"
+              }
+            },
+            {
+              "id": "n17",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T6"
+              }
+            },
+            {
+              "id": "n19",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T7"
+              }
+            },
+            {
+              "id": "n20",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T7"
+              }
+            },
+            {
+              "id": "n22",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T8"
+              }
+            },
+            {
+              "id": "n23",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T8"
+              }
+            },
+            {
+              "id": "n25",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T9"
+              }
+            },
+            {
+              "id": "n26",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T9"
+              }
+            },
+            {
+              "id": "n28",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:CRC_2_T10"
+              }
+            },
+            {
+              "id": "n29",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {
+                "__title__": "Max-Z T10"
+              }
+            },
+            {
+              "id": "n40",
+              "modes": {},
+              "op_key": "util.timeseries",
+              "params": {
+                "__title__": "CRC_2 T1-T10 by acquisition clock"
+              }
+            },
+            {
+              "id": "n41",
+              "modes": {},
+              "op_key": "registration.stabilize",
+              "params": {
+                "__locked__": [
+                  "ref_channel"
+                ],
+                "ref_channel": 1,
+                "__title__": "Stabilize per tile (ERK) - removes plate drift AND tile-mean flow"
+              }
+            },
+            {
+              "id": "n42",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2 series (stabilized)"
+              }
+            },
+            {
+              "id": "n43",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2 series"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg2",
+        "kind": "refine",
+        "master": null,
+        "name": "Image Refinement",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 120.0
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 120.0
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 358.0
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 358.0
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 596.0
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 596.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 834.0
+            },
+            "n11": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 834.0
+            },
+            "n13": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 1072.0
+            },
+            "n14": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 1072.0
+            },
+            "n16": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 1310.0
+            },
+            "n17": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 1310.0
+            },
+            "n19": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 1548.0
+            },
+            "n20": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 1548.0
+            },
+            "n22": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 1786.0
+            },
+            "n23": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 1786.0
+            },
+            "n25": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 2024.0
+            },
+            "n26": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 2024.0
+            },
+            "n28": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 2262.0
+            },
+            "n29": {
+              "collapsed": false,
+              "muted": false,
+              "x": 414.0,
+              "y": 2262.0
+            },
+            "n40": {
+              "collapsed": false,
+              "muted": false,
+              "x": 900.0,
+              "y": 1100.0
+            },
+            "n41": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1250.0,
+              "y": 1000.0
+            },
+            "n42": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1600.0,
+              "y": 1000.0
+            },
+            "n43": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1250.0,
+              "y": 1250.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n5",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n6",
+              "dst_socket": "regions",
+              "kind": "forward",
+              "src": "n4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n7",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n6",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n7",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n9",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n8",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n9",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "reference",
+              "kind": "forward",
+              "src": "n17",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n10",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n13",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n12",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n14",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n13",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n15",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n14",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n16",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n15",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n17",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n16",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n18",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n6",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n19",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n18",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n19",
+              "dst_socket": "reference",
+              "kind": "forward",
+              "src": "n17",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n20",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n19",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg2:CRC_2 series (stabilized)"
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "channels": "1",
+                "__title__": "ERK-mRuby2"
+              }
+            },
+            {
+              "id": "n3",
+              "modes": {},
+              "op_key": "enhance.gaussian",
+              "params": {
+                "sigma": 3.4,
+                "__title__": "ERK smoothed ~1 cell body"
+              }
+            },
+            {
+              "id": "n4",
+              "modes": {
+                "method": "fixed"
+              },
+              "op_key": "analysis.threshold",
+              "params": {
+                "threshold": 110.0,
+                "name": "cells",
+                "__title__": "Cell gate: ERK > 110 (gel ~62, cells >150)"
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "channels": "2",
+                "__title__": "H2B-iRFP670"
+              }
+            },
+            {
+              "id": "n6",
+              "modes": {
+                "extent": "frame",
+                "keep": "inside",
+                "fill": "zero"
+              },
+              "op_key": "util.crop_region",
+              "params": {
+                "region": "cells",
+                "__title__": "H2B inside cells (drops LLS gel particles)"
+              }
+            },
+            {
+              "id": "n7",
+              "modes": {},
+              "op_key": "enhance.gamma",
+              "params": {
+                "gamma": 0.5
+              }
+            },
+            {
+              "id": "n8",
+              "modes": {
+                "method": "log"
+              },
+              "op_key": "detect.spots",
+              "params": {
+                "min_radius": 3.0,
+                "max_radius": 6.0,
+                "threshold": 0.03,
+                "name": "spots"
+              }
+            },
+            {
+              "id": "n9",
+              "modes": {
+                "target": "point",
+                "method": "centroid"
+              },
+              "op_key": "track.objects",
+              "params": {
+                "points": "spots",
+                "max_distance": 8.0,
+                "min_track_length": 3,
+                "max_frame_gap": 1
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {
+                "target": "point",
+                "reference": "layer",
+                "coords": "stage"
+              },
+              "op_key": "track.directionality",
+              "params": {
+                "points": "spots",
+                "ref_labels": "bolus",
+                "bin_um": 500.0,
+                "time_bin_s": 21600.0,
+                "__title__": "Directionality to bolus (tracks)"
+              }
+            },
+            {
+              "id": "n11",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2 tracks"
+              }
+            },
+            {
+              "id": "n12",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg1:Bolus"
+              }
+            },
+            {
+              "id": "n13",
+              "modes": {},
+              "op_key": "util.select_position",
+              "params": {
+                "position": 0,
+                "__title__": "Bolus position 0 (CRC_2)"
+              }
+            },
+            {
+              "id": "n14",
+              "modes": {},
+              "op_key": "util.zproject",
+              "params": {}
+            },
+            {
+              "id": "n15",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "channels": "2",
+                "__title__": "far-red (red LLS)"
+              }
+            },
+            {
+              "id": "n16",
+              "modes": {},
+              "op_key": "enhance.gaussian",
+              "params": {
+                "sigma": 13.0
+              }
+            },
+            {
+              "id": "n17",
+              "modes": {
+                "method": "threshold",
+                "level": "otsu"
+              },
+              "op_key": "analysis.segment",
+              "params": {
+                "name": "bolus",
+                "min_area": 100000.0,
+                "__title__": "Bolus = Otsu on far-red, >= 0.1 mm2"
+              }
+            },
+            {
+              "id": "n18",
+              "modes": {
+                "reference_mode": "previous_frame"
+              },
+              "op_key": "analysis.piv",
+              "params": {
+                "channel": 0,
+                "window_size": 64,
+                "passes": 2,
+                "overlap": 0.5,
+                "name": "piv"
+              }
+            },
+            {
+              "id": "n19",
+              "modes": {
+                "target": "field",
+                "reference": "layer",
+                "coords": "stage"
+              },
+              "op_key": "track.directionality",
+              "params": {
+                "field": "piv",
+                "ref_labels": "bolus",
+                "bin_um": 500.0,
+                "time_bin_s": 21600.0,
+                "__title__": "Directionality to bolus (PIV field)"
+              }
+            },
+            {
+              "id": "n20",
+              "modes": {},
+              "op_key": "page.output",
+              "params": {
+                "name": "CRC_2 piv"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg3",
+        "kind": "process",
+        "master": null,
+        "name": "Image Processing",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 300.0
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 120.0
+            },
+            "n3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 120.0
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 870.0,
+              "y": 120.0
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 420.0
+            },
+            "n6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1140.0,
+              "y": 420.0
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1410.0,
+              "y": 420.0
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1680.0,
+              "y": 420.0
+            },
+            "n9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1950.0,
+              "y": 420.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2250.0,
+              "y": 420.0
+            },
+            "n11": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2550.0,
+              "y": 420.0
+            },
+            "n12": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 900.0
+            },
+            "n13": {
+              "collapsed": false,
+              "muted": false,
+              "x": 330.0,
+              "y": 900.0
+            },
+            "n14": {
+              "collapsed": false,
+              "muted": false,
+              "x": 600.0,
+              "y": 900.0
+            },
+            "n15": {
+              "collapsed": false,
+              "muted": false,
+              "x": 870.0,
+              "y": 900.0
+            },
+            "n16": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1140.0,
+              "y": 900.0
+            },
+            "n17": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1410.0,
+              "y": 900.0
+            },
+            "n18": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1410.0,
+              "y": 700.0
+            },
+            "n19": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2250.0,
+              "y": 760.0
+            },
+            "n20": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2550.0,
+              "y": 760.0
+            }
+          }
+        },
+        "zones": []
+      },
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n7",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n1",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n9",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n12",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n13",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n14",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "n1",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg3:CRC_2 tracks"
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "page.input",
+              "params": {
+                "source": "pg3:CRC_2 piv"
+              }
+            },
+            {
+              "id": "n3",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "spots",
+                "x": "ref_dist_bin_um",
+                "y": "speed_um_s",
+                "group_by": "",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "speed_um_s",
+                "title": "CRC_2 tracks: speed_um_s vs distance (pooled)"
+              }
+            },
+            {
+              "id": "n4",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "spots",
+                "x": "ref_dist_bin_um",
+                "y": "speed_um_s",
+                "group_by": "time_bin_h",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "speed_um_s",
+                "title": "CRC_2 tracks: speed_um_s vs distance (6 h windows)"
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "spots",
+                "x": "ref_dist_bin_um",
+                "y": "v_toward_um_s",
+                "group_by": "",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "v_toward_um_s",
+                "title": "CRC_2 tracks: v_toward_um_s vs distance (pooled)"
+              }
+            },
+            {
+              "id": "n6",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "spots",
+                "x": "ref_dist_bin_um",
+                "y": "v_toward_um_s",
+                "group_by": "time_bin_h",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "v_toward_um_s",
+                "title": "CRC_2 tracks: v_toward_um_s vs distance (6 h windows)"
+              }
+            },
+            {
+              "id": "n7",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "spots",
+                "x": "ref_dist_bin_um",
+                "y": "cos_toward",
+                "group_by": "",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "cos_toward",
+                "title": "CRC_2 tracks: cos_toward vs distance (pooled)"
+              }
+            },
+            {
+              "id": "n8",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "spots",
+                "x": "ref_dist_bin_um",
+                "y": "cos_toward",
+                "group_by": "time_bin_h",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "cos_toward",
+                "title": "CRC_2 tracks: cos_toward vs distance (6 h windows)"
+              }
+            },
+            {
+              "id": "n9",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "piv",
+                "x": "ref_dist_bin_um",
+                "y": "speed_um_s",
+                "group_by": "",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "speed_um_s",
+                "title": "CRC_2 PIV: speed_um_s vs distance (pooled)"
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "piv",
+                "x": "ref_dist_bin_um",
+                "y": "speed_um_s",
+                "group_by": "time_bin_h",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "speed_um_s",
+                "title": "CRC_2 PIV: speed_um_s vs distance (6 h windows)"
+              }
+            },
+            {
+              "id": "n11",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "piv",
+                "x": "ref_dist_bin_um",
+                "y": "v_toward_um_s",
+                "group_by": "",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "v_toward_um_s",
+                "title": "CRC_2 PIV: v_toward_um_s vs distance (pooled)"
+              }
+            },
+            {
+              "id": "n12",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "piv",
+                "x": "ref_dist_bin_um",
+                "y": "v_toward_um_s",
+                "group_by": "time_bin_h",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "v_toward_um_s",
+                "title": "CRC_2 PIV: v_toward_um_s vs distance (6 h windows)"
+              }
+            },
+            {
+              "id": "n13",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "piv",
+                "x": "ref_dist_bin_um",
+                "y": "cos_toward",
+                "group_by": "",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "cos_toward",
+                "title": "CRC_2 PIV: cos_toward vs distance (pooled)"
+              }
+            },
+            {
+              "id": "n14",
+              "modes": {
+                "domain": "point",
+                "kind": "line_markers",
+                "error": "sem",
+                "error_style": "band"
+              },
+              "op_key": "plot.xy",
+              "params": {
+                "table": "piv",
+                "x": "ref_dist_bin_um",
+                "y": "cos_toward",
+                "group_by": "time_bin_h",
+                "x_lines": "1651,2924,4005",
+                "x_line_label": "bolus edge (nearest),bolus r_eq,bolus edge (farthest)",
+                "x_label": "distance from bolus centroid (um)",
+                "y_label": "cos_toward",
+                "title": "CRC_2 PIV: cos_toward vs distance (6 h windows)"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg4",
+        "kind": "analyze",
+        "master": null,
+        "name": "Analysis",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "n1": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 200.0
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 900.0
+            },
+            "n3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 420.0,
+              "y": 200.0
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 780.0,
+              "y": 200.0
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1140.0,
+              "y": 200.0
+            },
+            "n6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 200.0
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1860.0,
+              "y": 200.0
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2220.0,
+              "y": 200.0
+            },
+            "n9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 420.0,
+              "y": 900.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 780.0,
+              "y": 900.0
+            },
+            "n11": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1140.0,
+              "y": 900.0
+            },
+            "n12": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1500.0,
+              "y": 900.0
+            },
+            "n13": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1860.0,
+              "y": 900.0
+            },
+            "n14": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2220.0,
+              "y": 900.0
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

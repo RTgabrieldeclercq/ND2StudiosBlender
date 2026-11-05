@@ -15,7 +15,6 @@ from nodegraph.registry import (Granularity, InBool, InDataset, InFloat, InInt, 
                                 OutDataset)
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.placement_entry import handedness_for as _handedness_for
 from nodegraph.catalog._shared.placement_entry import overlay_entry as _overlay_entry
 from nodegraph.catalog._shared.placement_entry import overlay_settings
 from nodegraph.catalog._shared.placement_entry import plan_kwargs as _plan_kwargs
@@ -163,15 +162,11 @@ def _compute_overlay(ctx: EvalContext) -> Dataset:
     # The recipe entry for THIS pairing. Plain JSON-shaped values only: the recipe rides in
     # `metadata`, which folds into `output_fingerprint`, so anything exotic in here would
     # make the fingerprint depend on object identity.
-    # Handedness is DERIVED for an already-stitched secondary: its canvas is in stage
-    # coordinates, so flipping it again mirrors the mosaic (`handedness_for`).
-    flip_x, flip_y, hand_warn = _handedness_for(sec, s["flip_x"], s["flip_y"])
-    entry = overlay_entry(
-        ctx.node_id, plan, {**s, "flip_x": flip_x, "flip_y": flip_y},
-        context=_context_boxes(ctx, ds, sec, plan, offset))
-    if hand_warn:
-        entry["warnings"] = list(entry.get("warnings") or ()) + list(hand_warn)
-        entry["note"] = str(entry.get("note") or "") + "  ·  Flip inert (stitched secondary)"
+    # Flip X/Y apply to a stage-Stitched secondary exactly as to a camera field: a mosaic keeps
+    # each tile's pixels as taken, so it is camera-handed (2026-10-16). The entry also records
+    # them as the PRIMARY's handedness (`frame_flip`), for a primary that is not a canvas.
+    entry = overlay_entry(ctx.node_id, plan, s,
+                          context=_context_boxes(ctx, ds, sec, plan, offset))
     recipe = list(_overlay_of(ds) or ({"node": "primary", "role": "base"},))
     if union and not base_is_canvas:
         # The canvas is blank, so the PRIMARY must be drawn onto it too — as a source of its
@@ -186,10 +181,9 @@ def _compute_overlay(ctx: EvalContext) -> Dataset:
         if p_plan.refusals:
             raise ValueError("Overlay cannot place the primary on the union canvas:\n  - "
                              + "\n  - ".join(p_plan.refusals))
-        pfx, pfy, _pw = _handedness_for(ds, s["flip_x"], s["flip_y"])
         recipe.append(overlay_entry(
             f"{ctx.node_id}#primary", p_plan,
-            {"blend": "add", "flip_x": pfx, "flip_y": pfy,
+            {"blend": "add", "flip_x": s["flip_x"], "flip_y": s["flip_y"],
              "z_sampling": s["z_sampling"]}))
     out = dst.with_metadata(**{OVERLAY_KEY: recipe + [entry]})
     if modes.get("output") == "resample":
@@ -234,9 +228,11 @@ def _bake_resample(ctx: EvalContext, ds: Dataset, sec: Dataset, entry: dict) -> 
 
     Cost is real and paid once: this reads every overlapping tile of the secondary for every
     (m, t, z) of the primary, which is why the footprint resolves to ``MULTI_VIEW`` in this
-    mode and stays ``TILEABLE`` in the other.
+    mode and stays ``TILEABLE`` in the other. Of each tile it reads only the window the field
+    covers, at level 0, so the baked channel carries the secondary's NATIVE pixels wherever
+    the primary is finer than it (2026-10-29: it used to average large tiles down first).
     """
-    from nodegraph.placement import compose_secondary_plane, paired_t
+    from nodegraph.placement import compose_secondary_plane, paired_t, pixel_window
 
     prov = ds.image
     sprov = sec.image
@@ -270,12 +266,20 @@ def _bake_resample(ctx: EvalContext, ds: Dataset, sec: Dataset, entry: dict) -> 
                     for z_sec, w in _z_pick(entry, sec.metadata, sax, int(hits[0][0]),
                                             ds.metadata, ax, z, z_um):
 
-                        # `_want` (the fractional window the compositor needs) is ignored:
-                        # this already reads level 0, so the whole tile IS the raw data and
-                        # there is nothing a window would buy but a second code path.
+                        # Level 0, and only the window the compositor needs (`_want`, snapped
+                        # out to whole pixels): the secondary is then drawn at its own
+                        # resolution. Reading the whole tile used to let a large tile behind a
+                        # small field be averaged down before it was magnified (a 0.86 µm/px CRC
+                        # tile under a 294 µm TFM field baked at 1.7 µm/px) — and read ~30x the
+                        # pixels it drew.
                         def read_tile(j, _want=None, _t=t_sec, _z=z_sec):
-                            return sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
-                                                    0, sax.y, 0, sax.x)
+                            if _want is None:
+                                return sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
+                                                        0, sax.y, 0, sax.x)
+                            y0, y1, x0, x1 = pixel_window(_want, sax.y, sax.x)
+                            plane = sprov.get_region(0, int(j), int(_t), int(_z), sec_c,
+                                                     y0, y1, x0, x1)
+                            return plane, (y0 / sax.y, y1 / sax.y, x0 / sax.x, x1 / sax.x)
 
                         composed = compose_secondary_plane(
                             entry, (ax.y, ax.x), ds.metadata, ax, m,
@@ -434,6 +438,13 @@ register_node(
                "scope. The default matches Stitch's, so a mosaic and an overlay of the "
                "same file can never disagree about which way is right. If a stitched "
                "montage from this scope comes out mirrored, flip it here too.\n\n"
+               "It applies to BOTH files unless the primary is an Experiment Canvas: the "
+               "secondary is sampled in this handedness, and the primary's own pixel grid "
+               "is walked in it, so a feature lands where the primary shows it. A "
+               "stage-Stitched mosaic keeps its tiles' pixels as taken, so it is "
+               "camera-handed and takes the flip exactly like a raw field. Wrong, it "
+               "mirrors the secondary about the primary's centre — the MEASURED channel "
+               "under Output 'resample' too.\n\n"
                "Under Canvas = union it ALSO sets the canvas's orientation (on the Overlay "
                "that starts the canvas): on (the default) runs stage +X to the right, tiles "
                "joining at their seams; toggling it mirrors the WHOLE picture — every file, "
@@ -442,9 +453,10 @@ register_node(
         InBool("flip_y", "Flip Y", field=False, default=False,
                description=
                "Whether image +y runs along stage −y. As Flip X, and defaulted to match "
-               "Stitch for the same reason. Handedness affects only which way the "
-               "secondary's pixels are sampled — never which tiles are chosen, since a "
-               "mirrored field still occupies the same patch of stage. Under Canvas = union "
+               "Stitch for the same reason, and like it applies to both files unless the "
+               "primary is a canvas. Handedness changes where the secondary is drawn — "
+               "never which tiles are chosen, since a mirrored field still occupies the "
+               "same patch of stage. Under Canvas = union "
                "it also sets the canvas's top-to-bottom orientation, as Flip X does "
                "left-to-right."),
         InFloat("min_coverage", "Coverage floor", unit="", field=False, default=0.0,
@@ -608,7 +620,9 @@ register_node(
                         "files that share no field (adjacent regions of a well, other wells), "
                         "which would otherwise draw nothing. The primary is drawn onto it as a "
                         "source with its own LUT; chain further union Overlays and the canvas "
-                        "grows to hold every file. The output is that canvas (one blank field), "
+                        "grows to hold every file. In the Viewer every file then keeps its OWN "
+                        "M, T and Z strips (no file follows another's clock or focus), and Play "
+                        "all steps them together. The output is that canvas (one blank field), "
                         "not the primary, so measure on a branch before the Overlay. Display "
                         "only — refused under `resample`.",
                 })],

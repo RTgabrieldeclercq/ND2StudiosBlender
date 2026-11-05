@@ -2200,6 +2200,18 @@ Nothing is blocking; these are the honest edges.
     draw the overlay 456 px from where a bake put it. The general lesson: a param that answers a
     question an upstream node has already answered is not a preference, it is inapplicable, and
     the honest form is to derive it and say so rather than ship a default the user finds by eye.
+    **Superseded 2026-10-16: the diagnosis was wrong.** A stage-Stitched mosaic keeps each
+    tile's pixels as taken, so it is camera-handed, not "in stage coordinates". The real fault
+    was the compositor's: it walked every non-canvas primary toward stage +x, the mirror of
+    this scope's camera. With two stitched files sharing nearly one centre, forcing the flip
+    off happened to cancel that; elsewhere it mirrored, worst on an Experiment Canvas. The
+    compositor now walks a non-canvas primary in the entry's `frame_flip`
+    (`placement.frame_mapping`), and `handedness_for` is gone. Synthetic ground truth went
+    from r 0.05–0.36 to 0.998 off a canvas, and on the IL-8 spheroid the stitched-vs-tiles
+    bake IoU went from 0.73 to 0.97.
+    `selftest::test_placement_handedness_ground_truth` pins it. The lesson above stands; only
+    its example was wrong. Before deriving a param inert, check the derivation against ground
+    truth, not against the one case that prompted it.
 * **Per-channel display state now survives** (V2.23, same report). Contrast is keyed
   `(node_id, channel)` and was *also* being cleared on every node switch — redundant, since the
   key already namespaces it, and it threw away the one thing that cannot be recomputed: a window

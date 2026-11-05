@@ -168,7 +168,7 @@ def _label_table(labels: np.ndarray, k: int, areas: np.ndarray, cz: np.ndarray,
 
 def label_components(mask: np.ndarray, connectivity: int, *, m: int = 0, t: int = 0,
                      c: int = 0, z_index: int = 0, layer: Optional[str] = None,
-                     b: Optional[int] = None
+                     b: Optional[int] = None, whole: bool = False
                      ) -> Tuple[np.ndarray, StructureTable]:
     """Label a 2D plane or 3D volume ``mask`` (nonzero = foreground) into connected
     regions and return ``(label_raster, table)``. Ids are **raster-canonical**
@@ -183,24 +183,37 @@ def label_components(mask: np.ndarray, connectivity: int, *, m: int = 0, t: int 
     C-order so the raster + table are **byte-identical** to the flood-fill (same
     connectivity ⇒ same partition; only the numbering is normalized). Falls back to the
     flood-fill if scipy is absent (the core stays importable without scipy).
+
+    ``whole`` (2026-10-13): ALL the foreground is one region — id 1, its area the whole
+    foreground's, its centroid the foreground's — whatever its connectivity. For a mask that
+    is one thing per frame however it is cut up: a background (the frame minus the objects)
+    that two touching objects split into pockets is still ONE background, and a per-frame
+    join needs exactly one row for it. Pure numpy; ``connectivity`` is still validated.
     """
     fg = np.asarray(mask) != 0                       # boolean foreground (m is the M-index)
     if fg.ndim not in (2, 3):
         raise ValueError(f"mask must be 2D or 3D, got {fg.ndim}D")
     rank = _connectivity_rank(fg.ndim, connectivity)     # validate (shared with the offsets)
-    try:
-        from scipy import ndimage as ndi
-    except ImportError:                                   # no scipy → the reference flood-fill
-        return _label_components_flood(fg, connectivity, m=m, t=t, c=c,
-                                       z_index=z_index, layer=layer, b=b)
-    raw, num = ndi.label(fg, structure=ndi.generate_binary_structure(fg.ndim, rank))
-    labels, k = _canonical_relabel(raw, num)
-    areas = np.bincount(labels.ravel(), minlength=k + 1)[1:k + 1].astype(np.int64)
-    if k:
-        com = np.atleast_2d(np.asarray(
-            ndi.center_of_mass(fg, labels, np.arange(1, k + 1)), dtype=float))
+    if whole:
+        k = int(fg.any())
+        labels = fg.astype(np.int64)
+        areas = np.array([int(fg.sum())], dtype=np.int64)[:k]
+        com = (np.array([[float(i.mean()) for i in np.nonzero(fg)]], dtype=float) if k
+               else np.zeros((0, fg.ndim), dtype=float))
     else:
-        com = np.zeros((0, fg.ndim), dtype=float)
+        try:
+            from scipy import ndimage as ndi
+        except ImportError:                               # no scipy → the reference flood-fill
+            return _label_components_flood(fg, connectivity, m=m, t=t, c=c,
+                                           z_index=z_index, layer=layer, b=b)
+        raw, num = ndi.label(fg, structure=ndi.generate_binary_structure(fg.ndim, rank))
+        labels, k = _canonical_relabel(raw, num)
+        areas = np.bincount(labels.ravel(), minlength=k + 1)[1:k + 1].astype(np.int64)
+        if k:
+            com = np.atleast_2d(np.asarray(
+                ndi.center_of_mass(fg, labels, np.arange(1, k + 1)), dtype=float))
+        else:
+            com = np.zeros((0, fg.ndim), dtype=float)
     if fg.ndim == 2:
         cy, cx = com[:, 0], com[:, 1]
         cz = np.full(k, float(z_index))                  # 2D: z is the plane index

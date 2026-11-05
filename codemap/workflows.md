@@ -194,6 +194,16 @@ anchors: sym:nodelab_v2.runner.EngineRunner, file:nodelab_v2/ingest.py
    `frame_datetime` (2026-10-02; the Viewer's timestamp overlay and the Timeseries Builder
    read it), `stage_layout_source`, `acquisition_start`, and the per-M `position_name` —
    each best-effort, and dropped whole rather than padded when the file carries it short.
+   **The clock is UTC and rebuilt from frame 0's raw stamp** (2026-10-13,
+   `nodelab_v2.nd2_acquisition.frame_jd`): `relativeTimeMs` runs from the start of the NIS
+   *run* — shared by every file of a JOBS run — and the SDK's per-frame
+   `absoluteJulianDayNumber` adds frame 0's offset into it twice, which interleaved the
+   CRC_1_T1..T5 series out of order. `frame_datetime` and `acquisition_start` are LOCAL
+   time through the file's own `utc_offset_s` (read off its `date`; `placement.UTC_OFFSET_KEY`).
+   Beside them, `ingest.ACQUISITION_KEYS` carries the full acquisition record — sections in
+   `acquisition_info`, per-channel rows in `channel_acquisition` (laser line and power, gain,
+   detector, pinhole…; a `metadata.PER_CHANNEL_KEYS` member so a tap keeps its own rows),
+   raw text in `acquisition_text` — for the Viewer's channel tooltips and Info window.
    The per-channel **names and native colours** ride the source envelope too
    (`ingest.channel_display_seed`, V4.00 step 11g — the one function the file-pick seed and
    the runner's resolved envelope both go through), so a stream downstream of a channel tap
@@ -290,3 +300,35 @@ anchors: sym:nodelab_v2.window.MainWindow.open_node_demo, sym:nodelab_v2.demo_wi
    to a Run button.
 
 read next: INV-17 (1 min) · `nodegraph.selftest.test_node_demos` (grep, 3 min) · MANUAL §8e
+
+### WF-10 — a figure render, in the window and headless
+anchors: sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.compute_sources, sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_bundle, sym:nodelab_v2.figure_render.render_job, sym:nodelab_v2.lablink.worker.Worker._write_figure
+
+1. The window shows an Analysis page: `CanvasPanel.sync_mode` swaps the canvas to the
+   `FigureEditorPanel`, `bind(page_id)` reads the page's `FigureDocument`, and
+   `refresh_sources` asks the host for the catalog (every Page Output of the feeder pages
+   with its envelope — no pull), the sources' envelopes and their run ids
+   (`FigureDocument.run_ids` over `Workspace.compose`).
+2. *Compute sources* (`compute_sources`) fetches every run id not in hand through the
+   runner as a payload-only pull — the Viewer is not retargeted. `on_fetched` stores the
+   payload, invalidates the renders that read it and re-runs `_refresh_renders`: image and
+   montage items go to the `_RenderWorker` thread (latest request per item wins), charts and
+   tables resolve synchronously from the payload's tables (`charts_data.resolve_series`,
+   `tables.summary_table`), dependents (colour bars, histograms, scale bars, legends) read
+   their image's `Rendered`.
+3. Every item paints in page units with plain pens and the page font; `FigureScene.export`
+   renders the same scene to PNG / TIFF at the page dpi, SVG or PDF, and `export_bundle`
+   adds the SVG, `figure.json`, `legend.txt`, `provenance.json` and `data/*.csv`
+   (`nodegraph.figure.bundle`).
+4. Headless: `figure_render.build_job` serialises the composed graph, the figure, its run
+   ids and a seed spec per loader; `render_job` makes an offscreen `QApplication`, seeds a
+   `headless_engine` (a file is ingested as the GUI ingests it, a blank path is the
+   synthetic stack), binds the same panel to a `HeadlessHost` whose `fetch` pulls
+   synchronously, and exports. The CLI is `python -m nodelab_v2.figure_render`.
+5. LabLink: `recipe.draft_from_workspace` of a figure page puts the figure (document, run
+   ids after the readable renaming) in the manifest and declares a `figure` output; the
+   worker's `_write_figure` writes a job from the graph as it runs (knobs applied) and the
+   uploaded files, runs the CLI as a subprocess (Qt never loads in the worker), and
+   returns the PNG as the artifact with the bundle listed beside it.
+
+read next: CON-29 (2 min) · INV-18 (1 min) · MANUAL §2c

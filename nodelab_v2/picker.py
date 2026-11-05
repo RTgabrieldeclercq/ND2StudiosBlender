@@ -227,6 +227,10 @@ class PickRequest:
     #: what is viewed is not a canvas: on a canvas that runs toward stage −x / −y a screen
     #: delta runs against stage µm, so the nudge must reverse it. Filled by the window.
     mirror: Optional[Tuple[bool, bool]] = None
+    #: Off a canvas, the primary's own handedness (the Overlay's Flip X/Y) for ``nudge_xy``:
+    #: a camera field from this scope runs toward stage −x, so a screen delta does too
+    #: (:func:`nodegraph.placement.frame_mapping`). ``None`` on a canvas. Filled by the window.
+    frame: Optional[Tuple[bool, bool]] = None
     #: True when the gesture's controls (tool, add/cut, undo, apply) live in the node's
     #: panel instead of on the viewer (2026-10-02, Draw Regions): the viewer then takes the
     #: mouse but shows no bar — nothing about the drawing is configured on the image.
@@ -578,9 +582,9 @@ class PickSession:
         """The two clicks → the new ``(offset_y, offset_x)``: the current nudge PLUS the move
         that carries the second click (the feature as the overlay draws it) onto the first
         (the same feature in the primary). Through the engine's own
-        :func:`nodegraph.placement.nudge_delta_um`, which is flip-independent — a flip
-        mirrors which source pixel the secondary's box samples, never where the box sits.
-        The bound group is ``(y name, x name)`` in that order."""
+        :func:`nodegraph.placement.nudge_delta_um`, signed by which way the PRIMARY's grid
+        runs over the stage (``mirror`` on a canvas, ``frame`` off one); the secondary's flip
+        never enters. The bound group is ``(y name, x name)`` in that order."""
         from nodegraph.placement import nudge_delta_um
         if len(self.pts) < 2 or len(self.req.bounds) != 2:
             return {}
@@ -588,7 +592,7 @@ class PickSession:
         md = {"pixel_size_um": self.calib.lateral}
         if self.req.mirror is not None:
             md["canvas_flip"] = list(self.req.mirror)
-        got = nudge_delta_um(md, None, (ya, xa), (yb, xb))
+        got = nudge_delta_um(md, None, (ya, xa), (yb, xb), frame_flip=self.req.frame)
         if got is None:
             return {}
         base = dict(self.req.base or ())

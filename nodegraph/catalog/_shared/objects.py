@@ -18,7 +18,7 @@ from nodegraph.catalog._shared.labels import (
 )
 
 def _object_velocity_nd(track: np.ndarray, tt: np.ndarray, coords_um: np.ndarray,
-                        dt_s: float) -> np.ndarray:
+                        dt_s) -> np.ndarray:
     """Per-object velocity in µm/s, for a coordinate array of ANY dimensionality.
 
     ``coords_um`` is ``(N, D)`` slowest-first — ``(y, x)`` in 2D, ``(z, y, x)`` in 3D —
@@ -28,6 +28,12 @@ def _object_velocity_nd(track: np.ndarray, tt: np.ndarray, coords_um: np.ndarray
     `vy` beside it. The definition (gap-aware differencing against the track's own
     previous detection, NaN at a track's first row and for untracked rows) is stated in
     full on that wrapper.
+
+    ``dt_s`` is what :func:`_frame_timebase` resolves: ONE interval (every step spans
+    ``frame gap × dt_s``), or — for a series whose frames are not evenly spaced, so it has no
+    interval — each frame's own time in seconds, an array indexed by ``t``; a step then
+    spans the real time between its two frames (2026-10-16). A row on a frame that array
+    does not cover gets no velocity rather than a guessed one.
     """
     coords_um = np.asarray(coords_um, dtype=float)
     n, d = coords_um.shape
@@ -38,9 +44,18 @@ def _object_velocity_nd(track: np.ndarray, tt: np.ndarray, coords_um: np.ndarray
     order = live[np.lexsort((tt[live], track[live]))]       # by track, then time
     tid = np.asarray(track)[order]
     edge = np.concatenate(([True], tid[1:] != tid[:-1]))    # first row of each track
-    step = np.concatenate(([np.nan], np.diff(tt[order]).astype(float)))
-    step = np.where(edge, np.nan, step)                     # a track's first row has none
-    span = step * float(dt_s)
+    if np.ndim(dt_s) == 0:
+        step = np.concatenate(([np.nan], np.diff(tt[order]).astype(float)))
+        step = np.where(edge, np.nan, step)                 # a track's first row has none
+        span = step * float(dt_s)
+    else:
+        secs = np.asarray(dt_s, dtype=float)
+        ti = np.asarray(tt, dtype=float)[order]
+        on = np.isfinite(ti) & (ti >= 0) & (ti < secs.size)
+        at = np.where(on, secs[np.clip(np.nan_to_num(ti), 0, secs.size - 1).astype(np.int64)],
+                      np.nan)
+        span = np.concatenate(([np.nan], np.diff(at)))
+        span = np.where(edge, np.nan, span)                 # a track's first row has none
     good = np.isfinite(span) & (span > 0)
     for k in range(d):
         dk = np.concatenate(([np.nan], np.diff(coords_um[order, k])))
@@ -91,8 +106,46 @@ def _InFrameInterval() -> Tuple[SocketSpec, ...]:
                     "divergence and curl LINEARLY, so getting it wrong scales your reported "
                     "µm/s by exactly the same factor; it is inert if you asked for none of "
                     "those metrics."),)
+def _frame_timebase(ctx: EvalContext, n_t: int, *, needed: bool, wanted, node: str,
+                    metadata=None):
+    """What every rate in an object-analysis node divides by: ONE interval in seconds (a
+    float), or — for a series whose frames are not evenly spaced, so it carries no
+    ``dt_s`` — each frame's own time in seconds (a float array of ``n_t``, indexed by ``t``),
+    which :func:`_object_velocity_nd` divides each step by (2026-10-16).
+
+    Resolution order — the ``frame_interval`` socket if the user set one, else the file's
+    ``dt_s``, else the series' per-frame times (its clock ``frame_time_jd``, or the
+    ``frame_time_s`` a clockless subset kept: :func:`~nodegraph.metadata.series_seconds`),
+    else **refuse** (:func:`_frame_interval_s`'s reason). ``dt_s`` comes first because the
+    rebuilt time axis (:func:`~nodegraph.metadata.retime`) only carries it when it is true
+    of every step, so an evenly spaced series computes exactly what it always did; the
+    per-frame branch is what an uneven Trim, a hand-picked Crop or a Timeseries Builder
+    whose files are unevenly spaced used to be refused for. All reads are memo-fenced
+    (``ctx.calib`` / ``ctx.meta``); ``metadata`` (the input payload's) is the fallback for
+    an envelope that does not carry the clock."""
+    if not needed:
+        return 1.0
+    override = float(ctx.params.get("frame_interval", 0.0) or 0.0)
+    if override > 0:
+        return override
+    dt = ctx.calib("dt_s")
+    if dt and float(dt) > 0:
+        return float(dt)
+    from nodegraph.metadata import FRAME_TIME_S_KEY, series_seconds
+    env_md = {"frame_time_jd": ctx.meta("frame_time_jd"),
+              FRAME_TIME_S_KEY: ctx.meta(FRAME_TIME_S_KEY)}
+    secs = series_seconds(env_md, n_t)
+    if secs is None and metadata is not None:
+        secs = series_seconds(metadata, n_t)
+    if secs is not None:
+        return np.asarray(secs, dtype=float)
+    return _frame_interval_s(ctx, needed=True, wanted=wanted, node=node)
+
+
 def _frame_interval_s(ctx: EvalContext, *, needed: bool, wanted, node: str) -> float:
-    """The seconds-per-frame every rate in an object-analysis node divides by.
+    """The seconds-per-frame every rate in an object-analysis node divides by, when it can
+    only use ONE (a node with a single-interval quantity; the per-object rates go through
+    :func:`_frame_timebase`, which falls back here).
 
     Resolution order — the ``frame_interval`` socket if the user set one, else the file's
     ``dt_s`` (memo-fenced through :meth:`EvalContext.calib`), else **refuse**.
@@ -118,10 +171,11 @@ def _frame_interval_s(ctx: EvalContext, *, needed: bool, wanted, node: str) -> f
         return float(dt)
     raise ValueError(
         f"{node}: {sorted(wanted)} are RATES (per second), and this Dataset declares no "
-        f"frame interval — dividing by a placeholder 1.0 would report µm/FRAME under a "
-        f"µm/s label. Set the `frame_interval` socket to the seconds between timepoints, "
-        f"or re-open the source if it should carry timing (an ND2's per-frame timestamps "
-        f"become `dt_s` at ingest; a plain TIFF has none). Metrics that are not rates "
+        f"frame interval and no per-frame times — dividing by a placeholder 1.0 would "
+        f"report µm/FRAME under a µm/s label. Set the `frame_interval` socket to the "
+        f"seconds between timepoints, or re-open the source if it should carry timing (an "
+        f"ND2's per-frame timestamps become `dt_s` at ingest; a plain TIFF has none). "
+        f"Metrics that are not rates "
         f"('neighbors', 'density', 'mean_area', 'intensity', 'frame_fold') need no "
         f"interval and work as they are.")
 def _object_table(ctx: EvalContext, ds: Dataset, *, node: str, allow_3d: bool = False):

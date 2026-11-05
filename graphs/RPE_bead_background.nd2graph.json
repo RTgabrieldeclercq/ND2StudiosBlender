@@ -1,0 +1,326 @@
+{
+  "app_version": "4.0.0",
+  "format_version": "3.0",
+  "workspace": {
+    "active": "pg1",
+    "next_page_seq": 2,
+    "pages": [
+      {
+        "graph": {
+          "edges": [
+            {
+              "dst": "n2",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "L",
+              "src_socket": "image"
+            },
+            {
+              "dst": "n11",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n10",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n3",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n4",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n2",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n5",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n3",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n5",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "n4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n8",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n4",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n6",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n5",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n7",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n6",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n9",
+              "dst_socket": "other",
+              "kind": "forward",
+              "src": "n7",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n9",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n8",
+              "src_socket": "out"
+            },
+            {
+              "dst": "n10",
+              "dst_socket": "data",
+              "kind": "forward",
+              "src": "n9",
+              "src_socket": "out"
+            }
+          ],
+          "nodes": [
+            {
+              "id": "L",
+              "modes": {
+                "access": "direct"
+              },
+              "op_key": "io.load",
+              "params": {
+                "__channels__": [
+                  {
+                    "color": null,
+                    "emission_nm": 571.0,
+                    "name": "R-PE"
+                  },
+                  {
+                    "color": null,
+                    "emission_nm": 651.0,
+                    "name": "Cy5"
+                  }
+                ],
+                "__title__": "Count00000 R-PE + Cy5 (Seq0002)",
+                "path": "C:\\Users\\McGheeLab - Analysis\\Downloads\\Standard Curve\\20261012_153228_769\\Count00000_ChannelR-PE,Cy5_Seq0002.nd2"
+              }
+            },
+            {
+              "id": "n10",
+              "modes": {
+                "domain": "label",
+                "op": "subtract"
+              },
+              "op_key": "math.values",
+              "params": {
+                "__title__": "Bead mean \u2212 background",
+                "a": "mean_intensity",
+                "b": "bg_mean_intensity",
+                "name": "mean_intensity_bgsub",
+                "table": "bead_corrected"
+              }
+            },
+            {
+              "id": "n11",
+              "modes": {
+                "domain": "label",
+                "op": "multiply"
+              },
+              "op_key": "math.values",
+              "params": {
+                "__title__": "Bead integrated signal \u2212 background",
+                "a": "mean_intensity_bgsub",
+                "b": "area",
+                "name": "total_intensity_bgsub",
+                "table": "bead_corrected"
+              }
+            },
+            {
+              "id": "n2",
+              "modes": {},
+              "op_key": "channel.select",
+              "params": {
+                "__locked__": [
+                  "channels"
+                ],
+                "channels": "0"
+              }
+            },
+            {
+              "id": "n3",
+              "modes": {},
+              "op_key": "analysis.roi_mask",
+              "params": {}
+            },
+            {
+              "id": "n4",
+              "modes": {},
+              "op_key": "analysis.histogram_threshold",
+              "params": {
+                "__locked__": [
+                  "min_area",
+                  "percentile_high"
+                ],
+                "min_area": 10.0,
+                "percentile_high": 98.0
+              }
+            },
+            {
+              "id": "n5",
+              "modes": {
+                "op": "subtract"
+              },
+              "op_key": "math.mask",
+              "params": {
+                "__title__": "Background = ROI \u2212 bead pixels",
+                "a": "roi_mask",
+                "b": "mask",
+                "name": "background"
+              }
+            },
+            {
+              "id": "n6",
+              "modes": {},
+              "op_key": "analysis.label",
+              "params": {
+                "__title__": "Background region",
+                "mask": "background",
+                "name": "background"
+              }
+            },
+            {
+              "id": "n7",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure background (R-PE)",
+                "labels": "background",
+                "stats": "mean,median,min,max,count"
+              }
+            },
+            {
+              "id": "n8",
+              "modes": {
+                "target": "label"
+              },
+              "op_key": "analysis.measure",
+              "params": {
+                "__title__": "Measure bead (R-PE)",
+                "labels": "labels",
+                "stats": "mean,median,max,min,sum,count"
+              }
+            },
+            {
+              "id": "n9",
+              "modes": {
+                "domain": "label",
+                "how": "left",
+                "on": "m_t",
+                "other_domain": "label"
+              },
+              "op_key": "table.join",
+              "params": {
+                "__title__": "Each bead + its frame's background",
+                "name": "bead_corrected",
+                "other_table": "background",
+                "prefix": "bg_",
+                "table": "labels"
+              }
+            }
+          ]
+        },
+        "groups": [],
+        "id": "pg1",
+        "kind": "free",
+        "master": null,
+        "name": "R-PE bead background",
+        "ui": {
+          "frames": {},
+          "nodes": {
+            "L": {
+              "collapsed": false,
+              "muted": false,
+              "x": 40.0,
+              "y": 0.0
+            },
+            "n10": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2300.0,
+              "y": 185.7
+            },
+            "n11": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2600.0,
+              "y": 185.7
+            },
+            "n2": {
+              "collapsed": false,
+              "muted": false,
+              "x": 322.3513130434783,
+              "y": 11.2825304347826
+            },
+            "n3": {
+              "collapsed": false,
+              "muted": false,
+              "x": 641.3028999999999,
+              "y": -72.84899999999999
+            },
+            "n4": {
+              "collapsed": false,
+              "muted": false,
+              "x": 647.0160999999998,
+              "y": 185.67329999999998
+            },
+            "n5": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1100.0,
+              "y": -72.8
+            },
+            "n6": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1400.0,
+              "y": -72.8
+            },
+            "n7": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1700.0,
+              "y": -72.8
+            },
+            "n8": {
+              "collapsed": false,
+              "muted": false,
+              "x": 1100.0,
+              "y": 185.7
+            },
+            "n9": {
+              "collapsed": false,
+              "muted": false,
+              "x": 2000.0,
+              "y": 185.7
+            }
+          }
+        },
+        "zones": []
+      }
+    ]
+  }
+}

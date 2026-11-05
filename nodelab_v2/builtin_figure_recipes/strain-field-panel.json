@@ -1,0 +1,36 @@
+{
+  "format": "nd2studios.figure-recipe/1",
+  "name": "Strain / speed field panel",
+  "description": "A measured field (strain, speed, displacement) as a heat map over the image with its colour bar, and the distribution of the field's values beside it.",
+  "goal": "composite",
+  "tags": ["field", "PIV", "strain"],
+  "slots": [
+    {"id": "field", "needs": "fields", "label": "an image carrying a measured point field (PIV, deformation, cell speed)"}
+  ],
+  "figure": {
+    "goal": "composite",
+    "page": {"preset": "double_column", "width_mm": 180.0, "height_mm": 120.0, "dpi": 300,
+             "style": "paper", "font": "sans", "font_pt": 8.0, "palette": "colorblind",
+             "letters": "A"},
+    "sources": [{"id": "field", "source": "slot:field"}],
+    "items": [
+      {"id": "heat", "kind": "image", "rect_mm": [4.0, 4.0, 84.0, 63.0], "letter": "A",
+       "image": {"source": "field", "frame": {"m": 0, "t": "cursor", "z": "max"},
+                 "channels": [],
+                 "layers": [{"domain": "point", "layer": "slot:field.fields", "kind": "field",
+                             "column": "slot:field.fields.column", "cmap": "turbo",
+                             "look": {"style": "smooth"}, "opacity": 65,
+                             "limits": {"mode": "series"}}],
+                 "decor": {"scale_bar_um": 20.0}}},
+      {"id": "bar", "kind": "colorbar", "rect_mm": [4.0, 70.0, 40.0, 8.0],
+       "of": {"item": "heat", "layer": 0}, "label": "", "orientation": "horizontal",
+       "ticks": 5},
+      {"id": "values", "kind": "chart", "rect_mm": [96.0, 4.0, 80.0, 56.0], "letter": "B",
+       "chart": {"kind": "distribution", "sub_kind": "histogram", "source": "field",
+                 "domain": "point", "table": "slot:field.fields",
+                 "value": "slot:field.fields.column", "bins": 30,
+                 "axes": {"title": "", "x_label": "", "y_label": "points"}}}
+    ],
+    "links": []
+  }
+}

@@ -14,7 +14,7 @@ from nodegraph.provider import AxisConcatProvider, ChannelMergeProvider
 from nodegraph.registry import Granularity, InBool, InDataset, InFloat, Mode, OutDataset
 
 from nodegraph.catalog._base import register_node
-from nodegraph.catalog._shared.placement_entry import handedness_for, overlay_entry
+from nodegraph.catalog._shared.placement_entry import overlay_entry
 from nodegraph.catalog._shared.sampling import _sampling_of
 
 # ── Merge (§0 grill, 2026-09-15 — retires channel.merge) ─────────────────────────
@@ -186,10 +186,11 @@ def _merge_channel_axis(ctx: EvalContext, files: Tuple[Dataset, ...]) -> Dataset
                              + "\n".join(f"  - {r}" for r in z_refuse))
 
         ax, sax = result.axes, sec.axes
-        # Handedness is DERIVED, not defaulted: an already-stitched secondary is in stage
-        # coordinates and flipping it again mirrors the mosaic — see `handedness_for`.
-        flip_x, flip_y, hand_warn = handedness_for(
-            sec, ctx.params.get("flip_x", True), ctx.params.get("flip_y", False))
+        # One handedness for every input, a stage-Stitched mosaic included (it keeps its tiles'
+        # pixels as taken), and the entry records it as the running result's too: the
+        # compositor walks a non-canvas first input in it (`placement.frame_mapping`).
+        flip_x = bool(ctx.params.get("flip_x", True))
+        flip_y = bool(ctx.params.get("flip_y", False))
         entry = overlay_entry(
             ctx.node_id, plan,
             {"blend": "add",                 # unread here: a merge composites nothing
@@ -216,7 +217,7 @@ def _merge_channel_axis(ctx: EvalContext, files: Tuple[Dataset, ...]) -> Dataset
 
         notes.append(f"input {i}: " + plan.describe(0)
                      + f"  ·  +{sax.c} channel(s)  ·  {grid.n} z @ {grid.step_um:g} um")
-        step_warnings = list(plan.warnings) + list(z_warn) + list(hand_warn)
+        step_warnings = list(plan.warnings) + list(z_warn)
         notes.extend(f"input {i} ! {w}" for w in step_warnings)
         all_warnings.extend(step_warnings)
         if plan.placed_by != "stage":
@@ -298,11 +299,21 @@ def _merge_index_axis(files: Tuple[Dataset, ...], axis: str) -> Dataset:
     out = ref.with_image(prov).reshaped_axes(prov.axes)
     out = _concat_axis_metadata(out, files, ax_name)
     if axis == "T":
-        dts = {float(v) for v in (ds.metadata.get("dt_s") for ds in files) if v is not None}
-        if len(dts) > 1:
-            # Disagreement, not absence: before/after frames are not evenly spaced from
-            # each other, so a single dt_s surviving the merge would misdescribe the seam.
-            out = out.with_metadata(dt_s=None)
+        # The time axis is rebuilt across the seam (`concat_interval`, 2026-10-16): with the
+        # concatenated per-frame clock, dt_s is what those frames really have — so an
+        # agreed in-file interval that the gap between the inputs contradicts is dropped,
+        # and a rate at the seam reads the gap itself; without a clock, the inputs'
+        # interval only when they all agree (disagreement: the frames are not evenly
+        # spaced from each other). Each input's per-frame seconds are on its OWN timeline,
+        # so they are never concatenated.
+        from nodegraph.metadata import FRAME_TIME_S_KEY, concat_interval
+        from nodegraph.placement import frame_seconds
+        secs = frame_seconds(out.metadata.get("frame_time_jd"), int(out.axes.t))
+        dt = concat_interval([ds.metadata.get("dt_s") for ds in files], secs)
+        changes: Dict[str, Any] = {"dt_s": dt}
+        if any(ds.metadata.get(FRAME_TIME_S_KEY) is not None for ds in files):
+            changes[FRAME_TIME_S_KEY] = None
+        out = out.with_metadata(**changes)
 
     note = "  ·  ".join(
         f"input {i}: {ax_name} {start}" if count <= 1
@@ -407,19 +418,19 @@ register_node(
         InBool("flip_x", "Flip X", field=False, default=True,
                available_in={"merge_axis": frozenset({"C"})},
                description=
-               "Channel merge only. Whether a later input's image +x runs along stage "
-               "−x. The file does not record how the camera is mounted, so for a RAW "
-               "field this cannot be derived — the default matches Stitch's and "
-               "Overlay's so the three can never disagree about which way is right.\n\n"
-               "INERT when that input is an already-stitched canvas: the stitch answered "
-               "this question to place its tiles, so flipping it again mirrors the "
-               "mosaic inside its own footprint."),
+               "Channel merge only. Whether image +x runs along stage −x, for every "
+               "input. The file does not record how the camera is mounted, so this cannot "
+               "be derived — the default matches Stitch's and Overlay's so the three can "
+               "never disagree about which way is right. It applies to a stage-Stitched "
+               "mosaic exactly as to a raw field (a mosaic keeps its tiles' pixels as "
+               "taken), and to the FIRST input's grid unless that is an Experiment Canvas. "
+               "Wrong, a later input lands mirrored about the first's centre."),
         InBool("flip_y", "Flip Y", field=False, default=False,
                available_in={"merge_axis": frozenset({"C"})},
                description=
-               "Channel merge only. Whether a later input's image +y runs along stage "
-               "−y. As Flip X — same default, same reason, and equally inert for an "
-               "already-stitched input."),
+               "Channel merge only. Whether image +y runs along stage −y, for every "
+               "input. As Flip X — same default, same reason, and it applies to a "
+               "stitched mosaic too."),
     ],
     outputs=[OutDataset()],
     modes=[

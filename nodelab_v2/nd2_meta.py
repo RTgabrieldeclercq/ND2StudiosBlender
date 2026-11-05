@@ -26,10 +26,16 @@ rewritten; these are extra reads beside it:
   ``frame_metadata`` FALLBACK branch, which never runs when ``f.experiment`` supplies the
   XY loop — so it came back ``[]`` on every file whose positions were planned. The
   ``XYPosLoop`` points carry ``z`` themselves, so it now costs nothing.
-* ``frame_time_jd`` — per-timepoint ``absoluteJulianDayNumber``. ``frame_timestamps_s`` is
-  ``relativeTimeMs``, whose ORIGIN is per-file: on the WellA3 pair the two relative clocks
-  start 1207.3 s apart, so comparing them across files is meaningless. The Julian day is
-  the only common clock, and it is what says GFP[k] was acquired 2415 s after 640[k].
+* ``frame_time_jd`` — per-timepoint Julian day (UTC). **Corrected 2026-10-13**: this used to
+  be the SDK's ``absoluteJulianDayNumber``, which ``nd2`` builds as frame 0's stamp PLUS the
+  frame's whole ``relativeTimeMs`` — and ``relativeTimeMs`` runs from the start of the RUN
+  (an NIS job writing several files), not from the file. So every file's clock was late by
+  its own frame 0's offset into the run: the WellA3 GFP file read 2415 s after 640 where the
+  truth is 1207.3 s (the 640 sweep ends at 1983.5 s, GFP starts at 1994.8 s), and the
+  CRC_1_T1..T5 JOBS series was interleaved out of order by the Timeseries Builder.
+  :func:`nodelab_v2.nd2_acquisition.frame_jd` composes the stamp correctly. The relative
+  clocks of files from ONE run share their origin; the Julian day is what is comparable
+  across runs.
 * ``z_home_index`` / ``z_bottom_to_top`` — the ``ZStackLoop`` anchoring. ``stagePositionUm.z``
   is CONSTANT along a stack (it is the position's nominal focus, not the per-slice piezo
   reading), so without knowing which slice that nominal Z names, a stack cannot be placed in
@@ -325,14 +331,17 @@ def read_nd2_metadata_extended(filepath):
         else:
             stage_z = [float(v) for v in stage_z]
 
-        # 2) Per-T frame times — the per-file RELATIVE clock and the absolute one.
+        # 2) Per-T frame times — the RELATIVE clock and the absolute one.
         #
-        # `relativeTimeMs` is measured from each file's own origin, so two files' values are
-        # NOT comparable: on the WellA3 pair the origins sit 1207.3 s apart, which makes a
-        # naive cross-file "nearest timestamp" match land a whole acquisition cycle off.
-        # `absoluteJulianDayNumber` is the shared wall clock and the only honest basis for
-        # matching T across files; both are carried so a within-file consumer (dt_s) keeps
-        # the cheap one.
+        # `relativeTimeMs` is measured from the start of the RUN that wrote the file (shared
+        # by every file of an NIS job), and the file holds ONE absolute stamp, frame 0's. The
+        # SDK's per-frame `absoluteJulianDayNumber` adds frame 0's offset twice (see the
+        # module docstring), so the Julian day is rebuilt from the raw stamp here:
+        #     jd[t] = jd0 + (rel[t] - rel[0]) / 86_400_000
+        # Only where the file has no readable stamp does the SDK's value stand — on such a
+        # file there is nothing to correct it with, and it is right whenever rel[0] is ~0.
+        from nodelab_v2.nd2_acquisition import frame0_stamp, frame_jd as _true_jd
+        stamp = frame0_stamp(f)
         frame_ts: List[float] = []
         frame_jd: List[float] = []
         for t in range(n_t):
@@ -344,14 +353,17 @@ def read_nd2_metadata_extended(filepath):
                   else None)
             if fm is None:
                 continue
-            ts = (
-                _safe(lambda meta=fm: float(meta.channels[0].time.relativeTimeMs)) or
-                _safe(lambda meta=fm: float(meta.relativeTimeMs))
-            )
+            # `is None`, not `or`: a frame taken at the run's very start reads 0.0 ms, which
+            # `or` treated as missing — dropping frame 0 from an ordinary file's clock.
+            ts = _safe(lambda meta=fm: float(meta.channels[0].time.relativeTimeMs))
+            if ts is None:
+                ts = _safe(lambda meta=fm: float(meta.relativeTimeMs))
             if ts is not None:
                 frame_ts.append(ts / 1000.0)
-            jd = _safe(
-                lambda meta=fm: float(meta.channels[0].time.absoluteJulianDayNumber))
+            jd = _true_jd(stamp, ts) if (stamp is not None and ts is not None) else None
+            if jd is None:
+                jd = _safe(
+                    lambda meta=fm: float(meta.channels[0].time.absoluteJulianDayNumber))
             if jd is None:
                 jd = _safe(lambda meta=fm: float(meta.absoluteJulianDayNumber))
             if jd is not None:
@@ -368,12 +380,33 @@ def read_nd2_metadata_extended(filepath):
 
         out["frame_timestamps_s"] = frame_ts
         out["frame_time_jd"] = frame_jd
+
+        # The microscope PC's time zone (2026-10-13). The Julian day is UTC; the file's own
+        # `date` is that PC's LOCAL clock at its last frame (NIS writes it at close), so the
+        # two together give the offset — see `nd2_acquisition.utc_offset`. The last frame is
+        # the last one ACQUIRED: a run stopped early freezes its remaining frames' clock at
+        # that instant, so the maximum relative time is the right one either way.
+        from nodelab_v2.nd2_acquisition import acquisition_record, utc_offset
+        last_jd = None
+        if stamp is not None:
+            ev_t = _safe(lambda: f.events(orient="list").get("Time [s]"), default=None)
+            rel_max = _safe(lambda: max(float(v) for v in ev_t if v == v) * 1000.0
+                            ) if ev_t else None
+            last_jd = _true_jd(stamp, rel_max) if rel_max is not None else None
+        first_jd = frame_jd[0] if frame_jd else (stamp[0] if stamp is not None else None)
+        text_date = _safe(lambda: (f.text_info or {}).get("date"))
+        off_s, off_src = utc_offset(text_date, [j for j in (last_jd, first_jd)
+                                                 if j is not None])
+        out["utc_offset_s"] = off_s
+        out["utc_offset_source"] = off_src
+
         # The same clock, readable: one ``YYYY-MM-DD HH:MM:SS.mmm`` per timepoint
         # (2026-10-02). Derived from the Julian day here, once, so every consumer — the
         # Viewer's timestamp, a table export, a Timeseries Builder's resolved order — shows
-        # the identical text for a frame rather than each re-deriving it.
+        # the identical text for a frame rather than each re-deriving it. LOCAL time since
+        # 2026-10-13 (it was the UTC Julian day printed as if local — 7 h ahead in the lab).
         from nodegraph.placement import jd_to_datetime_text
-        out["frame_datetime"] = [jd_to_datetime_text(j) for j in frame_jd]
+        out["frame_datetime"] = [jd_to_datetime_text(j, off_s) for j in frame_jd]
         out["stage_xy_um"] = stage_xy
         out["stage_z_um"] = stage_z
         out["stage_layout_source"] = stage_layout_source
@@ -409,11 +442,26 @@ def read_nd2_metadata_extended(filepath):
                     break
         out["bit_depth"] = bits or None
 
-        # The human-readable acquisition date, straight from the text block. Second
-        # resolution and free-form, so it labels a readout but never drives arithmetic —
-        # `frame_time_jd` is the field to compute with.
-        out["acquisition_start"] = str(
-            _safe(lambda: (f.text_info or {}).get("date")) or "")
+        # When the acquisition STARTED, local time. Until 2026-10-13 this was the text
+        # block's `date` verbatim — which NIS writes when the file CLOSES, i.e. the end of a
+        # 19-hour run on the lab's files, under a key that says start. It is now the first
+        # frame's own clock, in the same text as `frame_datetime`; the raw `date` is kept
+        # whole in `acquisition_text`. Labels a readout, never drives arithmetic.
+        out["acquisition_start"] = (jd_to_datetime_text(first_jd, off_s)[:19]
+                                    if first_jd is not None else
+                                    str(_safe(lambda: (f.text_info or {}).get("date")) or ""))
+
+        # Every setting the file records, display-ready (2026-10-13): laser line and power,
+        # detector, gain, offset, pinhole, emission range, scanner, objective, loops, the
+        # per-frame recorded data and the software — one row list per channel, sections for
+        # the rest, and the raw text blocks whole. See `nd2_acquisition.acquisition_record`.
+        rec = _safe(lambda: acquisition_record(
+            f, channel_names=names, frame_jd_first=first_jd,
+            frame_jd_last=last_jd if last_jd is not None else (
+                frame_jd[-1] if frame_jd else None),
+            utc_offset_s=off_s, utc_offset_source=off_src, stamp=stamp), default=None)
+        if rec:
+            out.update(rec)
         out["loops"] = [
             {
                 "type": str(_safe(lambda lp=lp: lp.type) or ""),

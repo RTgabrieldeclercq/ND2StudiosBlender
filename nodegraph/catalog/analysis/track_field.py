@@ -25,7 +25,7 @@ from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.columns import member_layer, on_layer
 from nodegraph.catalog._shared.objects import (
     _InFrameInterval,
-    _frame_interval_s,
+    _frame_timebase,
     _object_table,
     _object_velocity_nd,
 )
@@ -251,8 +251,8 @@ def _compute_track_field(ctx: EvalContext) -> Dataset:
 
     # ── displacement (µm) and the instantaneous velocity (µm/s) ────────────────
     disp_um = _displacement(work_track, tt, coords_um, reference)
-    dt_s = _frame_interval_s(ctx, needed=want_vel, wanted=("velocity",),
-                             node="track field")
+    dt_s = _frame_timebase(ctx, int(ds.axes.t), needed=want_vel, wanted=("velocity",),
+                           node="track field", metadata=ds.metadata)
     vel_um_s = (_object_velocity_nd(work_track, tt, coords_um, dt_s)
                 if want_vel else None)
 
@@ -370,7 +370,9 @@ def _compute_track_field(ctx: EvalContext) -> Dataset:
         prov["track_field_poisson_ratio"] = float(ctx.params.get("poisson_ratio", 0.45))
         if not is_3d:
             prov["track_field_plane"] = plane
-    if want_vel:
+    if want_vel and np.ndim(dt_s) == 0:
+        # one interval: stamped. Per-frame times (an unevenly spaced series) have none to
+        # stamp — each step used its own gap, recorded in the series' clock.
         prov["track_field_dt_s"] = float(dt_s)
     return ds.with_structure(table).with_metadata(**prov)
 

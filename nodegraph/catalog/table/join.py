@@ -23,7 +23,12 @@ _JOIN_KEYSETS: Dict[str, Tuple[str, ...]] = {
     "id": ("id",),
     "m_t": ("m", "t"),
     "track": ("track_id", "t"),
+    "label": ("id", "m", "t"),
 }
+#: ``on`` → the LEFT table's column for a key the other table names differently. ``label``
+#: (2026-11-02) matches a pixel table's rows (Measure, Members = pixel), whose own ``id`` is
+#: a row number and whose region is ``label_id``, to the region's row of the object table.
+_LEFT_KEYS: Dict[str, Dict[str, str]] = {"label": {"id": "label_id"}}
 _DEFAULT_NAME = "joined"
 _DEFAULT_PREFIX = "other_"
 #: never copied from the other table: its coordinates and batch member describe the SAME
@@ -66,7 +71,9 @@ def _compute_table_join(ctx: EvalContext) -> Dataset:
       measurements of one segmentation), ``id`` (globally unique ids), ``m_t`` (a per-frame
       table onto every object of that frame), ``track`` (``track_id`` and ``t`` — a Track
       table's per-frame columns onto the tracked objects; untracked ``track_id`` 0 never
-      matches). The batch member ``b`` joins the key when both tables carry it;
+      matches), ``label`` (the left's ``label_id`` against the other's ``id``, plus ``m``
+      and ``t`` — a pixel table onto its regions, 2026-11-02). The batch member ``b`` joins
+      the key when both tables carry it;
     * the OTHER table may hold each key once (else the match is ambiguous and is refused —
       aggregate it first); the left may repeat a key (many-to-one);
     * ``how`` left keeps every left row (unmatched: NaN numbers, empty text); inner keeps
@@ -107,8 +114,10 @@ def _compute_table_join(ctx: EvalContext) -> Dataset:
     keys = list(_JOIN_KEYSETS.get(on, _JOIN_KEYSETS["id_m_t"]))
     if BATCH_COLUMN in left and BATCH_COLUMN in right:
         keys.append(BATCH_COLUMN)
-    for side, cols, lyr in (("left", left, left_layer), ("other", right, right_layer)):
-        miss = [k for k in keys if k not in cols]
+    lnames = [_LEFT_KEYS.get(on, {}).get(k, k) for k in keys]
+    for side, cols, lyr, names in (("left", left, left_layer, lnames),
+                                   ("other", right, right_layer, keys)):
+        miss = [k for k in names if k not in cols]
         if miss:
             raise ValueError(
                 f"Table Join: the {side} table {lyr!r} has no {miss} column(s) for On "
@@ -131,7 +140,7 @@ def _compute_table_join(ctx: EvalContext) -> Dataset:
             f"({', '.join(keys)}), so a left row would match several — the join is "
             f"ambiguous. Aggregate the other table first (Table Aggregate), or join on a "
             f"finer key.")
-    lkeys = _row_keys(left, keys, nl)
+    lkeys = _row_keys(left, lnames, nl)
     match = np.array([index.get(k, -1) if k is not None and not (
         on == "track" and k[0] == 0) else -1 for k in lkeys], dtype=np.int64)
     rows = np.arange(nl) if how == "left" else np.flatnonzero(match >= 0)
@@ -248,6 +257,11 @@ register_node(
                         "background level) onto every object of that frame.",
                  "track": "track_id and frame — a Track table's per-frame columns onto the "
                           "tracked objects; an untracked object (track_id 0) never matches.",
+                 "label": "The left row's `label_id` against the other row's `id`, in the "
+                          "same position and frame — a PIXEL table (Measure, Members = "
+                          "pixel) on the left, its regions' Label table as Other, so every "
+                          "pixel carries its object's area, shape and mean. Background "
+                          "pixels (label_id 0) find no region.",
              }),
         Mode("how", ["left", "inner"], default="left", label="How",
              description="What happens to a left row with no match.",
@@ -264,5 +278,5 @@ register_node(
                                       "track": frozenset({Domain.TRACK})}},
     extra_layers=_join_layers, adds_columns=_join_columns,
     description="Add another table's columns to a Label, Point or Track table, matching rows "
-                "on id+position+frame, id, position+frame or track — left or inner — as a "
-                "new joined table.")
+                "on id+position+frame, id, position+frame, track, or a pixel's region "
+                "(label_id) — left or inner — as a new joined table.")

@@ -11510,7 +11510,10 @@ def test_measure_stage_position() -> None:
         assert a is not None, f"missing Point column {name!r}"
         return np.asarray(a.values, dtype=float)
 
-    want_sx = box_x0[mm] + xx * 0.5
+    # DEFAULT_FLIP (2026-10-13): image +x runs along stage -x, +y along stage +y — the
+    # Stitch / Overlay handedness, measured on the lab's AX confocal
+    box_x1 = box_x0 + ext_w
+    want_sx = box_x1[mm] - xx * 0.5
     want_sy = box_y0[mm] + yy * 0.5
     want_sz = np.array([stage_z(int(mm[i]), zz[i]) for i in range(n)])
     assert np.allclose(col_pt("stage_x_um"), want_sx), (col_pt("stage_x_um"), want_sx)
@@ -11520,6 +11523,13 @@ def test_measure_stage_position() -> None:
     # ROW's own z, not broadcast once per field
     assert col_pt("stage_z_um")[0] != col_pt("stage_z_um")[1]
     assert col_pt("stage_x_um")[0] == col_pt("stage_x_um")[1]
+    # Flip X off places the row unflipped — the pre-2026-10-13 column
+    _, out_nf = run([("S", "io.stageseed", {}),
+                     ("Q", "analysis.measure", {"modes": {"target": "point"},
+                                                 "params": {"flip_x": False}})],
+                    [("S", "Q")], "Q", seed=ds_pt)
+    assert np.allclose(np.asarray(out_nf.get(D.POINT, "stage_x_um", layer="blobs").values,
+                                  float), box_x0[mm] + xx * 0.5)
 
     # ── 2. LABEL branch: local x_um/y_um/z_um (new) + stage_* ───────────────────
     raster6 = np.zeros((M, 1, Z, 1, Y, X), dtype=np.int64)
@@ -11545,7 +11555,7 @@ def test_measure_stage_position() -> None:
     assert np.allclose(col_lab("x_um"), lab_cols["x"] * 0.5), col_lab("x_um")
     assert np.allclose(col_lab("y_um"), lab_cols["y"] * 0.5), col_lab("y_um")
     assert np.allclose(col_lab("z_um"), lab_cols["z"] * 2.0), col_lab("z_um")
-    lab_sx = np.array([box_x0[0] + 6.0 * 0.5, box_x0[1] + 8.0 * 0.5])
+    lab_sx = np.array([box_x1[0] - 6.0 * 0.5, box_x1[1] - 8.0 * 0.5])
     lab_sy = np.array([box_y0[0] + 4.0 * 0.5, box_y0[1] + 5.0 * 0.5])
     lab_sz = np.array([stage_z(0, 1.0), stage_z(1, 2.0)])
     assert np.allclose(col_lab("stage_x_um"), lab_sx), (col_lab("stage_x_um"), lab_sx)
@@ -16431,7 +16441,10 @@ def test_crop_frames() -> None:
     md = {"pixel_size_um": 0.5, "z_step_um": 0.4, "dt_s": 2.0, "bit_depth": 12,
           "origin_um": [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 200.0, 0.0]],
           "stage_xy_um": [[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]],
-          "frame_time_jd": [2461249.0 + i for i in range(5)],
+          # a clock that AGREES with dt_s (2 s a frame): a strided pick is checked against
+          # the kept frames' own times since `retime` (2026-10-16), and a clock a day apart
+          # under a 2 s interval would — correctly — win
+          "frame_time_jd": [2461249.0 + 2.0 * i / 86400.0 for i in range(5)],
           "z_home_index": 2}
     pts = StructureTable(D.POINT, {
         "id": np.arange(1, 7, dtype=np.int64),
@@ -16475,7 +16488,7 @@ def test_crop_frames() -> None:
                           img[2, 1, 0, 0]), "the view addresses the PICKED frames"
     assert out.metadata["origin_um"] == [[0.0, 0.0, 0.0], [0.0, 200.0, 0.0]]
     assert out.metadata["stage_xy_um"] == [[0.0, 0.0], [200.0, 0.0]]
-    assert out.metadata["frame_time_jd"] == [2461250.0, 2461252.0]
+    assert out.metadata["frame_time_jd"] == [md["frame_time_jd"][1], md["frame_time_jd"][3]]
     assert out.metadata["dt_s"] == env.metadata["dt_s"] == 4.0, "stride 2 re-spaces T"
     assert out.metadata["z_step_um"] == 0.4 and out.metadata["z_home_index"] == 2
     # lattice layers are SUBSET, not dropped for no longer fitting
@@ -17860,7 +17873,10 @@ def test_checkpoint_dock() -> None:
 #: The lab's real WellA3 pair, as numbers. Both files' geometry is reproduced here exactly
 #: — extents, pixel sizes, stage logs, focus logs, Julian timestamps — so the placement
 #: maths is gated on the acquisition it was designed for without needing a 40 GB ND2 in the
-#: test environment. Read from the files on 2026-07-31 via `read_nd2_metadata_extended`.
+#: test environment. Read from the files on 2026-07-31 via `read_nd2_metadata_extended`;
+#: the Julian timestamps re-read 2026-10-13 off each file's raw frame-0 stamp, after the SDK's
+#: per-frame value was found to add frame 0's offset into the NIS job twice (787.5 s on the
+#: 640 file, 1994.8 s on the GFP one) — see `nodelab_v2.nd2_acquisition`.
 _W3_PRIMARY_XY = [(-14088.6, -29462.8), (-14382.4, -29462.9), (-14382.3, -29169.1),
                   (-14088.5, -29168.9), (-11580.8, -19689.0), (-11874.6, -19688.8),
                   (-11874.8, -19394.9), (-11581.0, -19394.8), (-11368.9, -24369.9),
@@ -17892,8 +17908,11 @@ def test_overlay_placement() -> None:
       source tile would show three-quarters of a field and a black corner;
     * the montage's tiles do not abut to the micron (a 0.18 µm seam), so an exact-coverage
       test calls five of twelve fields defective;
-    * the two files' RELATIVE clocks start 1207.3 s apart, so only the absolute Julian one
-      can report how far apart paired frames really are;
+    * the two files were written by ONE NIS job, so their relative clocks share an origin
+      and start 1207.3 s apart — and the absolute Julian clock must agree (it did not until
+      2026-10-13: the SDK's per-frame value doubled the gap to 2414.6 s, which would put the
+      GFP sweep inside the 640's NEXT sweep; the 640 sweep really ends at 1983.5 s and the
+      GFP one starts at 1994.8 s);
     * ``stagePositionUm.z`` is constant down a stack, so placing the GFP plane in the 640
       stack needs the ZStackLoop anchoring, not just the focus.
 
@@ -17907,14 +17926,14 @@ def test_overlay_placement() -> None:
         "pixel_size_um": _W3_PRIMARY_PS, "z_step_um": 0.288, "bit_depth": 12,
         "stage_xy_um": _W3_PRIMARY_XY, "stage_z_um": _W3_PRIMARY_Z,
         "z_home_index": 0, "z_bottom_to_top": True,
-        "frame_time_jd": [2461249.623022976 + i * (1421.9 / 86400.0) for i in range(16)],
+        "frame_time_jd": [2461249.6139087384 + i * (1421.9 / 86400.0) for i in range(16)],
     }
     pri_ax = AxisSizes(m=12, t=16, z=210, c=1, y=1024, x=1024)
     sec_md = {
         "pixel_size_um": _W3_SECOND_PS, "bit_depth": 12,
         "stage_xy_um": _w3_secondary_xy(),
         "stage_z_um": [5999.74 + 1.7 * i for i in range(49)],
-        "frame_time_jd": [2461249.650969694 + i * (1417.8 / 86400.0) for i in range(16)],
+        "frame_time_jd": [2461249.627882095 + i * (1417.8 / 86400.0) for i in range(16)],
     }
     sec_ax = AxisSizes(m=49, t=16, z=1, c=1, y=1024, x=1024)
 
@@ -17936,12 +17955,15 @@ def test_overlay_placement() -> None:
     # ── absolute clock: index pairing, honest error ───────────────────────────────
     pairs = pair_timepoints(pri_md, 16, sec_md, 16)
     assert all(j == t for t, j, _ in pairs)
-    assert abs(pairs[0][2] - 2414.6) < 2.0, pairs[0]        # GFP[0] is 2415 s after 640[0]
+    assert abs(pairs[0][2] - 1207.3) < 2.0, pairs[0]        # GFP[0] is 1207 s after 640[0]
     # Nearest-in-time runs the OTHER way round: the GFP frame is the SECONDARY, and
-    # GFP[0] is nearest to 640[2], so the shift that would chase the clock is -2 (primary
-    # t pairs with secondary t-2) — which is exactly why nearest-time is not the default.
-    shifted = pair_timepoints(pri_md, 16, sec_md, 16, shift=-2)
-    assert abs(shifted[2][2] + 429.0) < 5.0, shifted[2]     # and the nearest one is EARLIER
+    # GFP[0] (+1207.3 s) is nearer 640[1] (+1421.9 s) than 640[0], so the shift that would
+    # chase the clock is -1 (primary t pairs with secondary t-1) — pairing each GFP sweep
+    # with the 640 stack acquired AFTER it, the opposite of what the job did (each cycle ran
+    # the 640 stacks, then the GFP sweep), which is exactly why nearest-time is not the
+    # default.
+    shifted = pair_timepoints(pri_md, 16, sec_md, 16, shift=-1)
+    assert abs(shifted[1][2] + 214.6) < 5.0, shifted[1]     # and the nearest one is EARLIER
     assert shifted[0][1] is None and shifted[0][2] is None   # shift walks off the start
     off_end = plan_placement(pri_md, pri_ax, sec_md, sec_ax, t_shift=2)
     assert any("no secondary frame" in w for w in off_end.warnings), off_end.warnings
@@ -17958,8 +17980,8 @@ def test_overlay_placement() -> None:
     held = pair_timepoints(pri_md, 16, still_md, 1)
     assert [j for _, j, _ in held] == [0] * 16, held
     # the readout still says how far the primary has travelled from the still
-    assert abs(held[0][2] - 2414.6) < 2.0, held[0]
-    assert abs(held[15][2] - (2414.6 - 15 * 1421.9)) < 5.0, held[15]
+    assert abs(held[0][2] - 1207.3) < 2.0, held[0]
+    assert abs(held[15][2] - (1207.3 - 15 * 1421.9)) < 5.0, held[15]
     # a still ignores t_shift rather than being shifted off its only frame
     assert [j for _, j, _ in pair_timepoints(pri_md, 16, still_md, 1, shift=5)] == [0] * 16
     # a SHORT secondary is NOT broadcast — three frames is a genuine mismatch
@@ -18078,7 +18100,7 @@ def test_overlay_placement() -> None:
     entry = {
         "tiles": [[m, [[j, f] for j, f in plan.tiles[m]]] for m in sorted(plan.tiles)],
         "offset_um": [0.0, 0.0, 0.0], "flip_x": True, "flip_y": False,
-        "t_pairs": [[t, t, 2414.6] for t in range(16)]}
+        "t_pairs": [[t, t, 1207.3] for t in range(16)]}
     # a reader that ignores the window it is offered: the whole tile, which is what every
     # in-memory reader hands back and the contract compose_secondary_plane keeps supporting
     tile_of = lambda j, _want=None: np.full((64, 64), float(j), dtype=np.float32)
@@ -18200,8 +18222,8 @@ def test_overlay_placement() -> None:
     _ok("overlay placement (V2.19): the real WellA3 pair placed by stage µm — 12 primary "
         "fields resolve to 1/2/4 GFP tiles (m10 draws four), 5.985x pixel ratio reported, "
         "the 0.18 µm montage seam NOT called a hole, index t-pairing carries the absolute "
-        "+2415 s from the shared Julian clock (chasing it would need shift=-2, nearest at "
-        "-429 s, which walks off the start), a single plane places inside a 210-slice "
+        "+1207.3 s from the shared Julian clock (chasing it would need shift=-1, nearest at "
+        "-214.6 s, which walks off the start), a single plane places inside a 210-slice "
         "stack via the ZStackLoop "
         "anchoring and an unanchored stack REFUSES, a nudge re-selects tiles; the primary "
         "passes through with the same provider/axes/calibration, overlays chain to 3 "
@@ -18414,6 +18436,55 @@ def test_overlay_resample() -> None:
     assert sorted(set(unflipped.image.get_region(0, 0, 0, 0, 1, 0, 8, 0, 8)
                       .ravel().tolist())) == [26, 27, 34, 35]
 
+    # ── NATIVE resolution: a large secondary tile behind a small field (2026-10-29) ─────────
+    # The TFM case: a 294 µm field under a 1760 µm CRC tile. The field covers a small window
+    # of the tile and is sampled finer than it, so every secondary pixel in that window must
+    # be drawn, magnified. The bake used to read the WHOLE tile and weigh all of its pixels
+    # against the field's output rows, call that minification, and block-average the tile
+    # down to the output size before magnifying it — 0.86 µm/px nuclei baked at 1.7 µm/px.
+    reads = []
+
+    class _Rec(ArrayProvider):
+        def get_region(self, level, m, t, z, c, y0, y1, x0, x1, *, b=0):
+            reads.append((y1 - y0, x1 - x0))
+            return super().get_region(level, m, t, z, c, y0, y1, x0, x1, b=b)
+
+    big_md = {"pixel_size_um": 2.0, "stage_xy_um": [(4.0, 4.0)], "bit_depth": 12,
+              "channel_names": ["GFP"]}
+    big_ax = AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64)      # 128 µm tile centred on field 0
+    tile = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    big = Dataset(axes=big_ax, metadata=big_md).with_image(_Rec(tile.reshape(1, 1, 1, 1, 64, 64)))
+    g = Graph()
+    g.add(NodeInstance("A", "io.load")); g.add(NodeInstance("B", "io.load"))
+    g.add(NodeInstance("O", "view.overlay", modes={"output": "resample"}))
+    g.connect("A", "O"); g.connect("B", "O", dst_socket="secondary")
+    nat = Engine(g, computes=COMPUTES, seeds={"A": pri, "B": big},
+                 meta_seeds={"A": env_p}).pull("O")
+    baked = np.asarray(nat.image.get_region(0, 0, 0, 0, 1, 0, 8, 0, 8))
+    # the 8 µm field spans 4 x 4 tile pixels (rows/cols 30-33): all 16 drawn, each as a 2 x 2
+    # block of the 1 µm output, and nothing else
+    assert sorted(set(baked.ravel().tolist())) == sorted(tile[30:34, 30:34].ravel().tolist()), \
+        sorted(set(baked.ravel().tolist()))
+    assert (baked[0::2, 0::2] == baked[1::2, 1::2]).all() and \
+        (baked[0::2, :] == baked[1::2, :]).all(), baked
+    # ...and only that window was read, not the 64 x 64 tile
+    assert reads and max(r for r, _c in reads) <= 6 and max(c for _r, c in reads) <= 6, reads
+    # the compositor gives the same answer from a WHOLE-tile reader (the Viewer's in-memory
+    # path) as from a windowed one, because it cuts the tile to its window before weighing
+    # minification — 16 native values either way
+    from nodegraph.placement import compose_secondary_plane as _compose_w, pixel_window
+    entry = {"tiles": [[0, [[0, 1.0]]]], "offset_um": [0.0, 0.0, 0.0], "flip_x": True,
+             "flip_y": False, "placed_by": "stage", "t_pairs": [[0, 0, 0.0]]}
+
+    def _windowed(j, w=None):
+        y0, y1, x0, x1 = pixel_window(w, 64, 64)
+        return tile[y0:y1, x0:x1].astype(np.float32), (y0 / 64, y1 / 64, x0 / 64, x1 / 64)
+    whole = _compose_w(entry, (8, 8), pri_md, pri_ax, 0, big_md, big_ax,
+                       lambda j, w=None: tile.astype(np.float32))
+    win = _compose_w(entry, (8, 8), pri_md, pri_ax, 0, big_md, big_ax, _windowed)
+    assert whole is not None and win is not None and np.array_equal(whole, win), (whole, win)
+    assert len(np.unique(whole)) == 16, np.unique(whole)
+
     # the footprint is honest per mode: display reads nothing, resample reads across M
     spec = NODES.get("view.overlay")
     assert spec.resolve_granularity({"output": "display"}) is Granularity.TILEABLE
@@ -18436,7 +18507,10 @@ def test_overlay_resample() -> None:
         "fields sample different (and exactly the predicted) columns of the secondary with "
         "the flip_x default this node shares with Stitch, the footprint resolves "
         "TILEABLE/MULTI_VIEW per mode, the modes memoize apart, and an out-of-range "
-        "secondary channel refuses instead of clamping onto a neighbour")
+        "secondary channel refuses instead of clamping onto a neighbour; a large tile behind "
+        "a small, finer field bakes at its NATIVE resolution (all 16 window pixels, 2 x 2 "
+        "each), reads only that window, and the compositor answers the same from a whole-tile "
+        "reader as from a windowed one")
 
 
 def test_overlay_override_and_presentation() -> None:
@@ -19348,28 +19422,10 @@ def test_util_merge() -> None:
     assert np.allclose(_area_shrink(blk, 2, 2), [[2.5, 4.5], [10.5, 12.5]])
     assert _area_shrink(blk, 4, 4) is blk
 
-    # ── an already-STITCHED secondary must not be flipped again ──────────────────
-    #
-    # Reported 2026-08-05 via the live graph, which had `flip_x` set to False by hand — the clue.
-    # Flip X/Y say whether image +x runs along stage −x, which no file records; but `util.stitch`
-    # had to answer that to place its tiles, so its canvas is ALREADY in stage coordinates.
-    # Applying the flip again mirrors the mosaic inside its own footprint: measured on the WellA3
-    # pair, the stitched 640 secondary landed 784 µm — 456 px at the primary's 1.718 µm/px — out
-    # in x. Derived from the data, because a default the user has to find by eye is not a default.
-    from nodegraph.catalog._shared.placement_entry import already_stage_placed, handedness_for
-    raw = SimpleNamespace(metadata={})
-    assert already_stage_placed(raw) is False
-    assert handedness_for(raw, True, False) == (True, False, ())
-    stitched_sec = SimpleNamespace(metadata={SAMPLING_KEY: ("stitch[stage[49 tiles]]",)})
-    assert already_stage_placed(stitched_sec) is True
-    fx, fy, why = handedness_for(stitched_sec, True, False)
-    assert (fx, fy) == (False, False) and why and "mirror" in why[0], (fx, fy, why)
-    # …and it says nothing when there was no flip to ignore, so the card stays quiet
-    assert handedness_for(stitched_sec, False, False) == (False, False, ())
-    # a GRID-layout stitch is NOT stage-placed and must keep the camera handedness
-    grid_sec = SimpleNamespace(metadata={SAMPLING_KEY: ("stitch[grid[4x3]]",)})
-    assert already_stage_placed(grid_sec) is False, \
-        "a contact-sheet montage makes no stage claim, so the camera flip still applies"
+    # (Handedness — a stitched input takes the flip like a raw field, and a non-canvas primary
+    # is walked in it — is checked against a ground-truth stage image in
+    # `test_placement_handedness_ground_truth`, which replaced the 2026-08-05 "stitched =
+    # flip inert" assertions here.)
 
     # ── the merged note reports what it did ─────────────────────────────────────
     n = out.metadata["__merge__"]
@@ -19607,12 +19663,7 @@ def test_util_merge() -> None:
         "nearest-neighbour, since \"blocky is the honest rendering of real pixels stretched\" "
         "depends on exactly that; each covering tile is also read at ITS OWN nearest plane rather "
         "than the first hit's, because the secondary's fields are each focused at their own "
-        "height; and Flip X/Y are DERIVED inert for an already-stitched secondary — the stitch "
-        "answered the handedness question to place its tiles, so its canvas is in stage "
-        "coordinates and flipping it again mirrored the mosaic inside its own footprint, "
-        "measured 784 µm (456 px) out in x on the WellA3 pair, which is what had the live graph "
-        "carrying a hand-set flip_x=False; a GRID-layout stitch makes no stage claim and keeps "
-        "the camera flip. A SINGLE-timepoint secondary is HELD across the primary's whole T "
+        "height. A SINGLE-timepoint secondary is HELD across the primary's whole T "
         "rather than paired only with frame 0 (reported 2026-09-14 as \"overlay only appears on "
         "the first frame\") — here a snapshot merged into a 4-frame timelapse reads 200/210 on "
         "every frame instead of zeros after the first, while the primary's own channel still "
@@ -19626,6 +19677,183 @@ def test_util_merge() -> None:
         "grown axis unknown (not also z, unlike \"C\"); merge_axis folds into the recipe hash so "
         "T and M on the same wiring never collide; and a lone input refuses under every axis "
         "choice, not just the default C")
+
+
+def test_placement_handedness_ground_truth() -> None:
+    """Overlay, Merge and Crop To place by the camera's handedness on every primary (2026-10-16).
+
+    Tiles are cut from one analytic stage image the way this scope's camera takes them (image
+    +x along stage −x — Flip X on), so every placed result has a ground truth. Two faults are
+    pinned here:
+
+    * the compositor walked every NON-CANVAS primary toward stage +x, which on this scope is
+      the mirror of the primary's own pixels, so a secondary landed mirrored about the
+      primary's centre (r = 0.36 raw-on-raw against this ground truth);
+    * a stage-Stitched input had Flip X/Y forced off (the 2026-08-05 "already in stage
+      coordinates" rule). A mosaic keeps its tiles' pixels as taken, so it is camera-handed,
+      and forcing the flip off mirrored it — on an Experiment Canvas too, where the IL-8
+      spheroid bake came out mirrored about the mosaic's centre (IoU 0.73 against its own raw
+      tiles, 0.97 after this fix). The 784 µm WellA3 measurement behind that rule was the
+      first fault seen through two stitched files with nearly the same centre.
+
+    Each result must correlate with the ground truth rendered in the primary's own pixel
+    frame; the +x-right rendering of the same truth must not, so the check can tell the two
+    apart.
+    """
+    from nodegraph.nodes import COMPUTES, OVERLAY_KEY
+    from nodegraph.placement import (canvas_mapping, compose_secondary_plane, field_rect01,
+                                     frame_mapping, nudge_delta_um)
+    from nodegraph.provider import ArrayProvider
+
+    blobs = ((-150.0, -40.0, 18.0), (-60.0, 70.0, 12.0), (40.0, -90.0, 25.0),
+             (130.0, 20.0, 10.0), (90.0, 110.0, 15.0), (-110.0, 140.0, 9.0),
+             (10.0, 10.0, 6.0), (-20.0, -150.0, 14.0))
+
+    def stage(X, Y):
+        v = np.zeros_like(X)
+        for k, (bx, by, s) in enumerate(blobs):
+            v += (100.0 + 30.0 * k) * np.exp(-((X - bx) ** 2 + (Y - by) ** 2) / (2 * s * s))
+        return v
+
+    def acquire(centres, n, p):
+        """This scope's camera: pixel (r, c) of a field centred (cx, cy) images stage
+        (cx + W/2 − (c + ½)p, cy − H/2 + (r + ½)p)."""
+        arr = np.zeros((len(centres), 1, 1, 1, n, n), np.float32)
+        half = (np.arange(n) + 0.5) * p
+        for i, (cx, cy) in enumerate(centres):
+            X, Y = np.meshgrid(cx + n * p / 2 - half, cy - n * p / 2 + half)
+            arr[i, 0, 0, 0] = stage(X, Y)
+        md = {"pixel_size_um": p, "stage_xy_um": [list(c) for c in centres],
+              "stage_z_um": [0.0] * len(centres),
+              "origin_um": [[0.0, cy - n * p / 2, cx - n * p / 2] for cx, cy in centres]}
+        ax = AxisSizes(m=len(centres), t=1, z=1, c=1, y=n, x=n)
+        return Dataset(axes=ax, metadata=md).with_image(ArrayProvider(arr))
+
+    def truth(ds, camera):
+        """The ground truth on ``ds``'s own pixel grid: camera-handed, or +x right."""
+        _oz, oy, ox = ds.metadata["origin_um"][0]
+        p = float(ds.metadata["pixel_size_um"])
+        cols = (np.arange(ds.axes.x) + 0.5) * p
+        X, Y = np.meshgrid(ox + ds.axes.x * p - cols if camera else ox + cols,
+                           oy + (np.arange(ds.axes.y) + 0.5) * p)
+        return stage(X, Y)
+
+    def plane(ds, c):
+        a = ds.axes
+        return np.asarray(ds.image.read_region(0, 0, 0, 0, c, 0, a.y, 0, a.x), dtype=float)
+
+    def corr(img, ref):
+        ok = img > 0                    # where something was placed
+        a, b = img[ok] - img[ok].mean(), ref[ok] - ref[ok].mean()
+        return float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
+
+    def pull(nodes, edges, seeds, at):
+        g = Graph()
+        for nid, op, params, modes in nodes:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+        for a, b, sock in edges:
+            g.connect(a, b, dst_socket=sock)
+        metas = {k: MetaEnvelope(axes=v.axes, metadata=dict(v.metadata))
+                 for k, v in seeds.items()}
+        return Engine(g, computes=COMPUTES, seeds=seeds, meta_seeds=metas).pull(at)
+
+    pri = acquire([(-115.2 + 115.2 * i, -115.2 + 115.2 * j)
+                   for j in range(3) for i in range(3)], 64, 2.0)       # 3×3 at 2 µm/px
+    sec = acquire([(50.0 + 60.0 * i, -60.0 + 60.0 * j)
+                   for j in range(2) for i in range(2)], 128, 0.5)      # 2×2 at 0.5 µm/px
+    one = acquire([(30.0, 10.0)], 80, 2.0)                              # one raw field
+    stitch = ("util.stitch", {"flip_x": True, "flip_y": False},
+              {"layout": "stage", "blend": "max"})
+    bake = ("view.overlay", {}, {"output": "resample", "canvas": "primary"})
+    load = ("io.load", {}, {})
+
+    def check(what, img, ds):
+        good, mirror = corr(img, truth(ds, True)), corr(img, truth(ds, False))
+        assert good > 0.98 and mirror < 0.6, (what, round(good, 3), round(mirror, 3))
+        return good
+
+    # ── Overlay onto a raw field, a stitched mosaic and an Experiment Canvas ───────
+    out = pull([("A", *load), ("B", *load), ("O", *bake)],
+               [("A", "O", "data"), ("B", "O", "secondary")], {"A": one, "B": sec}, "O")
+    check("raw primary <- raw secondary", plane(out, 1), one)
+    raw_entry = out.metadata[OVERLAY_KEY][-1]
+    assert raw_entry["frame_flip"] == [True, False], raw_entry.get("frame_flip")
+    out = pull([("A", *load), ("B", *load), ("SA", *stitch), ("SB", *stitch), ("O", *bake)],
+               [("A", "SA", "data"), ("B", "SB", "data"), ("SA", "O", "data"),
+                ("SB", "O", "secondary")], {"A": pri, "B": sec}, "O")
+    check("stitched primary, own pixels", plane(out, 0), out)
+    check("stitched primary <- stitched secondary", plane(out, 1), out)
+    for label, via_stitch in (("stitched", True), ("raw", False)):
+        nodes = [("A", *load), ("B", *load),
+                 ("CV", "view.canvas", {"pixel_size_um": 2.0, "margin_um": 20.0}, {}),
+                 ("O", *bake)]
+        edges = [("A", "CV", "data"), ("CV", "O", "data")]
+        if via_stitch:
+            nodes.append(("SB", *stitch))
+            edges += [("B", "SB", "data"), ("SB", "O", "secondary")]
+        else:
+            edges.append(("B", "O", "secondary"))
+        out = pull(nodes, edges, {"A": pri, "B": sec}, "O")
+        # a canvas at the default flips is a +x-right map: the truth is NOT camera-handed
+        img, ref = plane(out, out.axes.c - 1), truth(out, False)
+        assert corr(img, ref) > 0.98, (label, corr(img, ref))
+        assert corr(img, truth(out, True)) < 0.6, label
+
+    # ── Merge (channel) and Crop To, through the same rule ────────────────────────
+    out = pull([("A", *load), ("B", *load), ("SA", *stitch),
+                ("M", "util.merge", {}, {})],
+               [("A", "SA", "data"), ("SA", "M", "data"), ("B", "M", "data")],
+               {"A": pri, "B": sec}, "M")
+    check("merge: stitched first input + raw", plane(out, 1), out)
+    out = pull([("A", *load), ("R", *load), ("SA", *stitch),
+                ("K", "util.crop_to", {}, {})],
+               [("A", "SA", "data"), ("SA", "K", "data"), ("R", "K", "region")],
+               {"A": pri, "R": one}, "K")
+    check("crop_to: stitched mosaic by a raw field's box", plane(out, 0), out)
+
+    # ── the frame rule itself, and the two display helpers that must follow it ────
+    canvas_md = {"canvas_flip": [True, False]}
+    assert frame_mapping(canvas_md, raw_entry) == canvas_mapping(canvas_md)
+    assert frame_mapping(one.metadata, raw_entry) == (True, False, False, False)
+    assert frame_mapping(one.metadata, {}) == (False, False, False, False), \
+        "an entry stamped before frame_flip keeps the old ascending walk"
+    # field_rect01 outlines each secondary field exactly where the compositor paints it
+    for j in range(sec.axes.m):
+        ent = {**raw_entry, "tiles": [[0, [[j, 1.0]]]]}
+        got = compose_secondary_plane(ent, (80, 80), one.metadata, one.axes, 0,
+                                      sec.metadata, sec.axes,
+                                      lambda _j, _w=None: np.ones((128, 128), np.float32))
+        rect = field_rect01(ent, one.metadata, one.axes, 0, sec.metadata, sec.axes, j)
+        if got is None or rect is None:
+            continue
+        rows, cols = np.flatnonzero(got.any(axis=1)), np.flatnonzero(got.any(axis=0))
+        fx0, fx1 = max(0.0, rect[2]), min(1.0, rect[3])
+        assert abs(cols[0] / 80 - fx0) <= 1.5 / 80 and abs((cols[-1] + 1) / 80 - fx1) <= 1.5 / 80, \
+            (j, cols[0], cols[-1], rect)
+        assert rows.size > 0
+    # a two-click nudge moves the drawn feature onto the click, on a camera-handed primary
+    dot = np.zeros((128, 128), np.float32)
+    dot[64, 40] = 1.0
+    ent = {**raw_entry, "tiles": [[0, [[0, 1.0]]]]}
+    at = compose_secondary_plane(ent, (80, 80), one.metadata, one.axes, 0, sec.metadata,
+                                 sec.axes, lambda _j, _w=None: dot)
+    r0, c0 = np.unravel_index(int(np.argmax(at)), at.shape)
+    dy, dx = nudge_delta_um(one.metadata, one.axes, (r0, c0 + 5), (r0, c0),
+                            frame_flip=(True, False))
+    moved = compose_secondary_plane({**ent, "offset_um": [0.0, dy, dx]}, (80, 80),
+                                    one.metadata, one.axes, 0, sec.metadata, sec.axes,
+                                    lambda _j, _w=None: dot)
+    r1, c1 = np.unravel_index(int(np.argmax(moved)), moved.shape)
+    assert (r1, c1) == (r0, c0 + 5), ((r0, c0), (r1, c1), dx)
+    _ok("placement handedness (2026-10-16): against a ground-truth stage image cut into "
+        "camera-handed tiles (image +x along stage −x), Overlay places a secondary correctly "
+        "on a raw field, on a stage-Stitched mosaic and on an Experiment Canvas, from raw "
+        "tiles or a stitched mosaic alike (r > 0.98 against the primary's own frame, < 0.6 "
+        "against its mirror); Merge and Crop To follow the same rule; a non-canvas primary is "
+        "walked in the entry's frame_flip, a canvas in its own orientation, and an old entry "
+        "without frame_flip in the old ascending walk; field_rect01 outlines each field where "
+        "the compositor paints it; and a two-click nudge on a camera-handed primary moves the "
+        "drawn feature onto the click")
 
 
 def test_display_resolution_policy() -> None:
@@ -20789,9 +21017,10 @@ def test_lablink() -> None:
     # A client socket timeout at or below the long-poll ceiling turns every SUCCESSFUL long
     # poll into an apparent dead server.
     assert LC.HubClient("http://x", "t").timeout > LP.LONGPOLL_MAX_S
-    # Every artifact kind we advertise must have something that can write it.
+    # Every artifact kind we advertise must have something that can write it — a Dataset
+    # writer, or the run loop itself (metrics; the figure, rendered in a subprocess).
     for kind in LP.ARTIFACT_KINDS:
-        assert kind in LA.WRITERS or kind == "metrics", \
+        assert kind in LA.WRITERS or kind in ("metrics", "figure"), \
             f"hello advertises artifact kind {kind!r} with no writer for it"
     _ok("LabLink wire constants: graph format tracks nodegraph.serialize, node states are "
         "the engine's observer events, hub-only error codes are unemittable by "
@@ -25599,6 +25828,427 @@ def test_time_shift() -> None:
         "frame are the identity, Δ past the length holds the edge everywhere; the four mode "
         "states hash apart; a fraction is refused; FrameRemapProvider repeats, blanks and "
         "fingerprints its map")
+
+
+def test_trim() -> None:
+    """``util.trim`` (2026-10-16): scale an axis down to evenly spaced frames.
+
+    1. **The rule** (:func:`trim_picks`): 12 frames to a third is 0, 3, 7, 11 — the request's
+       own example — by fraction and by count alike; ``stride`` is 0, 3, 6, 9; half-up
+       rounding; never below one frame; a count past the end keeps all; a fraction outside
+       (0, 1] and a count below 1 are refused.
+    2. **The pull, on T**: pixels, the per-T clock, the Voxel mask and the Point rows follow;
+       ``span``'s uneven steps DROP ``dt_s`` and ``stride`` multiplies it; envelope ==
+       payload; the stamp is t-only; ``dt_s`` is a fenced read; the mode states hash apart;
+       keeping every frame is the identity; a bad fraction is refused while the envelope
+       holds.
+    3. **Z and M**: ``z_step_um`` re-spaced and ``z_home_index`` moved; per-M lists follow.
+    4. **Either side of a Timeseries Builder**: a trimmed multi-file card keeps each file's
+       own clock (``source_frame_time_jd``) in step, so the builder still interleaves the
+       survivors by real time; separately trimmed cards give the same series; trimming the
+       BUILT series picks evenly from acquisition order. Envelope == payload throughout.
+    """
+    from dataclasses import replace as _replace
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import jd_to_datetime_text
+    from nodegraph.provider import ArrayProvider, MultiSourceProvider
+    from nodegraph.metadata import SOURCE_CLOCK_KEY, SOURCE_FILE_KEY
+    from nodegraph.structure import StructureTable
+    from nodegraph.catalog._shared.sampling import SAMPLING_KEY
+    from nodegraph.catalog.util.trim import trim_picks
+
+    # 1. the rule
+    def picks(n, params=None, modes=None):
+        params = params or {}
+        keep, problem = trim_picks(n, modes or {}, params.get("fraction"), params.get("count"))
+        return keep if keep is not None else problem
+
+    assert picks(12, {"fraction": 1 / 3}) == (0, 3, 7, 11), picks(12, {"fraction": 1 / 3})
+    assert picks(12, {"fraction": 0.33}) == (0, 3, 7, 11)
+    assert picks(12, {"count": 4}, {"size_by": "count"}) == (0, 3, 7, 11)
+    assert picks(12, {"count": 4}, {"size_by": "count", "spacing": "stride"}) == (0, 3, 6, 9)
+    assert picks(12) == (0, 2, 4, 6, 8, 11), "the default keeps half, first to last"
+    assert picks(5, {"fraction": 0.5}) == (0, 2, 4), "2.5 frames rounds half UP to 3"
+    assert picks(12, {"fraction": 0.01}) == (0,) and picks(12, {"fraction": 1}) == tuple(range(12))
+    assert picks(12, {"count": 50}, {"size_by": "count"}) == tuple(range(12))
+    assert picks(1, {"fraction": 0.1}) == (0,) and picks(7, {"count": 2}, {"size_by": "count"}) == (0, 6)
+    for params, modes, word in (({"fraction": 3}, {}, "outside (0, 1]"),
+                                ({"fraction": 0}, {}, "outside (0, 1]"),
+                                ({"fraction": "x"}, {}, "between 0 and 1"),
+                                ({"count": 0}, {"size_by": "count"}, "keeps no frames"),
+                                ({"count": 2.5}, {"size_by": "count"}, "keeps no frames")):
+        got = picks(12, params, modes)
+        assert isinstance(got, str) and word in got, (params, got)
+
+    # 2. the pull on T
+    define_node("io.trimseed", "S", outputs=[OutDataset()])
+    M, T, Z, Y, X = 1, 12, 3, 4, 5
+    arr = np.zeros((M, T, Z, 1, Y, X), dtype=float)
+    for t in range(T):
+        for z in range(Z):
+            arr[:, t, z] = 100.0 * t + z
+    ax = AxisSizes(m=M, t=T, z=Z, c=1, y=Y, x=X)
+    jd = [2460000.0 + 30.0 * t / 86400.0 for t in range(T)]     # a clock that agrees with dt_s
+    meta = {"pixel_size_um": 0.5, "dt_s": 30.0, "z_step_um": 0.5, "z_home_index": 2,
+            "frame_time_jd": jd, "frame_datetime": [jd_to_datetime_text(v) for v in jd]}
+    ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(arr))
+    mask = np.zeros((M, T, Z, 1, Y, X), dtype=np.int64)
+    for t in range(T):
+        mask[:, t, :, :, t % Y, t % X] = 1
+    ds = ds.with_layer(Domain.VOXEL, "mask", mask)
+    ds = ds.with_structure(StructureTable(Domain.POINT, {
+        "id": np.array([1, 2, 3]), "m": np.array([0, 0, 0]), "t": np.array([0, 3, 5]),
+        "c": np.array([0, 0, 0]), "z": np.array([0, 1, 0]),
+        "y": np.array([0.0, 1.0, 2.0]), "x": np.array([0.0, 1.0, 2.0])}, layer="spots"))
+    env0 = MetaEnvelope(axes=ax, metadata=meta)
+
+    def engine(params=None, modes=None, seed=ds, env=env0):
+        g = Graph()
+        g.add(NodeInstance("S", "io.trimseed"))
+        g.add(NodeInstance("N", "util.trim", params=params or {}, modes=modes or {}))
+        g.connect("S", "N")
+        return Engine(g, computes=COMPUTES, seeds={"S": seed}, meta_seeds={"S": env})
+
+    def pull(params=None, modes=None, seed=ds, env=env0):
+        e = engine(params, modes, seed, env)
+        return e, e.pull("N")
+
+    def px(out, t=0, z=0, m=0):
+        return float(out.image.get_region(0, m, t, z, 0, 0, Y, 0, X)[0, 0])
+
+    e, out = pull({"fraction": 1 / 3})
+    keep = [0, 3, 7, 11]
+    assert out.axes == _replace(ax, t=4), out.axes
+    assert [px(out, t) for t in range(4)] == [100.0 * k for k in keep], [px(out, t) for t in range(4)]
+    assert out.metadata["frame_time_jd"] == [jd[k] for k in keep]
+    assert out.metadata["frame_datetime"] == [meta["frame_datetime"][k] for k in keep]
+    assert out.metadata.get("dt_s") is None, "span's steps (3, 4, 4) carry no single interval"
+    assert out.metadata["z_step_um"] == 0.5 and out.metadata["z_home_index"] == 2
+    lay = out.get(Domain.VOXEL, "mask").values
+    assert lay.shape[1] == 4 and all(lay[0, i, 0, 0, k % Y, k % X] == 1 for i, k in enumerate(keep))
+    assert lay.sum() == 4 * Z, lay.sum()
+    assert list(out.get(Domain.POINT, "id", layer="spots").values) == [1, 2]
+    assert list(out.get(Domain.POINT, "t", layer="spots").values) == [0, 1], "t=3 is kept frame 1"
+    env = e.env("N")
+    assert env.axes == out.axes and env.metadata.get("frame_time_jd") == out.metadata["frame_time_jd"]
+    assert env.metadata.get("dt_s") is None
+    assert "t:trim[0,3,7,11]" in str(out.metadata.get(SAMPLING_KEY, "")), out.metadata.get(SAMPLING_KEY)
+    assert "dt_s" in dict(e.entry("N").reads), dict(e.entry("N").reads)
+    hashes = {e.entry("N").recipe_hash}
+    # stride keeps a uniform step, so dt_s survives multiplied
+    e, out = pull({"count": 4}, {"size_by": "count", "spacing": "stride"})
+    assert [px(out, t) for t in range(4)] == [0.0, 300.0, 600.0, 900.0]
+    assert out.metadata["dt_s"] == 90.0 and e.env("N").metadata["dt_s"] == 90.0
+    hashes.add(e.entry("N").recipe_hash)
+    e, out = pull({"count": 4}, {"size_by": "count"})
+    assert [px(out, t) for t in range(4)] == [100.0 * k for k in keep], "count 4 == a third of 12"
+    hashes.add(e.entry("N").recipe_hash)
+    assert len(hashes) == 3, "fraction/count and span/stride fold into the recipe"
+    # the identity: keeping every frame returns the input untouched
+    for params, modes in (({"fraction": 1.0}, {}), ({"count": 99}, {"size_by": "count"})):
+        e, out = pull(params, modes)
+        assert out.axes == ax and SAMPLING_KEY not in out.metadata and out.metadata["dt_s"] == 30.0
+    # a refusal: the payload raises with the reason, the envelope holds
+    try:
+        pull({"fraction": 3})
+        raise AssertionError("a fraction above 1 must be refused")
+    except ValueError as exc:
+        assert "outside (0, 1]" in str(exc) and "count" in str(exc), str(exc)
+    assert engine({"fraction": 3}).env("N").axes == ax
+
+    # 3. Z and M
+    e, out = pull({"count": 2}, {"axis": "Z", "size_by": "count"})
+    assert out.axes == _replace(ax, z=2) and [px(out, 0, z) for z in range(2)] == [0.0, 2.0]
+    assert out.metadata["z_step_um"] == 1.0 and out.metadata["z_home_index"] == 1
+    assert out.metadata["frame_time_jd"] == jd and out.metadata["dt_s"] == 30.0
+    assert e.env("N").axes == out.axes and e.env("N").metadata["z_step_um"] == 1.0
+    assert list(out.get(Domain.POINT, "id", layer="spots").values) == [1, 3], "z=1 dropped"
+    m_arr = np.stack([arr[0] + 10000.0 * m for m in range(4)])
+    m_meta = {"pixel_size_um": 0.5, "stage_xy_um": [[float(m), 0.0] for m in range(4)],
+              SOURCE_FILE_KEY: [f"f{m}.nd2" for m in range(4)]}
+    m_ds = Dataset(axes=_replace(ax, m=4), metadata=m_meta).with_image(ArrayProvider(m_arr))
+    m_env = MetaEnvelope(axes=m_ds.axes, metadata=m_meta)
+    e, out = pull({"fraction": 0.5}, {"axis": "M"}, seed=m_ds, env=m_env)
+    assert out.axes.m == 2 and [px(out, 0, 0, m) for m in range(2)] == [0.0, 30000.0]
+    assert out.metadata["stage_xy_um"] == [[0.0, 0.0], [3.0, 0.0]]
+    assert out.metadata[SOURCE_FILE_KEY] == ["f0.nd2", "f3.nd2"]
+    assert e.env("N").axes == out.axes and e.env("N").metadata[SOURCE_FILE_KEY] == ["f0.nd2", "f3.nd2"]
+
+    # 4. before and after a Timeseries Builder: two files whose frames alternate in time
+    J, MIN = 2460000.0, 1.0 / 1440.0
+
+    def farr(fid):
+        a = np.zeros((1, 6, 1, 1, 4, 4))
+        for i in range(6):
+            a[0, i] = 10 * fid + i                      # value says (file, own frame)
+        return a
+
+    def card(fid, name, mins):
+        cj = [J + v * MIN for v in mins]
+        md = {"pixel_size_um": 0.5, SOURCE_FILE_KEY: [name], "frame_time_jd": cj}
+        return Dataset(axes=AxisSizes(m=1, t=6, z=1, c=1, y=4, x=4),
+                       metadata=md).with_image(ArrayProvider(farr(fid)))
+
+    a = card(1, "run_001.nd2", [0, 2, 4, 6, 8, 10])
+    b = card(2, "run_002.nd2", [1, 3, 5, 7, 9, 11])
+
+    def run(nodes, edges, seeds, tail):
+        g = Graph(nodes={nid: NodeInstance(nid, op, params=p, modes=md)
+                         for nid, (op, p, md) in nodes.items()},
+                  edges=[Edge(s, d, ss, ds_, "forward") for s, d, ss, ds_ in edges])
+        eng = Engine(g, computes=COMPUTES, seeds=seeds,
+                     meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                                 for k, v in seeds.items()})
+        out = eng.pull(tail)
+        assert eng.env(tail).axes == out.axes, (eng.env(tail).axes, out.axes)
+        assert eng.env(tail).metadata.get("frame_time_jd") == out.metadata.get("frame_time_jd")
+        return out
+
+    def frames(d):
+        return [int(d.image.get_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0])
+                for t in range(int(d.axes.t))]
+
+    builder = ("util.timeseries", {}, {"chain_axis": "T", "chain_order": "time"})
+    half = ("util.trim", {"fraction": 0.5}, {})
+    # (a) BEFORE, one multi-file card: each file keeps its frames 0, 2, 5, and its own clock
+    prov = MultiSourceProvider([ArrayProvider(farr(1)), ArrayProvider(farr(2))],
+                               labels=["run_001.nd2", "run_002.nd2"])
+    bundle = Dataset(axes=prov.axes, metadata={
+        "pixel_size_um": 0.5, SOURCE_FILE_KEY: ["run_001.nd2", "run_002.nd2"],
+        "frame_time_jd": a.metadata["frame_time_jd"],
+        SOURCE_CLOCK_KEY: [a.metadata["frame_time_jd"], b.metadata["frame_time_jd"]]}
+    ).with_image(prov)
+    out_b = run({"L": ("io.load", {}, {}), "R": half, "C": builder},
+                [("L", "R", "image", "data"), ("R", "C", "out", "data")], {"L": bundle}, "C")
+    assert frames(out_b) == [10, 20, 12, 22, 15, 25], frames(out_b)
+    assert out_b.metadata["frame_time_jd"] == [J + v * MIN for v in (0, 1, 4, 5, 10, 11)]
+    assert out_b.metadata["__chain__"]["interleaved"] is True, out_b.metadata["__chain__"]
+    # (b) BEFORE, two separate cards each through its own Trim: the same series
+    out_s = run({"L0": ("io.load", {}, {}), "L1": ("io.load", {}, {}),
+                 "R0": half, "R1": half, "C": builder},
+                [("L0", "R0", "image", "data"), ("L1", "R1", "image", "data"),
+                 ("R1", "C", "out", "data"), ("R0", "C", "out", "file_2")],
+                {"L0": a, "L1": b}, "C")
+    assert frames(out_s) == frames(out_b) and \
+        out_s.metadata["frame_time_jd"] == out_b.metadata["frame_time_jd"], frames(out_s)
+    # (c) AFTER: the built 12-frame series trimmed to a third is frames 0, 3, 7, 11 of it
+    out_a = run({"L0": ("io.load", {}, {}), "L1": ("io.load", {}, {}), "C": builder,
+                 "R": ("util.trim", {"fraction": 1 / 3}, {})},
+                [("L0", "C", "image", "data"), ("L1", "C", "image", "file_2"),
+                 ("C", "R", "out", "data")], {"L0": b, "L1": a}, "R")
+    assert frames(out_a) == [10, 21, 23, 25], frames(out_a)
+    assert out_a.metadata["frame_time_jd"] == [J + v * MIN for v in (0, 3, 7, 11)]
+    _ok("trim: 12 frames to a third keep 0, 3, 7, 11 (by fraction or count; `stride` 0, 3, "
+        "6, 9; half-up; ≥ 1 frame; a count past the end keeps all; fraction ∉ (0, 1] and "
+        "count < 1 refused); on T the pixels, clock, Voxel mask and Point rows follow, span "
+        "drops dt_s and stride multiplies it, envelope == payload, t-only stamp, dt_s fenced, "
+        "mode states hash apart, keep-all is the identity; Z re-spaces z_step_um and moves "
+        "z_home_index, M narrows the per-M lists; before a Timeseries Builder (one bundle or "
+        "separate cards) each file's clock follows and the survivors interleave by real time, "
+        "after it the built series is trimmed evenly in acquisition order")
+
+
+def test_time_metadata() -> None:
+    """The time axis is REBUILT by every node that changes T, and READ the same way by every
+    node that turns frames into time (2026-10-16).
+
+    1. **retime** (one rule for every subset): a contiguous run keeps ``dt_s``; an even stride
+       multiplies it when the clock bears it out and takes the clock's step when the source
+       paused; uneven kept times drop it; a clockless uneven pick keeps each frame's time as
+       ``frame_time_s`` (and a later subset of THAT is retimed from it); one frame keeps the
+       interval; an untimed series gains nothing.
+    2. **concat_interval**: a seam gap drops an agreed in-file ``dt_s``; files of one frame
+       each gain the clock's step; without a clock only an agreed interval survives.
+    3. **Rates read per-frame time**: a tracked object moving at 0.1 µm/s through an UNEVEN
+       Trim (frames 0, 3, 7, 11 — no ``dt_s``) reports exactly 0.1 µm/s on every step, with a
+       clock and without one; PIV's pair gap and the velocity helper agree.
+    4. **Reducers and slices**: Stack drops the clock with ``dt_s``; ``zone.frame`` subsets it
+       to its frame — envelope == payload for both.
+    5. **Concatenators**: a Timeseries Builder in block order with a gap between files drops
+       ``dt_s`` (and says so), one built from single-frame files gains it; Merge onto T with a
+       seam gap drops it; ``frame_time_s`` is never concatenated.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.metadata import (FRAME_TIME_S_KEY, SOURCE_FILE_KEY, concat_interval,
+                                    frame_times_s, retime, series_seconds, uniform_step_s)
+    from nodegraph.catalog._shared.objects import _object_velocity_nd
+    from nodegraph.catalog.analysis.piv import _pair_dt_s
+
+    J, DAY = 2460000.0, 86400.0
+    clock = [J + 30.0 * t / DAY for t in range(12)]               # 30 s a frame
+    timed = {"dt_s": 30.0, "frame_time_jd": clock}
+
+    def close(a, b, tol=1e-3):
+        # a Julian day near 2.46e6 resolves ~40 µs, so a step read off the clock is exact
+        # only to that
+        return a is not None and b is not None and abs(float(a) - float(b)) < tol
+
+    # 1. retime
+    ch = retime(timed, range(2, 6))
+    assert ch["dt_s"] == 30.0 and ch["frame_time_jd"] == clock[2:6], ch
+    ch = retime(timed, [0, 3, 6, 9])
+    assert ch["dt_s"] == 90.0, ch                                   # stride borne out by the clock
+    paused = {"dt_s": 30.0, "frame_time_jd": [J + s / DAY for s in
+                                              (0, 30, 60, 90, 600, 630, 660, 690)]}
+    ch = retime(paused, [0, 2, 4, 6])                               # times 0, 60, 600, 660
+    assert ch["dt_s"] is None, "the pause makes the stride uneven in TIME"
+    ch = retime(paused, [4, 6])
+    assert close(ch["dt_s"], 60.0), ch                              # a stride of 2 that is even
+    ch = retime(timed, [0, 3, 7, 11])
+    assert ch["dt_s"] is None and ch["frame_time_jd"] == [clock[i] for i in (0, 3, 7, 11)]
+    assert FRAME_TIME_S_KEY not in ch, "a clocked series needs no second per-frame list"
+    clockless = {"dt_s": 30.0}
+    ch = retime(clockless, [0, 3, 7, 11])
+    assert ch["dt_s"] is None and ch[FRAME_TIME_S_KEY] == [0.0, 90.0, 210.0, 330.0], ch
+    again = retime({**clockless, **ch}, [1, 3])                     # 90 s and 330 s
+    assert again[FRAME_TIME_S_KEY] == [90.0, 330.0] and close(again["dt_s"], 240.0), again
+    assert series_seconds({**clockless, **ch}, 4) == [0.0, 90.0, 210.0, 330.0]
+    assert retime(clockless, [0, 4, 8])["dt_s"] == 120.0
+    assert FRAME_TIME_S_KEY not in retime(clockless, [0, 4, 8])
+    assert retime(timed, [5])["dt_s"] == 30.0 and retime(timed, [5])["frame_time_jd"] == [clock[5]]
+    untimed = retime({}, [0, 3, 7])
+    assert untimed == {"dt_s": None}, untimed
+    no_dt = retime({"frame_time_jd": clock}, [0, 1, 2])
+    assert close(no_dt["dt_s"], 30.0), "a series without an interval gains the clock's"
+    assert frame_times_s({"dt_s": 2.0}, 3) == [0.0, 2.0, 4.0]
+    assert frame_times_s({}, 3) is None and uniform_step_s([0.0, 1.0, 1.5]) is None
+
+    # 2. concat_interval
+    assert concat_interval([60.0, 60.0], [0, 60, 120, 600, 660]) is None, "seam gap"
+    assert concat_interval([60.0, 60.0], [0, 60, 120, 180]) == 60.0
+    assert close(concat_interval([None, None, None], [0, 300, 600]), 300.0)
+    assert concat_interval([60.0, 60.0], None) == 60.0
+    assert concat_interval([60.0, 30.0], None) is None
+
+    # 3. rates read per-frame time, through an UNEVEN trim, clocked and clockless
+    define_node("io.timeseed", "S", outputs=[OutDataset()])
+    T, Y, X, PX, V = 12, 8, 64, 0.5, 0.1                            # V µm/s along x
+    ax = AxisSizes(m=1, t=T, z=1, c=1, y=Y, x=X)
+    img = np.zeros((1, T, 1, 1, Y, X), dtype=float)
+    tbl = StructureTable(Domain.LABEL, {
+        "id": np.arange(1, T + 1, dtype=np.int64), "m": np.zeros(T, np.int64),
+        "t": np.arange(T, dtype=np.int64), "c": np.zeros(T, np.int64), "z": np.zeros(T),
+        "y": np.full(T, 4.0), "x": 2.0 + V * 30.0 * np.arange(T) / PX,
+        "area": np.full(T, 4.0), "track_id": np.ones(T, np.int64)},
+        layer="labels", z_kind="plane_index")
+
+    def chain(md, nodes):
+        ds = (Dataset(axes=ax, metadata=md).with_image(ArrayProvider(img))
+              .with_layer(Domain.VOXEL, "labels", np.zeros((1, T, 1, 1, Y, X), np.int64))
+              .with_structure(tbl))
+        g = Graph()
+        g.add(NodeInstance("S", "io.timeseed"))
+        prev = "S"
+        for nid, op, params, modes in nodes:
+            g.add(NodeInstance(nid, op, params=params, modes=modes))
+            g.connect(prev, nid)
+            prev = nid
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=md)})
+        return e, e.pull(prev)
+
+    third = ("R", "util.trim", {"fraction": 1 / 3}, {})
+    speed = ("O", "analysis.object_metrics", {"metrics": "speed"}, {})
+    for label, md in (("clocked", {"pixel_size_um": PX, **timed}),
+                      ("clockless", {"pixel_size_um": PX, "dt_s": 30.0})):
+        e, trimmed = chain(md, [third])
+        assert trimmed.axes.t == 4 and trimmed.metadata.get("dt_s") is None, (label, trimmed.metadata)
+        assert e.env("R").metadata.get("dt_s") is None
+        assert frame_times_s(trimmed.metadata, 4) == [0.0, 90.0, 210.0, 330.0] or label == "clocked"
+        if label == "clocked":
+            secs = frame_times_s(trimmed.metadata, 4)
+            assert all(close(a, b, 1e-3) for a, b in zip(secs, [0, 90, 210, 330])), secs
+        else:
+            assert trimmed.metadata[FRAME_TIME_S_KEY] == [0.0, 90.0, 210.0, 330.0]
+            assert e.env("R").metadata[FRAME_TIME_S_KEY] == [0.0, 90.0, 210.0, 330.0]
+        _e, out = chain(md, [third, speed])
+        sp = np.asarray(out.get(Domain.LABEL, "speed", layer="labels").values, dtype=float)
+        assert np.isnan(sp[0]) and np.allclose(sp[1:], V, rtol=1e-6), (label, sp)
+    # the interval path is unchanged: an even trim keeps dt_s and the same speed
+    _e, out = chain({"pixel_size_um": PX, **timed},
+                    [("R", "util.trim", {"count": 4}, {"size_by": "count", "spacing": "stride"}),
+                     speed])
+    sp = np.asarray(out.get(Domain.LABEL, "speed", layer="labels").values, dtype=float)
+    assert np.allclose(sp[1:], V, rtol=1e-9), sp
+    # the helpers directly: per-frame seconds vs one interval, and PIV's pair gap
+    tt = np.array([0, 1, 2], dtype=float)
+    xs = np.array([[0.0], [9.0], [21.0]])
+    v1 = _object_velocity_nd(np.ones(3, np.int64), tt, xs, np.array([0.0, 90.0, 210.0]))
+    assert np.isnan(v1[0, 0]) and np.allclose(v1[1:, 0], 0.1), v1
+    assert _pair_dt_s(30.0, 2, False) == 30.0
+    assert _pair_dt_s(np.array([0.0, 90.0, 210.0]), 2, False) == 120.0
+    assert _pair_dt_s(np.array([0.0, 90.0, 210.0]), 0, True) == 105.0
+    assert np.isnan(_pair_dt_s(np.array([0.0, 90.0]), 5, False))
+
+    # 4. a reducer drops the clock, a slice subsets it
+    e, out = chain({"pixel_size_um": PX, **timed}, [("K", "util.stack", {}, {})])
+    for md in (out.metadata, e.env("K").metadata):
+        assert md.get("frame_time_jd") is None and md.get("dt_s") is None, md
+    e, out = chain({"pixel_size_um": PX, **timed}, [("F", "zone.frame", {"__frame__": 5}, {})])
+    assert out.metadata["frame_time_jd"] == [clock[5]] and out.metadata["dt_s"] == 30.0
+    assert e.env("F").metadata["frame_time_jd"] == [clock[5]]
+
+    # 5. concatenators: Timeseries Builder and Merge onto T
+    MIN = 1.0 / 1440.0
+
+    def card(name, mins, dt=None):
+        md = {"pixel_size_um": 0.5, SOURCE_FILE_KEY: [name],
+              "frame_time_jd": [J + v * MIN for v in mins]}
+        if dt is not None:
+            md["dt_s"] = dt
+        n = len(mins)
+        return Dataset(axes=AxisSizes(m=1, t=n, z=1, c=1, y=4, x=4), metadata=md).with_image(
+            ArrayProvider(np.zeros((1, n, 1, 1, 4, 4))))
+
+    def build(cards, op="util.timeseries", modes=None):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(cards))}
+        nodes["C"] = NodeInstance("C", op, modes=modes or {"chain_axis": "T",
+                                                           "chain_order": "time"})
+        if op == "util.timeseries":
+            edges = [Edge(f"L{i}", "C", "image", "data" if i == 0 else f"file_{i + 1}",
+                          "forward") for i in range(len(cards))]
+        else:
+            edges = [Edge(f"L{i}", "C", "image", "data", "forward") for i in range(len(cards))]
+        eng = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES,
+                     seeds={f"L{i}": d for i, d in enumerate(cards)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(cards)})
+        return eng, eng.pull("C")
+
+    eng, gap = build([card("g_001.nd2", [0, 1, 2], 60.0), card("g_002.nd2", [30, 31], 60.0)])
+    assert gap.axes.t == 5 and gap.metadata.get("dt_s") is None, gap.metadata.get("dt_s")
+    assert eng.env("C").metadata.get("dt_s") is None, "envelope == payload"
+    assert "gaps between files" in gap.metadata["__chain__"]["note"], gap.metadata["__chain__"]
+    _e, even = build([card("e_001.nd2", [0, 1, 2], 60.0), card("e_002.nd2", [3, 4], 60.0)])
+    assert even.metadata["dt_s"] == 60.0, "a seam one interval long keeps the in-file interval"
+    _e, singles = build([card(f"s_{i:03d}.nd2", [5 * i]) for i in range(4)])
+    assert singles.axes.t == 4 and close(singles.metadata.get("dt_s"), 300.0, 1e-3), \
+        singles.metadata.get("dt_s")
+    fts = Dataset(axes=AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4),
+                  metadata={"pixel_size_um": 0.5, SOURCE_FILE_KEY: ["f_001.tif"],
+                            FRAME_TIME_S_KEY: [0.0, 90.0]}).with_image(
+        ArrayProvider(np.zeros((1, 2, 1, 1, 4, 4))))
+    fts2 = fts.with_metadata(**{SOURCE_FILE_KEY: ["f_002.tif"]})
+    _e, nofts = build([fts, fts2], "util.timeseries", {"chain_axis": "T", "chain_order": "loaded"})
+    assert nofts.axes.t == 4 and nofts.metadata.get(FRAME_TIME_S_KEY) is None, nofts.metadata
+    _e, merged = build([card("m_001.nd2", [0, 1], 60.0), card("m_002.nd2", [20, 21], 60.0)],
+                       "util.merge", {"merge_axis": "T"})
+    assert merged.axes.t == 4 and merged.metadata.get("dt_s") is None, merged.metadata.get("dt_s")
+    _e, merged_ok = build([card("n_001.nd2", [0, 1], 60.0), card("n_002.nd2", [2, 3], 60.0)],
+                          "util.merge", {"merge_axis": "T"})
+    assert merged_ok.metadata["dt_s"] == 60.0
+    _ok("time metadata: every T change rebuilds the time axis by one rule — retime keeps dt_s "
+        "on a contiguous run, multiplies it on a stride the clock bears out, takes the "
+        "clock's step or drops it where the source paused or the kept times are uneven, and "
+        "keeps a clockless uneven pick's per-frame seconds (frame_time_s, itself retimed by a "
+        "later subset); concat_interval drops an interval a seam gap contradicts and gains "
+        "one for single-frame files; a tracked object at 0.1 µm/s through an UNEVEN Trim "
+        "(no dt_s) reports 0.1 µm/s on every step, clocked and clockless, and an even trim "
+        "keeps the interval path; Stack drops the clock, zone.frame subsets it (envelope == "
+        "payload); a Timeseries Builder / Merge onto T with a gap between files drops dt_s "
+        "(and the builder says so), and frame_time_s is never concatenated")
 
 
 def test_split_groups() -> None:
@@ -33509,6 +34159,2381 @@ def test_field_end_to_end() -> None:
     _ok("field end to end (2026-10-09): " + "; ".join(notes))
 
 
+def test_lattice_tables_elided_batch() -> None:
+    """A lattice layer is unrolled by its array's OWN axes (2026-10-12): ``b`` is elided at
+    ``b == 1`` (V3.01, ``AxisSizes.axis_list``), so a Frame layer is ``(M, T)``, not
+    ``(B, M, T)``.
+
+    User report: Registration after a Timeseries Builder (38 frames) crashed the
+    Spreadsheet — ``lattice_tables`` built index rows from ``axes_of(domain)``, which keeps
+    ``b``, so a Frame table had three index rows for a two-axis array. A series whose
+    ``2·M·T`` is a multiple of 3 did not crash: it showed ``t`` starting at 13. The same
+    list put ``zone.frame``'s T slice on the wrong axis. Covered: the tables at 38 and 39
+    frames, a Plane table, a real batch (``b`` kept), ``zone.frame`` on a Frame layer, and
+    builder → Stabilize → the Spreadsheet's tables end to end."""
+    from nodegraph.metadata import SOURCE_FILE_KEY
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.tables import all_tables, lattice_tables
+
+    def frame_ds(m, t, b=1):
+        ax = AxisSizes(b=b, m=m, t=t, z=1, c=1, y=4, x=4)
+        vals = np.arange(b * m * t, dtype=float).reshape(ax.shape_for(Domain.FRAME))
+        return Dataset(axes=ax, metadata={}).with_layer(Domain.FRAME, "v", vals)
+
+    for t in (38, 39):   # 2·M·T not a multiple of 3 crashed; a multiple of 3 shifted `t`
+        cols = lattice_tables(frame_ds(1, t))[("frame", None)]
+        assert sorted(cols) == ["m", "t", "v"], sorted(cols)
+        assert list(cols["t"]) == list(range(t)) and not any(cols["m"]), list(cols["t"])[:4]
+        assert list(cols["v"]) == [float(i) for i in range(t)]
+    cols = lattice_tables(frame_ds(2, 3, b=2))[("frame", None)]
+    assert sorted(cols) == ["b", "m", "t", "v"] and list(cols["b"]) == [0] * 6 + [1] * 6
+    pax = AxisSizes(m=2, t=3, z=2, c=1, y=4, x=4)
+    pl = Dataset(axes=pax, metadata={}).with_layer(
+        Domain.PLANE, "p", np.arange(12, dtype=float).reshape(pax.shape_for(Domain.PLANE)))
+    cols = lattice_tables(pl)[("plane", None)]
+    assert (list(cols["m"]), list(cols["t"]), list(cols["z"])) == (
+        [0] * 6 + [1] * 6, [0, 0, 1, 1, 2, 2] * 2, [0, 1] * 6), cols
+
+    # zone.frame slices T, which is axis 1 of a Frame layer
+    src = frame_ds(1, 5)
+    src = src.with_image(ArrayProvider(np.zeros((1, 5, 1, 1, 4, 4), np.uint16)))
+    g = Graph(nodes={"L": NodeInstance("L", "io.load"),
+                     "F": NodeInstance("F", "zone.frame", params={"__frame__": 3})},
+              edges=[Edge("L", "F", "image", "data")])
+    fr = Engine(g, computes=COMPUTES, seeds={"L": src},
+                meta_seeds={"L": MetaEnvelope(axes=src.axes, metadata={})}).pull("F")
+    _fv = np.asarray(fr.get(Domain.FRAME, "v").values)
+    assert _fv.tolist() == [[3.0]], _fv
+
+    # builder → Stabilize → the Spreadsheet's tables: the user's graph
+    rng = np.random.default_rng(7)
+    base = rng.random((40, 40))
+
+    def card(k, t, name):
+        a = np.zeros((1, t, 1, 1, 32, 32), np.float32)
+        for j in range(t):
+            dy, dx = (j + k) % 3, (2 * j + k) % 3
+            a[0, j, 0, 0] = base[dy:dy + 32, dx:dx + 32]
+        p = ArrayProvider(a)
+        return Dataset(axes=p.axes, metadata={"pixel_size_um": 0.5,
+                                              SOURCE_FILE_KEY: [name]}).with_image(p)
+
+    cards = [card(0, 19, "w_t001.nd2"), card(1, 19, "w_t002.nd2")]
+    nodes = {"L0": NodeInstance("L0", "io.load"), "L1": NodeInstance("L1", "io.load"),
+             "B": NodeInstance("B", "util.timeseries", modes={"chain_order": "sequence"}),
+             "R": NodeInstance("R", "registration.stabilize")}
+    g = Graph(nodes=nodes, edges=[Edge("L0", "B", "image", "data"),
+                                  Edge("L1", "B", "image", "file_2"),
+                                  Edge("B", "R", "out", "data")])
+    eng = Engine(g, computes=COMPUTES, seeds={"L0": cards[0], "L1": cards[1]},
+                 meta_seeds={k: MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                             for k, d in (("L0", cards[0]), ("L1", cards[1]))})
+    reg = eng.pull("R")
+    assert reg.axes.t == 38, reg.axes
+    tabs = all_tables(reg)
+    frame = tabs[("frame", None)]
+    assert list(frame["t"]) == list(range(38)) and {"drift_y", "drift_x"} <= set(frame), \
+        sorted(frame)
+    _ok("lattice tables unroll a layer by its array's own axes (b elided at b == 1): a "
+        "38- or 39-frame Frame table has m/t columns 0..T-1 (it crashed, or showed t from "
+        "13), a Plane table m/t/z, a real batch keeps b; zone.frame slices a Frame layer's "
+        "T; builder → Stabilize → the Spreadsheet's tables carry every rebuilt frame's drift")
+
+
+#: The lab's CRC_TF_ELISA ``CRC_1_T1..T5`` JOBS series as numbers (read 2026-10-13): each
+#: file's raw frame-0 stamp (``dTimeAbsolute``, UTC Julian day) and the ``relativeTimeMs``
+#: of position 0 / plane 0 at every timepoint — the job-relative clock. The run began at
+#: 2026-10-06 19:47:21.215 local (the JOBS folder's own name) and the PC is UTC-7.
+_CRC1_STAMPS = {
+    "CRC_1_T1.nd2": (2461320.63017394, [1205813.1, 11005041.5, 20805729.9, 30613583.0,
+                                        40417162.3, 50194424.4, 59955624.1, 69745482.0]),
+    "CRC_1_T2.nd2": (2461320.65279192, [3160007.5, 12967539.4, 22762389.3, 32572758.0,
+                                        42374798.0, 52139978.3, 61910498.8, 71704873.1]),
+    "CRC_1_T3.nd2": (2461320.67533994, [5108156.5, 14930288.7, 24723403.5, 34540073.7,
+                                        44330809.1, 54085446.7, 63865485.4, 73664089.6]),
+    "CRC_1_T4.nd2": (2461320.69811433, [7075863.6, 16888663.8, 26686930.8, 36497768.2,
+                                        46282859.6, 56041518.2, 65825334.6]),
+    "CRC_1_T5.nd2": (2461320.72081583, [9037273.7, 18847974.3, 28653581.2, 38460287.4,
+                                        48236085.5, 57995326.5, 67787807.9]),
+}
+_CRC1_DIR = r"G:\McGhee Lab\CRC_TF_ELISA\20261006_194721_215"
+
+#: The NIS ``text_info["capturing"]`` block of those files, verbatim (three channels).
+_CRC1_CAPTURING = (
+    "AX\nConfiguration:\n\tDetector mode: Multi-Channel\n\tScanner: Galvano Unidirectional\n"
+    "\tScan Mode: Band\n\tResolution: 2048 x 2048\n\tDwell Time: 0.8 usec\n"
+    "\t\tp53-GFP, ERK-mRuby2, H2B-iRFP670\nComponents:\nComponent p53-GFP:\n\tDetector: 2\n"
+    "\tEmission Range: 499 nm - 551 nm\n\tGain: 50.0\n\tOffset: 0\n\tPinhole Size: 37.5 µm\n"
+    "\tFirst DM: 405/488/561/640 (Position 1)\n\tLaser 488 nm:\n\t\tEnabled\n\t\tPower: 3.0\n"
+    "\t\tLaser Port: Standard\n\nComponent ERK-mRuby2:\n\tDetector: 4\n"
+    "\tEmission Range: 571 nm - 625 nm\n\tGain: 40.0\n\tOffset: 0\n\tPinhole Size: 37.5 µm\n"
+    "\tFirst DM: 405/488/561/640 (Position 1)\n\tLaser 561 nm:\n\t\tEnabled\n\t\tPower: 20.0\n"
+    "\t\tLaser Port: Standard\n\nComponent H2B-iRFP670:\n\tDetector: 3\n"
+    "\tEmission Range: 655 nm - 850 nm\n\tGain: 75.0\n\tOffset: 0\n\tPinhole Size: 37.5 µm\n"
+    "\tFirst DM: 405/488/561/640 (Position 1)\n\tLaser 640 nm:\n\t\tEnabled\n\t\tPower: 10.0\n"
+    "\t\tLaser Port: Standard\n\nScan Area:\n\tZoom: 1.00\n\tOffset X: 0.00\n\tOffset Y: 0.00\n"
+    "\tRotation: 0.00\n\nMisc:\n\tDetector Port: Standard\n\tImage Mode: Normal\n"
+    "\tIR Filter Position: Out\n")
+
+
+def test_nd2_true_clock() -> None:
+    """The ND2 acquisition clock, rebuilt from the file's ONE absolute stamp (2026-10-13).
+
+    An ND2 stores frame 0's Julian day (UTC) and each frame's ``relativeTimeMs``, whose
+    origin is the start of the RUN — for an NIS JOBS run writing several files, the job
+    start, shared by all of them. ``nd2`` builds each frame's Julian day as ``jd0 + rel``,
+    adding frame 0's own offset into the job twice. On the lab's ``CRC_1_T1..T5`` series
+    (one job, five files, acquired round robin: T1 t0, T2 t0 … T5 t0, T1 t1 …) that made
+    the Timeseries Builder play true frames 0,1,2,5,3,6,4,7,10,8,… — the monolayer
+    "twitching" back in time — and on the WellA3 pair it doubled a 1207.3 s gap.
+
+    1. the composition and the zone: ``frame_jd = jd0 + (rel - rel0)``; the file's local
+       ``date`` against its last frame gives UTC-7, an unmatchable date falls back to this
+       computer; ``jd_to_datetime_text`` applies the offset.
+    2. the CRC_1 series as the files' own numbers, through the REAL Builder: the SDK's
+       composition reproduces the twitch, the corrected clock plays T1..T5 round robin.
+    3. the stopped run's partial last frame cropped out — AFTER the Builder (output frame
+       37) or BEFORE it (T3's t7) — leaves 37 frames in true order, each with its right
+       local time, and Export TIFF writes those same times (OME and ImageJ).
+    4. a troubleshooting T pin subsets the seed's clock with its frames.
+    5. the acquisition record: the NIS settings text parses into per-channel rows (laser
+       line and power, gain, detector…); a channel tap keeps its own channel's rows; the
+       Viewer's channel tooltip and Info window show them.
+    6. the real files, when this machine can see them: the reader produces (2)'s clock,
+       UTC-7 read from the file itself, and the record.
+    """
+    import os
+    import re
+    import shutil
+    import tempfile
+    from types import SimpleNamespace as NS
+    from nodegraph.metadata import (MetaEnvelope, SOURCE_FILE_KEY, channel_subset,
+                                    chain_members, chain_frame_order)
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.placement import jd_to_datetime_text
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2 import nd2_acquisition as ACQ
+    from nodelab_v2.acquisition_view import (channel_tooltip, info_sections,
+                                             series_time_rows)
+    from nodelab_v2.runner import pinned_seed_metadata
+
+    AZ = -7 * 3600
+    names = list(_CRC1_STAMPS)
+
+    # ── 1. composition and zone ─────────────────────────────────────────────────
+    jd0, rels = _CRC1_STAMPS["CRC_1_T1.nd2"]
+    stamp = (jd0, rels[0])
+    assert ACQ.frame_jd(stamp, rels[0]) == jd0
+    assert abs((ACQ.frame_jd(stamp, rels[1]) - jd0) * 86400 - (rels[1] - rels[0]) / 1000) < 1e-3
+    assert jd_to_datetime_text(jd0, AZ) == "2026-10-06 20:07:27.028", jd_to_datetime_text(jd0, AZ)
+    assert jd_to_datetime_text(jd0) == "2026-10-07 03:07:27.028", "offset 0 is UTC"
+    # the run's start = frame 0 less its relative time = the JOBS folder name, to the ms
+    start = jd_to_datetime_text(jd0 - rels[0] / 86_400_000, AZ)
+    assert start == "2026-10-06 19:47:21.215", start
+    # T1's last acquired frame (70558852.2 ms) against its own `date` (local, at close)
+    last = ACQ.frame_jd(stamp, 70558852.2)
+    assert ACQ.utc_offset("10/7/2026  3:23:20 PM", [last, jd0]) == (AZ, "file")
+    assert ACQ.utc_offset("10/7/2026  3:23:20 PM", [last])[1] == "file"
+    off, src = ACQ.utc_offset("1/1/2000  1:02:03 AM", [last])
+    assert src == "this computer" and isinstance(off, int), (off, src)
+    assert ACQ.offset_text(AZ) == "UTC-07:00" and ACQ.offset_text(19800) == "UTC+05:30"
+
+    # ── 2. the series through the real Builder ──────────────────────────────────
+    def clock(name, sdk=False):
+        j0, rs = _CRC1_STAMPS[name]
+        return [j0 + (r if sdk else r - rs[0]) / 86_400_000 for r in rs]
+
+    def card(fid, name, jd, cut_t=None):
+        t = len(jd)
+        a = np.zeros((1, t, 1, 1, 4, 4), dtype=np.uint16)
+        for i in range(t):
+            a[0, i] = 10 * fid + i                    # value = (file, own frame)
+        md = {"pixel_size_um": 0.86, SOURCE_FILE_KEY: [name], "frame_time_jd": list(jd),
+              "frame_datetime": [jd_to_datetime_text(v, AZ) for v in jd],
+              "utc_offset_s": AZ, "dt_s": 9800.0}
+        return Dataset(axes=AxisSizes(m=1, t=t, z=1, c=1, y=4, x=4),
+                       metadata=md).with_image(ArrayProvider(a))
+
+    def run(seeds, *, crop_after=None, crop_before=None, export=None, model="ome"):
+        nodes = {f"L{i}": NodeInstance(f"L{i}", "io.load") for i in range(len(seeds))}
+        nodes["C"] = NodeInstance("C", "util.timeseries")      # T, time: the defaults
+        edges = []
+        for i in range(len(seeds)):
+            sock = "data" if i == 0 else f"file_{i + 1}"
+            if crop_before is not None and crop_before[0] == i:
+                nodes["K0"] = NodeInstance("K0", "util.crop", modes={"region": "frames"},
+                                           params={"frames": crop_before[1]})
+                edges += [Edge(f"L{i}", "K0", "image", "data"), Edge("K0", "C", "out", sock)]
+            else:
+                edges.append(Edge(f"L{i}", "C", "image", sock))
+        pull = "C"
+        if crop_after is not None:
+            nodes["K"] = NodeInstance("K", "util.crop", modes={"region": "frames"},
+                                      params={"frames": crop_after})
+            edges.append(Edge("C", "K", "out", "data"))
+            pull = "K"
+        if export is not None:
+            nodes["W"] = NodeInstance("W", "io.write_tiff", params={"path": export},
+                                      modes={"model": model})
+            edges.append(Edge(pull, "W", "out", "data"))
+            pull = "W"
+        g = Graph(nodes=nodes, edges=edges)
+        eng = Engine(g, computes=COMPUTES, seeds={f"L{i}": d for i, d in enumerate(seeds)},
+                     meta_seeds={f"L{i}": MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                 for i, d in enumerate(seeds)})
+        return eng, eng.pull(pull), pull
+
+    def frames(ds):
+        return [int(ds.image.get_region(0, 0, t, 0, 0, 0, 4, 0, 4)[0, 0])
+                for t in range(int(ds.axes.t))]
+
+    round_robin = [10 * (k % 5 + 1) + k // 5 for k in range(38)]
+    true_rank = {v: i for i, v in enumerate(round_robin)}
+
+    # the SDK's composition: the twitch, through the real node
+    sdk = [card(i + 1, n, clock(n, sdk=True)) for i, n in enumerate(names)]
+    _e, out_sdk, _p = run(sdk)
+    got = [true_rank[v] for v in frames(out_sdk)]
+    assert got[:12] == [0, 1, 2, 5, 3, 6, 4, 7, 10, 8, 11, 9], got[:12]
+    assert sum(b < a for a, b in zip(got, got[1:])) == 14, "14 steps back in time"
+
+    # the corrected clock: round robin, every step forward, ~32.7 min apart
+    seeds = [card(i + 1, n, clock(n)) for i, n in enumerate(names)]
+    eng, out, _p = run(seeds)
+    assert out.axes.t == 38 and frames(out) == round_robin, frames(out)
+    jd = out.metadata["frame_time_jd"]
+    steps = [(b - a) * 86400 for a, b in zip(jd, jd[1:])]
+    assert all(1940 < s < 1975 for s in steps), (min(steps), max(steps))
+    assert abs(out.metadata["dt_s"] - 1960) < 15, out.metadata["dt_s"]
+    assert out.metadata["frame_datetime"][0] == "2026-10-06 20:07:27.028"
+    assert out.metadata["frame_datetime"][5].startswith("2026-10-06 22:50:46"), \
+        "output frame 5 is T1's second timepoint"
+    assert out.metadata["utc_offset_s"] == AZ
+    note = out.metadata["__chain__"]
+    assert note["interleaved"] and "2026-10-06 20:07:27.028 → 2026-10-07 16:15:05" in note["note"], \
+        note["note"]
+    assert note["first_frame"][0] == "2026-10-06 20:07:27.028", note["first_frame"]
+    # the chain's file-level ORDER under the same five clocks
+    mems, _n, prob = chain_members([(d.metadata, d.axes) for d in seeds], "t", order="time")
+    assert prob is None and chain_frame_order(mems, "t", "time") is not None
+
+    # ── 3. the partial last frame cropped out, after or before the Builder ───────
+    want_jd = jd[:37]
+    for how in ("after", "before"):
+        kw = ({"crop_after": "t0-36"} if how == "after" else {"crop_before": (2, "t0-6")})
+        eng_c, out_c, pull = run([card(i + 1, n, clock(n)) for i, n in enumerate(names)], **kw)
+        assert out_c.axes.t == 37 and frames(out_c) == round_robin[:37], (how, frames(out_c))
+        assert out_c.metadata["frame_time_jd"] == want_jd, how
+        fd = out_c.metadata["frame_datetime"]
+        assert len(fd) == 37 and fd[0] == "2026-10-06 20:07:27.028", (how, fd[0])
+        assert fd[36].startswith("2026-10-07 15:42:26"), (how, fd[36])    # T2's t7
+        assert eng_c.env(pull).metadata.get("frame_time_jd") == want_jd, \
+            f"{how}: the edit-time envelope carries the same clock as the pull"
+        assert abs(out_c.metadata["dt_s"] - 1960) < 15, (how, out_c.metadata.get("dt_s"))
+        rows = dict(series_time_rows(out_c.metadata, 37))
+        assert rows["Frames (T)"] == "37" and rows["First frame"].startswith(
+            "2026-10-06 20:07:27.028") and "UTC-07:00" in rows["First frame"], rows
+        assert rows["Last frame"].startswith("2026-10-07 15:42:26"), rows
+
+    # ...and the export writes exactly those times
+    try:
+        import tifffile
+    except Exception:  # noqa: BLE001
+        tifffile = None
+    tmp = tempfile.mkdtemp(prefix="nd2sb_clock_")
+    try:
+        if tifffile is not None:
+            p_ome = os.path.join(tmp, "crc.ome.tif")
+            run([card(i + 1, n, clock(n)) for i, n in enumerate(names)],
+                crop_after="t0-36", export=p_ome)
+            with tifffile.TiffFile(p_ome) as tf:
+                xml = tf.ome_metadata
+            assert ("<AcquisitionDate>2026-10-06T20:07:27.028-07:00</AcquisitionDate>"
+                    in xml), xml[:600]
+            dts = [float(v) for v in re.findall(r'DeltaT="([0-9.eE+-]+)"', xml)]
+            secs = [(v - want_jd[0]) * 86400 for v in want_jd]
+            assert len(dts) == 37 and all(abs(a - b) < 1e-3 for a, b in zip(dts, secs)), \
+                (len(dts), dts[:3], secs[:3])
+            assert 'K="t0036">2026-10-07 15:42:26' in xml, "every frame's local time"
+            p_ij = os.path.join(tmp, "crc_ij.tif")
+            run([card(i + 1, n, clock(n)) for i, n in enumerate(names)],
+                crop_after="t0-36", export=p_ij, model="imagej")
+            with tifffile.TiffFile(p_ij) as tf:
+                ij = tf.imagej_metadata
+            labels = list(ij.get("Labels") or [])
+            assert len(labels) == 37 and "2026-10-06 20:07:27.028" in labels[0], labels[:2]
+            assert "2026-10-07 15:42:26" in labels[36], labels[36]
+            assert "Frame times (UTC-07:00" in str(ij.get("Info") or ""), ij.get("Info")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── 4. a T pin subsets the clock with the frames ─────────────────────────────
+    disp = {"frame_time_jd": [1.0, 2.0, 3.0, 4.0], "frame_datetime": ["a", "b", "c", "d"],
+            "stage_xy_um": [(0.0, 0.0), (1.0, 1.0)]}
+    md_p = pinned_seed_metadata({}, disp, ((1,), (1, 3), None, None), 2, 4)
+    assert md_p["frame_time_jd"] == [2.0, 4.0] and md_p["frame_datetime"] == ["b", "d"], md_p
+    assert md_p["stage_xy_um"] == [(1.0, 1.0)], md_p
+    assert pinned_seed_metadata({}, disp, None, 2, 4)["frame_time_jd"] == [1.0, 2.0, 3.0, 4.0]
+    short = pinned_seed_metadata({}, {"frame_time_jd": [1.0, 2.0]}, (None, (3,), None, None), 1, 4)
+    assert "frame_time_jd" not in short, "a list too short to subset is dropped, not padded"
+
+    # ── 5. the acquisition record ────────────────────────────────────────────────
+    chans = [NS(channel=NS(name=n, excitationLambdaNm=ex, emissionLambdaNm=em,
+                           color=NS(r=r, g=g, b=b)),
+                microscope=NS(modalityFlags=["fluorescence", "laserScanConfocal"],
+                              objectiveName="PLAN APO 10x", objectiveMagnification=10.0,
+                              objectiveNumericalAperture=0.45, immersionRefractiveIndex=1.0,
+                              zoomMagnification=4.0, projectiveMagnification=None,
+                              pinholeDiameterUm=37.48),
+                volume=NS(axesCalibration=(0.859, 0.859, 15.0)))
+             for n, ex, em, (r, g, b) in (("p53-GFP", 488.0, 499.0, (54, 255, 0)),
+                                          ("ERK-mRuby2", 561.0, 571.0, (255, 0, 255)),
+                                          ("H2B-iRFP670", 640.0, 655.0, (165, 0, 0)))]
+    ev = {"Time [s]": [1205.8, 1211.8], "T Index": [0, 0],
+          "p53-GFP - Gain [%]": [50.0, 50.0], "p53-GFP - Laser Power [%]": [3.0, 3.0],
+          "ERK-mRuby2 - Gain [%]": [40.0, 40.0], "ERK-mRuby2 - Laser Power [%]": [20.0, 20.0],
+          "H2B-iRFP670 - Gain [%]": [75.0, 75.0],
+          "H2B-iRFP670 - Laser Power [%]": [10.0, 10.0],
+          "PFS Offset": [7827, 7636], "X Coord [µm]": [43356.7, 41773.0]}
+    fake = NS(text_info={"capturing": _CRC1_CAPTURING, "date": "10/7/2026  3:23:20 PM",
+                         "optics": "PLAN APO 10x", "description": "Camera Name: AX\n"},
+              metadata=NS(channels=chans), events=lambda orient="list": ev,
+              custom_data={"AppInfo_V1_0": {"SWNameString": "NIS-Elements AR",
+                                            "VersionString": "6.02.01"}},
+              experiment=[], sizes={"T": 8, "P": 40, "Z": 3, "C": 3, "Y": 2048, "X": 2048},
+              attributes=NS(bitsPerComponentSignificant=12, compressionType=None),
+              dtype="uint16")
+    rec = ACQ.acquisition_record(fake, channel_names=[c.channel.name for c in chans],
+                                 frame_jd_first=jd0, frame_jd_last=last, utc_offset_s=AZ,
+                                 utc_offset_source="file", stamp=stamp)
+    per = rec["channel_acquisition"]
+    assert len(per) == 3
+    gfp = dict((k, v) for k, v in per[0])
+    assert gfp["Laser 488 nm"] == "Enabled, Power 3.0, Laser Port Standard", gfp
+    assert gfp["Gain"] == "50.0" and gfp["Detector"] == "2" and gfp["Offset"] == "0", gfp
+    assert gfp["Emission Range"] == "499 nm - 551 nm" and gfp["Pinhole Size"] == "37.5 µm"
+    assert gfp["Laser Power (recorded)"] == "3 %" and gfp["Gain (recorded)"] == "50 %", gfp
+    assert gfp["Excitation"] == "488 nm" and gfp["Display colour"] == "#36ff00", gfp
+    erk = dict((k, v) for k, v in per[1])
+    assert erk["Laser 561 nm"].startswith("Enabled, Power 20.0") and erk["Gain"] == "40.0", erk
+    sec = dict((t, dict((k, v) for k, v in rows)) for t, rows in rec["acquisition_info"])
+    assert sec["Acquisition settings"]["Configuration › Dwell Time"] == "0.8 usec", sec
+    assert sec["Time"]["First frame"] == "2026-10-06 20:07:27 (UTC-07:00)", sec["Time"]
+    assert sec["Time"]["Last frame"] == "2026-10-07 15:23:20 (UTC-07:00)", sec["Time"]
+    assert sec["Time"]["Run started"].startswith("2026-10-06 19:47:21"), sec["Time"]
+    assert sec["Recorded data (per frame)"]["PFS Offset"].startswith("7636 – 7827"), sec
+    assert "p53-GFP - Gain" not in sec["Recorded data (per frame)"], \
+        "a channel's recorded data is listed under the channel, not the file"
+    assert sec["File"]["Software"] == "NIS-Elements AR 6.02.01", sec["File"]
+    # a channel tap keeps ITS channel's rows (PER_CHANNEL_KEYS)
+    md_c = {"channel_names": [c.channel.name for c in chans], "channel_acquisition": per}
+    tap = channel_subset(md_c, [1])
+    assert tap["channel_names"] == ["ERK-mRuby2"] and tap["channel_acquisition"] == [per[1]]
+    tip = channel_tooltip(tap, 0, "ERK-mRuby2", emission_nm=571.0, hint="click")
+    assert "ERK-mRuby2 · 571 nm" in tip and "Laser 561 nm" in tip and "Power 20.0" in tip, tip
+    assert "Laser 488 nm" not in tip, "another channel's laser never leaks into the tip"
+    md_i = dict(out.metadata, **md_c, acquisition_info=rec["acquisition_info"])
+    titles = [t for t, _r in info_sections(md_i, AxisSizes(m=1, t=38, z=1, c=3, y=4, x=4))]
+    assert titles[0] == "This series — time" and titles[1] == "This series — files", titles
+    assert "Source file (the series' first file) — Time" in titles, titles
+    assert titles[-3:] == ["Channel 1: p53-GFP", "Channel 2: ERK-mRuby2",
+                           "Channel 3: H2B-iRFP670"], titles
+
+    # ── 6. the real files ────────────────────────────────────────────────────────
+    paths = [os.path.join(_CRC1_DIR, n) for n in names]
+    if all(os.path.exists(p) for p in paths):
+        from nodelab_v2.nd2_meta import read_nd2_metadata_extended
+        for n, p in zip(names, paths):
+            md = read_nd2_metadata_extended(p)
+            assert md["utc_offset_s"] == AZ and md["utc_offset_source"] == "file", \
+                (n, md.get("utc_offset_s"), md.get("utc_offset_source"))
+            got = md["frame_time_jd"]
+            assert len(got) == len(clock(n)) and all(
+                abs(a - b) * 86400 < 0.005 for a, b in zip(got, clock(n))), n
+            assert md["frame_datetime"][0][:19] == jd_to_datetime_text(clock(n)[0], AZ)[:19], n
+            assert md["channel_acquisition"] and md["acquisition_info"], n
+        md1 = read_nd2_metadata_extended(paths[0])
+        assert md1["acquisition_start"] == "2026-10-06 20:07:27", md1["acquisition_start"]
+        assert dict(md1["channel_acquisition"][0])["Laser Power (recorded)"] == "3 %"
+        real = "the real CRC_1 files read to that clock, UTC-7 from their own dates"
+    else:
+        real = "real CRC_1 files not on this machine — their numbers are pinned above"
+
+    _ok("ND2 true clock (2026-10-13): frame k = frame 0's UTC stamp + (rel[k] - rel[0]); "
+        "the SDK's jd0 + rel reproduces the CRC_1 twitch through the real Builder (true "
+        "frames 0,1,2,5,3,6,4,7,…, 14 steps back) and the corrected clock plays T1..T5 "
+        "round robin 32.7 min apart; the run start lands on the JOBS folder's 19:47:21.215; "
+        "the file's own local date gives UTC-7; cropping the stopped run's partial frame "
+        "after OR before the Builder leaves 37 frames in true order with local times, and "
+        "OME/ImageJ exports write those same times; a T pin subsets the seed's clock; the "
+        "NIS settings parse into per-channel laser/gain/detector rows that follow a channel "
+        f"tap into the Viewer's tooltip and Info window; {real}")
+
+
+def test_standard_curve_trendline() -> None:
+    """A standard curve end to end (2026-10-13): Table Concat's numeric ``condition_value``
+    and Plot XY's ``fit`` / ``zero_x``.
+
+    1. ``xy_fit`` fits IN THE PLOTTED COORDINATES: an exact power law on log-log axes comes
+       back as its own A and b with R² = 1; an exact line on linear axes as its slope and
+       intercept; fewer than two distinct x gives no fit.
+    2. ``xy_zero_refs`` averages EVERY blank row — a background-subtracted blank scatters
+       around 0 — and marks a mean <= 0 not drawable on a log y axis rather than averaging
+       only the positive rows (the bug that drew a config-2 blank at +5 when it was -2).
+    3. Table Concat writes ``condition_value`` only when every condition is a number, and
+       its edit-time column list says so too.
+    4. Plot XY through the Engine: the trendline per series matches ``xy_fit`` on the
+       means it draws, the blank becomes each series' reference and is NOT in the fit, the
+       defaults (``none`` / ``drop``) leave the old figure unchanged, and the new modes fold
+       into the recipe hash.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.registry import NODES
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # 1. the fit
+    xs = np.array([500.0, 1000.0, 2500.0, 5000.0])
+    f = FIG.xy_fit(xs, 3.0 * xs ** 0.8, log_x=True, log_y=True)
+    assert abs(f["slope"] - 0.8) < 1e-9 and abs(10 ** f["intercept"] - 3.0) < 1e-9, f
+    assert abs(f["r2"] - 1.0) < 1e-12 and "x^0.800" in f["text"], f
+    g = FIG.xy_fit(xs, 2.0 * xs + 5.0)
+    assert abs(g["slope"] - 2.0) < 1e-9 and abs(g["intercept"] - 5.0) < 1e-6, g
+    assert FIG.xy_fit([1.0, 1.0], [2.0, 3.0]) is None, "one distinct x fixes no line"
+    assert FIG.xy_fit([0.0, 10.0], [1.0, 2.0], log_x=True) is None, "x = 0 is off a log axis"
+
+    # 2. the blank level
+    refs = FIG.xy_zero_refs([0, 0, 0, 500], [-2.0, 1.0, -1.0, 9.0], ["a", "a", "a", "a"],
+                            log_y=True)
+    assert abs(refs["a"]["y"] + 2.0 / 3.0) < 1e-12 and refs["a"]["n"] == 3, refs
+    assert refs["a"]["drawable"] is False, "a mean <= 0 is not drawn on a log y axis"
+    assert FIG.xy_zero_refs([0], [-1.0])[""]["drawable"] is True, "linear y draws it"
+
+    # 3 + 4. wells → concat → plot
+    ax = AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4)
+
+    def well(level, n=4):
+        sig = np.concatenate([[level * (1.0 - 0.3 * tt) + d for d in (-1.0, 0.0, 1.0, 0.0)]
+                              for tt in (0, 1)])
+        rows = {"id": np.arange(1, 2 * n + 1), "m": np.zeros(2 * n, int),
+                "t": np.repeat([0, 1], n), "c": np.zeros(2 * n, int), "z": np.zeros(2 * n),
+                "y": np.zeros(2 * n), "x": np.zeros(2 * n), "sig": sig}
+        ds = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+            ArrayProvider(np.zeros((1, 2, 1, 1, 4, 4))))
+        return ds.with_structure(StructureTable(Domain.LABEL, rows, layer="beads"))
+
+    seeds = {"A": well(3.0 * 5000 ** 0.8), "B": well(3.0 * 1000 ** 0.8),
+             "C": well(3.0 * 500 ** 0.8), "Z": well(0.0)}
+
+    def run(names, plot_modes=None, plot=True):
+        nodes = {k: NodeInstance(k, "io.load") for k in seeds}
+        nodes["K"] = NodeInstance("K", "table.concat",
+                                  params={"names": names, "name": "curve"})
+        edges = [Edge(k, "K", "image", "data") for k in seeds]
+        if plot:
+            nodes["P"] = NodeInstance("P", "plot.xy", modes=dict(
+                {"error": "sem", "kind": "scatter"}, **(plot_modes or {})),
+                params={"table": "curve", "x": "condition_value", "y": "sig",
+                        "group_by": "t", "log_x": True, "log_y": True})
+            edges.append(Edge("K", "P", "out", "data"))
+        return Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds=seeds,
+                      meta_seeds={k: MetaEnvelope(axes=d.axes, metadata=d.metadata)
+                                  for k, d in seeds.items()})
+
+    eng = run("5000,1000,500,0", {"fit": "linear", "zero_x": "reference_line"})
+    k = eng.pull("K")
+    cols = {a.name: np.asarray(a.values) for a in k.layers_on(Domain.LABEL) if a.layer == "curve"}
+    assert sorted(np.unique(cols["condition_value"]).tolist()) == [0.0, 500.0, 1000.0, 5000.0]
+    assert cols["condition_value"].dtype.kind == "f" and cols["condition"].dtype.kind == "U"
+    declared = {c for _d, lyr, c in NODES.get("table.concat").adds_columns(
+        {"names": "5000,1000,500,0", "name": "curve"}, {"domain": "label"}, (),
+        [(None, eng.env(n)) for n in "ABCZ"]) if lyr == "curve"}
+    assert "condition_value" in declared, declared
+    k2 = run("high,1000,500,0", plot=False).pull("K")
+    assert not any(a.name == "condition_value" for a in k2.layers_on(Domain.LABEL)), \
+        "one text label makes the conditions categories: no numeric column"
+
+    spec = eng.pull("P").metadata["figure_spec"]
+    series = {s["label"]: s for s in spec["series"]}
+    assert sorted(series) == ["0", "1"], sorted(series)
+    for lab, s in series.items():
+        assert s["x"] == [500.0, 1000.0, 5000.0], s["x"]        # blanks are not points
+        ref = FIG.xy_fit(s["x"], s["y"], log_x=True, log_y=True)
+        assert abs(s["fit"]["slope"] - ref["slope"]) < 1e-12 and s["fit"]["r2"] > 0.999, s["fit"]
+        assert abs(s["fit"]["slope"] - 0.8) < 1e-6, s["fit"]
+        assert s["zero_ref"]["n"] == 4 and abs(s["zero_ref"]["y"]) < 1e-12 and \
+            s["zero_ref"]["drawable"] is False, s["zero_ref"]
+        assert s["legend"].startswith(f"{lab} — y = ") and "R² = " in s["legend"], s["legend"]
+    plain = run("5000,1000,500,0").pull("P").metadata["figure_spec"]
+    assert not any("fit" in s or "zero_ref" in s for s in plain["series"]), \
+        "the defaults draw exactly the old figure"
+    e2 = run("5000,1000,500,0")
+    e2.pull("P")
+    assert e2.entry("P").recipe_hash != eng.entry("P").recipe_hash, "fit/zero_x key the memo"
+    _ok("standard curve (2026-10-13): xy_fit fits in the plotted coordinates (a power law on "
+        "log-log is its own A and b, R² 1); the x <= 0 reference averages every blank row and "
+        "marks a mean <= 0 undrawable on log y; Table Concat writes condition_value only for "
+        "all-numeric conditions and declares it at edit time; Plot XY fits each series' means, "
+        "keeps the blank out of the fit as its reference, defaults to the old figure, and keys "
+        "the memo on the new modes")
+
+
+
+def test_pooled_pixel_spread() -> None:
+    """Error bars over every PIXEL of every object, not over the object means (2026-10-13).
+
+    1. The Voxel->Label bridge's ``std`` is each region's sample SD (n - 1), NaN for a
+       one-voxel region, equal to numpy's on the region's own voxels; Measure writes it as
+       ``std_intensity`` and declares it at edit time.
+    2. ``pooled_stats`` on (mean, count, SD) per object IS the mean and n - 1 SD of the
+       pooled raw values — checked against literally concatenating them — and skips a row
+       it cannot pool.
+    3. Plot XY ``error = pooled_sd`` through the Engine: each point is the pixel-weighted
+       mean at its x and its bar the SD of all those pixels (not the SD of the means,
+       which ``sd`` keeps), ``n_pooled`` counts the pixels, the blank reference is pixel-weighted too,
+       a missing Pool SD column is refused by name, and the mode keys the memo.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.bridges import voxel_to_label
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # 1. the bridge
+    lab = np.zeros((1, 1, 1, 1, 6, 6), dtype=np.int64)
+    lab[..., 0:2, 0:3] = 1
+    lab[..., 4:6, 2:6] = 2
+    lab[..., 3, 0] = 3
+    val = (np.arange(36, dtype=float).reshape(lab.shape) * 7.0) % 23.0
+    ids, sd = voxel_to_label(val, lab, "std")
+    want = [np.std(val[lab == k], ddof=1) for k in (1, 2)]
+    assert ids.tolist() == [1, 2, 3] and np.allclose(sd[:2], want, atol=1e-12), (sd, want)
+    assert np.isnan(sd[2]), "one voxel has no sample SD"
+    cols = {c for _d, _l, c in NODES.get("analysis.measure").adds_columns(
+        {"labels": "labels", "stats": "mean,count,std"}, {"target": "label"}, ())}
+    assert "std_intensity" in cols, cols
+
+    # 2. the pooling identity
+    objs = [np.array([10.0, 12.0, 14.0]), np.array([20.0, 21.0]), np.array([30.0]),
+            np.array([5.0, 9.0, 13.0, 17.0])]
+    allv = np.concatenate(objs)
+    m, s, n = FIG.pooled_stats([o.mean() for o in objs], [o.size for o in objs],
+                               [o.std(ddof=1) if o.size > 1 else np.nan for o in objs])
+    assert n == allv.size and abs(m - allv.mean()) < 1e-12, (m, allv.mean())
+    assert abs(s - allv.std(ddof=1)) < 1e-12, (s, allv.std(ddof=1))
+    m2, _s2, n2 = FIG.pooled_stats([1.0, 2.0], [3, 4], [np.nan, 1.0])
+    assert n2 == 4 and m2 == 2.0, "a multi-pixel row with no SD cannot be pooled"
+
+    # 3. Plot XY through the Engine: two "wells" (x = 100, 0) of three beads each
+    beads = {100.0: [np.array([50.0, 60.0, 70.0, 80.0]), np.array([90.0, 95.0]),
+                     np.array([40.0, 44.0, 48.0])],
+             0.0: [np.array([1.0, 3.0]), np.array([-2.0, 0.0, 2.0, 4.0]), np.array([5.0])]}
+    rows = [(xv, b) for xv, bl in beads.items() for b in bl]
+    k = len(rows)
+    tab = {"id": np.arange(1, k + 1), "m": np.zeros(k, int), "t": np.zeros(k, int),
+           "c": np.zeros(k, int), "z": np.zeros(k), "y": np.zeros(k), "x": np.zeros(k),
+           "conc": np.array([r[0] for r in rows]),
+           "sig": np.array([r[1].mean() for r in rows]),
+           "area": np.array([r[1].size for r in rows]),
+           "std_intensity": np.array([r[1].std(ddof=1) if r[1].size > 1 else np.nan
+                                      for r in rows])}
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, tab, layer="beads"))
+
+    def plot(modes, params=None):
+        p = {"table": "beads", "x": "conc", "y": "sig", **(params or {})}
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "P": NodeInstance("P", "plot.xy", modes=modes, params=p)},
+                  edges=[Edge("S", "P", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)})
+        return e, e.pull("P").metadata["figure_spec"]["series"]
+
+    e_p, ser = plot({"error": "pooled_sd", "zero_x": "reference_line"})
+    px100 = np.concatenate(beads[100.0])
+    assert ser[0]["x"] == [100.0], ser[0]["x"]
+    assert abs(ser[0]["y"][0] - px100.mean()) < 1e-12, (ser[0]["y"], px100.mean())
+    assert abs(ser[0]["err"][0] - px100.std(ddof=1)) < 1e-12, ser[0]["err"]
+    assert ser[0]["n_pooled"] == [px100.size], ser[0]["n_pooled"]
+    sd_means = np.std([b.mean() for b in beads[100.0]], ddof=1)
+    px0 = np.concatenate(beads[0.0])
+    assert abs(ser[0]["zero_ref"]["y"] - px0.mean()) < 1e-12, ser[0]["zero_ref"]
+    e_s, ser_sd = plot({"error": "sd", "zero_x": "reference_line"})
+    assert abs(ser_sd[0]["err"][0] - sd_means) < 1e-12, "sd stays the SD of the means"
+    assert e_p.entry("P").recipe_hash != e_s.entry("P").recipe_hash, "error keys the memo"
+    try:
+        plot({"error": "pooled_sd"}, {"pool_sd": "nope"})
+    except Exception as ex:                            # noqa: BLE001 — the refusal itself
+        assert "nope" in str(ex), ex
+    else:
+        raise AssertionError("pooled_sd accepted a missing Pool SD column")
+    _ok("pooled pixel spread (2026-10-13): the bridge's std is each region's n-1 SD (NaN "
+        "for one voxel) and Measure declares std_intensity; pooled_stats on (mean, count, "
+        "SD) equals the mean and SD of the concatenated pixels; Plot XY pooled_sd plots the "
+        "pixel-weighted mean with the SD of every pixel (sd keeps the SD of the means), "
+        "counts the pixels, weighs the blank by pixels too, refuses a missing column and "
+        "keys the memo")
+
+
+def test_unique_objects_langmuir() -> None:
+    """One bead seen from several overlapping positions, and the curve it feeds (2026-10-13).
+
+    1. ``table.unique_objects`` links rows whose stage positions agree within the tolerance
+       (single linkage) into one ``object_uid``, numbers each object's sightings in
+       ``order_by`` order (``t,m``) with rows of ONE frame sharing a sighting, counts
+       ``sightings`` before ``keep_first`` drops the later ones into a NEW table, leaves the
+       input table whole, gives a row with no position an object of its own, and refuses a
+       missing position column or a Name equal to the table it reads. Its edit-time columns
+       announce the three new ones.
+    2. Connected Components ``regions = whole``: a background that two objects cut into
+       pockets is ONE region per frame (what a per-frame Table Join needs), area = the whole
+       foreground, centroid = the foreground's; ``components`` is unchanged and the mode keys
+       the memo.
+    3. Plot XY ``fit = langmuir`` recovers an exact Bmax and Kd in data units with R² = 1,
+       on log axes too; ``zero_x = reference_line`` now takes x <= 0 rows out of the points
+       and the fit on a LINEAR x axis as well, while ``drop`` keeps them as points there.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable, label_components
+
+    # 1. unique objects ------------------------------------------------------------------
+    #    A at (100, 200): t0 m0, t0 m1 (0.6 um off), t1 m0, t1 m1, t2 m0
+    #    B at (110, 200): t0 m1 as TWO fragments 0.8 um apart (one sighting), t2 m1
+    #    C: no stage position
+    rows = [  # (t, m, sx, sy)
+        (0, 0, 100.0, 200.0), (0, 1, 100.6, 200.0), (1, 0, 100.1, 200.1),
+        (1, 1, 100.5, 199.9), (2, 0, 100.0, 199.8),
+        (0, 1, 110.0, 200.0), (0, 1, 110.8, 200.0), (2, 1, 110.2, 200.1),
+        (1, 0, float("nan"), float("nan")),
+    ]
+    n = len(rows)
+    tab = {"id": np.arange(1, n + 1), "m": np.array([r[1] for r in rows]),
+           "t": np.array([r[0] for r in rows]), "c": np.zeros(n, int), "z": np.zeros(n),
+           "y": np.zeros(n), "x": np.zeros(n),
+           "stage_x_um": np.array([r[2] for r in rows]),
+           "stage_y_um": np.array([r[3] for r in rows]),
+           "sig": np.arange(n, dtype=float)}
+    ax = AxisSizes(m=2, t=3, z=1, c=1, y=4, x=4)
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((2, 3, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, tab, layer="beads"))
+
+    def uq(params):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "U": NodeInstance("U", "table.unique_objects", params=params)},
+                  edges=[Edge("S", "U", "image", "data")])
+        return Engine(g, computes=COMPUTES, seeds={"S": seed},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)})
+
+    eng = uq({"table": "beads", "tolerance": 3.0})
+    out = eng.pull("U")
+    got = {a.name: np.asarray(a.values) for a in out.layers_on(Domain.LABEL)
+           if a.layer == "unique"}
+    whole = {a.name: np.asarray(a.values) for a in out.layers_on(Domain.LABEL)
+             if a.layer == "beads"}
+    assert len(whole["id"]) == n and "object_uid" not in whole, "the input table is untouched"
+    assert len(got["id"]) == n, "keep_first 0 keeps every row"
+    uid, s, tot = got["object_uid"], got["sighting"], got["sightings"]
+    assert uid[:5].tolist() == [1] * 5 and s[:5].tolist() == [0, 1, 2, 3, 4], (uid, s)
+    assert set(tot[:5].tolist()) == {5}, tot
+    # B: first seen at (t0, m1) — after A's (t0, m0), before A's (t0, m1)? no: uids follow
+    # first sightings in (t, m) order, and A's first is (0, 0), B's first (0, 1)
+    assert uid[5] == uid[6] == uid[7] == 2, uid
+    assert s[5] == s[6] == 0 and s[7] == 1 and set(tot[5:8].tolist()) == {2}, (s, tot)
+    assert uid[8] == 3 and s[8] == 0 and tot[8] == 1, "no position: an object of its own"
+    tight = uq({"table": "beads", "tolerance": 0.1}).pull("U")
+    tu = {a.name: np.asarray(a.values) for a in tight.layers_on(Domain.LABEL)
+          if a.layer == "unique"}["object_uid"]
+    assert len(set(tu[:5].tolist())) > 1, "a tolerance below the rows' 0.14-0.6 um offsets splits A"
+    kept = uq({"table": "beads", "tolerance": 3.0, "keep_first": 2, "name": "first2"}).pull("U")
+    k2 = {a.name: np.asarray(a.values) for a in kept.layers_on(Domain.LABEL)
+          if a.layer == "first2"}
+    assert k2["sig"].tolist() == [0.0, 1.0, 5.0, 6.0, 7.0, 8.0], k2["sig"]
+    assert k2["sightings"].tolist() == [5, 5, 2, 2, 2, 1], "sightings counts before the cut"
+    rev = uq({"table": "beads", "tolerance": 3.0, "keep_first": 1,
+              "order_by": "m,t"}).pull("U")
+    rs = {a.name: np.asarray(a.values) for a in rev.layers_on(Domain.LABEL)
+          if a.layer == "unique"}["sig"]
+    assert rs.tolist() == [0.0, 5.0, 6.0, 8.0], rs        # m before t: (0,0) still first
+    for bad, frag in (({"table": "beads", "x": "nope"}, "nope"),
+                      ({"table": "beads", "name": "beads"}, "Name")):
+        try:
+            uq(bad).pull("U")
+        except Exception as ex:                        # noqa: BLE001 — the refusal itself
+            assert frag in str(ex), ex
+        else:
+            raise AssertionError(f"Unique Objects accepted {bad}")
+    declared = {c for _d, lyr, c in NODES.get("table.unique_objects").adds_columns(
+        {"table": "beads"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "stage_x_um"), (Domain.LABEL, "beads", "sig")))
+        if lyr == "unique"}
+    assert {"object_uid", "sighting", "sightings", "stage_x_um"} <= declared, declared
+
+    # 2. Connected Components, regions = whole -------------------------------------------
+    m2 = np.ones((8, 8), int)
+    m2[:, 3] = 0                                         # a wall: two pockets
+    _l, t8 = label_components(m2, 8)
+    lw, tw = label_components(m2, 8, whole=True)
+    assert t8.n == 2 and tw.n == 1 and int(tw.columns["area"][0]) == int(m2.sum()), tw.columns
+    yy, xx = np.nonzero(m2)
+    assert abs(tw.columns["x"][0] - xx.mean()) < 1e-12 and set(np.unique(lw)) == {0, 1}
+    assert label_components(np.zeros((4, 4)), 8, whole=True)[1].n == 0
+    mask6 = np.broadcast_to(m2, (1, 2, 1, 1, 8, 8)).astype(np.uint8).copy()
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=8, x=8)
+    ds2 = Dataset(axes=ax2, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 2, 1, 1, 8, 8)))).with_layer(Domain.VOXEL, "bg", mask6)
+
+    def cc(modes):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "L": NodeInstance("L", "analysis.label", modes=modes,
+                                           params={"mask": "bg", "name": "bgr"})},
+                  edges=[Edge("S", "L", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": ds2},
+                   meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=ds2.metadata)})
+        r = e.pull("L")
+        return e, {a.name: np.asarray(a.values) for a in r.layers_on(Domain.LABEL)
+                   if a.layer == "bgr"}
+    e_c, comp = cc({})
+    e_w, wh = cc({"regions": "whole"})
+    assert len(comp["id"]) == 4 and len(wh["id"]) == 2, (comp["id"], wh["id"])
+    assert wh["t"].tolist() == [0, 1] and set(wh["area"].tolist()) == {int(m2.sum())}
+    assert e_c.entry("L").recipe_hash != e_w.entry("L").recipe_hash, "regions keys the memo"
+
+    # 3. Langmuir and the blank on a linear axis -----------------------------------------
+    xs = np.array([500.0, 1000.0, 2500.0, 5000.0])
+    ys = 3000.0 * xs / (1800.0 + xs)
+    f = FIG.xy_langmuir(xs, ys)
+    assert abs(f["bmax"] - 3000.0) < 1e-6 and abs(f["kd"] - 1800.0) < 1e-6, f
+    assert abs(f["r2"] - 1.0) < 1e-12 and f["x0"] == 0.0 and "Kd = 1800" in f["text"], f
+    fl = FIG.xy_langmuir(xs, ys, log_x=True, log_y=True)
+    assert abs(fl["kd"] - 1800.0) < 1e-6 and fl["x0"] == 500.0, "data units on any axes"
+    assert FIG.xy_langmuir([0.0, 500.0], [1.0, 2.0]) is None, "one x > 0 fixes no curve"
+    x_all = np.concatenate([xs, [0.0, 0.0]])
+    y_all = np.concatenate([ys, [2.0, -4.0]])
+    ser = FIG.xy_series(x_all, y_all, None, "sem")
+    FIG.decorate_xy(ser, x_all, y_all, None, fit="langmuir", zero_x="reference_line")
+    assert ser[0]["x"] == xs.tolist() and len(ser[0]["err"]) == 4, ser[0]
+    assert ser[0]["zero_ref"]["y"] == -1.0 and ser[0]["zero_ref"]["drawable"] is True
+    assert abs(ser[0]["fit"]["kd"] - 1800.0) < 1e-6, "the blank is not in the curve"
+    kept0 = FIG.xy_series(x_all, y_all, None, "sem")
+    FIG.decorate_xy(kept0, x_all, y_all, None, fit="langmuir", zero_x="drop")
+    assert kept0[0]["x"][0] == 0.0 and "zero_ref" not in kept0[0], \
+        "drop on a linear axis keeps x = 0 as a point, as before"
+    _ok("unique objects + langmuir (2026-10-13): rows within the tolerance are one object "
+        "with sightings numbered in t,m order (one frame = one sighting), keep_first cuts "
+        "into a new table with totals counted first, no-position rows stand alone, bad "
+        "columns/names refused, columns announced; Connected Components regions=whole is "
+        "one region per frame and keys the memo; Langmuir recovers Bmax/Kd in data units "
+        "and the linear-axis blank leaves the points and the fit")
+
+
+def test_curate_objects() -> None:
+    """A bead QC review applied by id (2026-10-30): ``table.curate_objects`` drops the rows of
+    the ids in Drop (matched before any merge), gives Merge's ``from`` rows the ``to`` id (chains
+    resolved), keeps every column, the row order and the old id in ``object_uid_before``, skips
+    listed ids the table lacks, writes a new table when named and the read table back over
+    itself only when a table node wrote it; it refuses a blank Name on a measured table, a
+    merge into a dropped id, a cycle, a malformed list and a text id column, and announces the
+    added column."""
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # objects 1..6 over three frames; 5 and 6 are one bead split twice (5>4, 6>5)
+    uids = [1, 2, 3, 4, 1, 2, 3, 5, 1, 3, 6, 2]
+    n = len(uids)
+    tab = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.repeat([0, 1, 2], 4),
+           "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+           "object_uid": np.array(uids, dtype=np.int64), "sig": np.arange(n, dtype=float),
+           "stage_x_um": np.array([0., 100, 200, 300, 0, 100, 200, 300, 0, 200, 300, 100]),
+           "stage_y_um": np.zeros(n)}
+    ax = AxisSizes(m=1, t=3, z=1, c=1, y=4, x=4)
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 3, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, tab, layer="beads"))
+
+    def run(params, chain=False):
+        nodes = {"S": NodeInstance("S", "io.load"),
+                 "C": NodeInstance("C", "table.curate_objects", params=params)}
+        edges = [Edge("S", "C", "image", "data")]
+        if chain:      # a table a table node wrote: Unique Objects' "unique"
+            nodes["U"] = NodeInstance("U", "table.unique_objects",
+                                      params={"table": "beads", "tolerance": 1.0})
+            edges = [Edge("S", "U", "image", "data"), Edge("U", "C", "out", "data")]
+        g = Graph(nodes=nodes, edges=edges)
+        return Engine(g, computes=COMPUTES, seeds={"S": seed},
+                      meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)}).pull("C")
+
+    def table(ds, layer):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.LABEL) if a.layer == layer}
+
+    out = run({"table": "beads", "drop": "2, 99", "merge": "5>4, 6>5", "name": "qc"})
+    q, whole = table(out, "qc"), table(out, "beads")
+    assert len(whole["id"]) == n and "object_uid_before" not in whole, "the input table is whole"
+    assert q["sig"].tolist() == [0., 2, 3, 4, 6, 7, 8, 9, 10], q["sig"]
+    assert q["object_uid"].tolist() == [1, 3, 4, 1, 3, 4, 1, 3, 4], q["object_uid"]
+    assert q["object_uid_before"].tolist() == [1, 3, 4, 1, 3, 5, 1, 3, 6], "old ids kept"
+    assert set(tab) <= set(q), "every column survives"
+    ranged = table(run({"table": "beads", "drop": "1-2", "name": "qc"}), "qc")
+    assert sorted(set(ranged["object_uid"].tolist())) == [3, 4, 5, 6], "a-b is a range"
+    # in place: allowed on a table a table node wrote, refused on a measured one
+    ip = run({"table": "unique", "drop": "1"}, chain=True)
+    u = table(ip, "unique")
+    assert len(u["id"]) == n - 3 and 1 not in u["object_uid"].tolist(), u["object_uid"]
+    assert len(table(ip, "beads")["id"]) == n, "the measured table is untouched"
+    for bad, frag in (({"table": "beads", "drop": "2"}, "Name"),
+                      ({"table": "beads", "drop": "4", "merge": "5>4", "name": "qc"}, "Drop removes"),
+                      ({"table": "beads", "merge": "4>5, 5>4", "name": "qc"}, "cycle"),
+                      ({"table": "beads", "merge": "4>5, 4>6", "name": "qc"}, "both"),
+                      ({"table": "beads", "drop": "two", "name": "qc"}, "not an id"),
+                      ({"table": "beads", "merge": "4-5", "name": "qc"}, "from>to"),
+                      ({"table": "beads", "id_column": "nope", "name": "qc"}, "nope")):
+        try:
+            run(bad)
+        except Exception as ex:                        # noqa: BLE001 — the refusal itself
+            assert frag in str(ex), (bad, ex)
+        else:
+            raise AssertionError(f"Curate Objects accepted {bad}")
+    declared = {(lyr, c) for _d, lyr, c in NODES.get("table.curate_objects").adds_columns(
+        {"table": "beads", "name": "qc"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "object_uid"), (Domain.LABEL, "beads", "sig")))}
+    assert {("qc", "object_uid_before"), ("qc", "sig")} <= declared, declared
+    _ok("curate objects (2026-10-30): Drop removes ids matched before Merge, a-b ranges, "
+        "absent ids skipped; Merge resolves chains and keeps the old id; every column and the "
+        "row order survive; a new table when named, in place only over a table a table node "
+        "wrote; merge-into-dropped, cycles, two-way merges, bad lists and missing columns "
+        "refused; the added column announced")
+
+
+def test_bead_distance_plot() -> None:
+    """Capture beads around a spheroid (2026-10-14): a mosaic's stage Z, and Plot XY's
+    Colour by / Label by.
+
+    1. ``analysis.measure`` after a Stitch: the per-position focus log (``stage_z_um``) is
+       gone, ``origin_um`` still holds the stack's lowest focus, and ``stage_z_um`` comes
+       from it — slice k at z0 + k·step bottom-to-top, z1 - k·step top-to-bottom, z0 for a
+       one-plane field — where it used to be NaN.
+    2. The figure helpers: ``point_text`` rounds with the unit and leaves a missing value
+       unlabelled; ``color_limits`` spans the data (positive values only on a log scale) and
+       honours a fixed end; ``xy_series`` carries each point's colour and label through the
+       x sort, and ``decorate_xy``'s x <= 0 filter keeps them aligned.
+    3. Plot XY through the Engine, per frame: one colour range over EVERY row (both frames
+       share it), the bar's arrow when a value falls under it, a frame's colours and labels
+       are that frame's rows, the options fold into the recipe hash, and under a summarising
+       Error they are not read at all.
+    4. Label placement: five points crowded together get five labels, no two overlapping.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+
+    # 1. stage Z after a stitch ----------------------------------------------------------
+    Z, Y, X = 3, 8, 10
+    rows_n = 3
+    ptab = StructureTable(D.POINT, {
+        "id": np.arange(1, rows_n + 1, dtype=np.int64), "m": np.zeros(rows_n, np.int64),
+        "t": np.zeros(rows_n, np.int64), "c": np.zeros(rows_n, np.int64),
+        "z": np.array([0.0, 1.5, 2.0]), "y": np.array([1.0, 2.0, 3.0]),
+        "x": np.array([4.0, 5.0, 6.0])}, layer="blobs", z_kind="plane_index")
+
+    def stage_z(meta, nz):
+        ax = AxisSizes(m=1, t=1, z=nz, c=1, y=Y, x=X)
+        ds = (Dataset(axes=ax, metadata=meta)
+              .with_image(ArrayProvider(np.zeros((1, 1, nz, 1, Y, X))))
+              .with_structure(ptab))
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "Q": NodeInstance("Q", "analysis.measure",
+                                           modes={"target": "point"})},
+                  edges=[Edge("S", "Q", "image", "data")])
+        out = Engine(g, computes=COMPUTES, seeds={"S": ds},
+                     meta_seeds={"S": MetaEnvelope(axes=ax, metadata=meta)}).pull("Q")
+        return (np.asarray(out.get(D.POINT, "stage_z_um", layer="blobs").values, float),
+                np.asarray(out.get(D.POINT, "stage_x_um", layer="blobs").values, float))
+
+    mosaic = {"pixel_size_um": 0.5, "z_step_um": 15.0, "z_home_index": 4,
+              "origin_um": [[5062.68, -11007.0, -11693.0]]}       # a stitch's metadata
+    sz, sx = stage_z(mosaic, Z)
+    assert np.allclose(sz, 5062.68 + 15.0 * np.array([0.0, 1.5, 2.0])), sz
+    assert np.allclose(sx, -11693.0 + X * 0.5 - np.array([4.0, 5.0, 6.0]) * 0.5), sx
+    sz_down, _ = stage_z(dict(mosaic, z_bottom_to_top=False), Z)
+    assert np.allclose(sz_down, 5062.68 + 30.0 - 15.0 * np.array([0.0, 1.5, 2.0])), sz_down
+    sz_one, _ = stage_z(mosaic, 1)
+    assert np.allclose(sz_one, 5062.68), sz_one
+    logged = dict(mosaic, stage_z_um=[5126.3], z_home_index=4)  # the log still wins
+    sz_log, _ = stage_z(logged, Z)
+    assert np.allclose(sz_log, 5126.3 + 15.0 * (np.array([0.0, 1.5, 2.0]) - 4)), sz_log
+
+    # 2. the helpers ---------------------------------------------------------------------
+    assert FIG.point_text([1234.4, np.nan, "a", None, 2.25], decimals=0, unit="µm") == \
+        ["1234 µm", "", "a", "", "2 µm"]
+    assert FIG.point_text([3.14159], decimals=2) == ["3.14"]
+    assert FIG.color_limits([-1.0, 0.5, 10.0, np.nan], scale="log") == [0.5, 10.0]
+    assert FIG.color_limits([-1.0, 0.5, 10.0]) == [-1.0, 10.0]
+    assert FIG.color_limits([1.0, 9.0], [None, 5.0]) == [1.0, 5.0]
+    assert FIG.color_limits([], scale="log") == [None, None]
+    ser = FIG.xy_series([3.0, 1.0, 0.0, 2.0], [30.0, 10.0, 0.0, 20.0], None, "none",
+                        color=[0.3, 0.1, 0.0, 0.2], text=["c", "a", "z", "b"])
+    assert ser[0]["x"] == [0.0, 1.0, 2.0, 3.0] and ser[0]["c"] == [0.0, 0.1, 0.2, 0.3] and \
+        ser[0]["text"] == ["z", "a", "b", "c"], ser
+    FIG.decorate_xy(ser, [3.0, 1.0, 0.0, 2.0], [30.0, 10.0, 0.0, 20.0], None,
+                    zero_x="reference_line")
+    assert ser[0]["x"] == [1.0, 2.0, 3.0] and ser[0]["c"] == [0.1, 0.2, 0.3] and \
+        ser[0]["text"] == ["a", "b", "c"], "the x <= 0 row leaves colour and label too"
+    summ = FIG.xy_series([1.0, 1.0], [2.0, 4.0], None, "sd", color=[1.0, 2.0], text=["p", "q"])
+    assert "c" not in summ[0] and "text" not in summ[0], "a summarised point has neither"
+
+    # 3. Plot XY per frame ---------------------------------------------------------------
+    ax2 = AxisSizes(m=1, t=2, z=1, c=1, y=4, x=4)
+    n = 6
+    cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.array([0, 0, 0, 1, 1, 1]),
+            "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+            "dist_um": np.array([100.0, 200.0, 300.0, 101.0, 201.0, 301.0]),
+            "height_um": np.array([10.0, 20.0, 30.0, 10.0, 20.0, 30.0]),
+            "mfi": np.array([500.0, 50.0, -2.0, 800.0, 80.0, 5.0])}
+    seed = Dataset(axes=ax2, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 2, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, cols, layer="beads"))
+
+    def plot(params, modes):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "P": NodeInstance("P", "plot.xy", params=dict(
+                             {"table": "beads", "x": "dist_um", "y": "height_um"}, **params),
+                             modes=dict({"kind": "scatter", "per": "frame"}, **modes))},
+                  edges=[Edge("S", "P", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=ax2, metadata=seed.metadata)})
+        return e, e.pull("P")
+
+    lit = {"color_by": "mfi", "label_by": "dist_um", "label_decimals": 0}
+    e1, p1 = plot(lit, {"color_scale": "log", "colormap": "inferno"})
+    spec = p1.metadata["figure_spec"]
+    cs = spec["draw"]["color"]
+    assert cs["range"] == [5.0, 800.0], cs          # every frame's rows; -2 is off a log scale
+    assert cs["extend"] == "min" and cs["colormap"] == "inferno" and cs["scale"] == "log", cs
+    assert cs["label"] == "mfi", cs                 # no unit recorded: the bare name
+    assert spec["rows"]["lab"] == ["100 µm", "200 µm", "300 µm", "101 µm", "201 µm",
+                                   "301 µm"], spec["rows"]["lab"]
+    f1 = FIG.frame_spec(spec, 1)
+    assert f1["series"][0]["c"] == [800.0, 80.0, 5.0] and \
+        f1["series"][0]["text"] == ["101 µm", "201 µm", "301 µm"], f1["series"]
+    assert f1["draw"]["color"]["range"] == [5.0, 800.0], "frames share one scale"
+    rgb = FIG.render_rgb(spec)
+    assert rgb.shape[0] == p1.axes.y and rgb.shape[1] == p1.axes.x, (rgb.shape, p1.axes)
+    e0, p0 = plot({}, {})
+    assert "color" not in p0.metadata["figure_spec"]["draw"], "blank Colour by: no scale"
+    assert e0.entry("P").recipe_hash != e1.entry("P").recipe_hash
+    _e, ps = plot(lit, {"error": "sd"})
+    assert "color" not in ps.metadata["figure_spec"]["draw"] and \
+        ps.metadata["figure_spec"]["rows"]["lab"] is None, \
+        "under a summarising Error the per-point options are not read"
+
+    # 4. crowded labels do not overlap ---------------------------------------------------
+    crowd = {"kind": "xy", "per": "all",
+             "series": [{"label": "", "x": [1.0, 1.02, 1.04, 1.01, 1.03],
+                         "y": [1.0, 1.01, 1.0, 0.99, 1.02], "err": None, "n": 5,
+                         "c": [1.0, 2.0, 3.0, 4.0, 5.0],
+                         "text": ["1001 µm", "1002 µm", "1003 µm", "1004 µm", "1005 µm"]}],
+             "draw": {"mode": "scatter",
+                      "color": {"colormap": "viridis", "scale": "linear",
+                                "range": [1.0, 5.0], "label": "v", "extend": "neither"}},
+             "axes": {"title": "", "x_label": "x", "y_label": "y", "x_range": [0.0, 2.0],
+                      "y_range": [0.0, 2.0]},
+             "style": dict(FIG.STYLE_PRESETS["paper"])}
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(crowd)
+        r = fig.canvas.get_renderer()
+        boxes = [t.get_window_extent(r) for t in fig.axes[0].texts]
+    assert len(boxes) == 5, len(boxes)
+    for i in range(5):
+        for j in range(i + 1, 5):
+            assert not boxes[i].overlaps(boxes[j]), (i, j, boxes[i], boxes[j])
+    _ok("bead distance plot (2026-10-14): Measure places a stitched mosaic's rows in Z from "
+        "origin_um (bottom-to-top, top-to-bottom, one plane) where it gave NaN, and the "
+        "focus log still wins where it exists; Plot XY's Colour by spans every frame's rows "
+        "(positive only on log, arrow when a value falls under), colours and labels ride "
+        "the x sort and the x <= 0 filter, per frame each frame shows its own rows, the "
+        "options key the memo and go unread under a summarising Error; five crowded labels "
+        "are placed without overlap")
+
+
+def test_overlay_union_axes() -> None:
+    """A union canvas's sources each on axes of their own (2026-10-14).
+
+    1. ``tiles_covering`` judges a sliver against the SMALLER box: a 64 µm field lying wholly
+       inside an 8.8 mm canvas is kept (it was dropped as 0.0055 % of the canvas, so the bead
+       overlay drew nothing), while a big tile grazing a field's corner is still dropped.
+    2. ``field_rect01`` is where ``compose_secondary_plane`` paints the field — plain and on a
+       mirrored canvas.
+    3. The runner: a chain of union Overlays on a canvas is ``independent``; there each source
+       shows its OWN ``(m, t, z)`` (default: field 0, frame 0, its home plane), the readout
+       reports it, a selection keys apart like a stepper, and each source's LUT reference is
+       its own field's plane at that frame. A non-canvas primary is never independent.
+    4. ``_source_lut`` pools its window over the source's fields: a dim field 0 no longer
+       sets a window every bright field saturates.
+    """
+    from types import SimpleNamespace
+    import threading
+    from collections import OrderedDict
+    from nodegraph.placement import (compose_secondary_plane, field_box, field_rect01,
+                                     tiles_covering)
+    from nodegraph.provider import ArrayProvider
+    from nodelab_v2.runner import (EngineRunner, _default_source_frame, _independent_overlay,
+                                   _key_sub, _plane_key)
+
+    # 1. slivers --------------------------------------------------------------------------
+    canvas_md = {"pixel_size_um": 1.0, "origin_um": [[0.0, 0.0, 0.0]],
+                 "stage_layout_source": "canvas"}
+    cax = AxisSizes(m=1, t=1, z=1, c=1, y=8800, x=8800)
+    small_md = {"pixel_size_um": 1.0, "stage_xy_um": [(4000.0, 3000.0), (100.0, 9000.0)]}
+    sax = AxisSizes(m=2, t=2, z=1, c=1, y=64, x=64)
+    hits = tiles_covering(canvas_md, cax, 0, small_md, sax)
+    assert [h[0] for h in hits] == [0], hits          # field 1 is off the canvas
+    assert abs(hits[0][1] - 64.0 * 64.0 / 8800.0 ** 2) < 1e-12, "fraction is still OF the field"
+    field_md = {"pixel_size_um": 1.0, "stage_xy_um": [(50.0, 50.0)]}
+    fax = AxisSizes(m=1, t=1, z=1, c=1, y=100, x=100)
+    big_md = {"pixel_size_um": 1.0, "stage_xy_um": [(2099.6, 2099.6)]}  # grazes 0.4 x 0.4 µm
+    bax = AxisSizes(m=1, t=1, z=1, c=1, y=4000, x=4000)
+    assert tiles_covering(field_md, fax, 0, big_md, bax) == [], "a corner graze is a sliver"
+
+    # 2. the outline is where the composite paints ----------------------------------------
+    entry = {"placed_by": "stage", "flip_x": False, "flip_y": False,
+             "offset_um": [0.0, 0.0, 0.0], "tiles": [[0, [[0, hits[0][1]]]]]}
+    for flip in (None, [False, False], [True, True]):
+        pmd = dict(canvas_md)
+        if flip is not None:
+            pmd["canvas_flip"] = flip
+        shape = (880, 880)
+        got = compose_secondary_plane(entry, shape, pmd, cax, 0, small_md, sax,
+                                      lambda j, want: np.ones((64, 64), np.float32))
+        ys, xs = np.nonzero(got)
+        fy0, fy1, fx0, fx1 = field_rect01(entry, pmd, cax, 0, small_md, sax, 0)
+        assert abs(ys.min() - fy0 * shape[0]) <= 1 and abs(ys.max() + 1 - fy1 * shape[0]) <= 1 \
+            and abs(xs.min() - fx0 * shape[1]) <= 1 and abs(xs.max() + 1 - fx1 * shape[1]) <= 1, \
+            (flip, (ys.min(), ys.max(), xs.min(), xs.max()), (fy0, fy1, fx0, fx1))
+    assert field_rect01({"placed_by": "index"}, canvas_md, cax, 0, small_md, sax, 0) is None
+
+    # 3. the runner -------------------------------------------------------------------------
+    def node(op, canvas):
+        return SimpleNamespace(op_key=op, modes={"canvas": canvas}, params={})
+    recs = {"OV": node("view.overlay", "union"), "OP": node("view.overlay", "primary")}
+    srcs = [{"ovl_id": "OV#primary"}, {"ovl_id": "OV"}]
+    assert _independent_overlay(recs.get, srcs, canvas_md) is True
+    assert _independent_overlay(recs.get, srcs, {"pixel_size_um": 1.0}) is False, \
+        "a field primary pairs its sources"
+    assert _independent_overlay(recs.get, [{"ovl_id": "OP"}], canvas_md) is False, \
+        "an ordinary Overlay onto a view.canvas keeps the paired model"
+    # a source: 3 fields x 2 frames x 5 planes, value = 1000*m + 100*t + 10*z + 1
+    vol = np.zeros((3, 2, 5, 1, 8, 8), np.uint16)
+    for m in range(3):
+        for t in range(2):
+            for z in range(5):
+                vol[m, t, z, 0] = 1000 * m + 100 * t + 10 * z + 1
+    sec_ax = AxisSizes(m=3, t=2, z=5, c=1, y=8, x=8)
+    src = {"ovl_id": "OV", "sec_id": "B", "as_channel": False, "n": 1, "base_c": 1,
+           "sec_axes": sec_ax, "sec_md": {"z_home_index": 3}, "sec_provider": ArrayProvider(vol),
+           "entry": {"tiles": [[0, [[0, 0.5], [1, 0.2], [2, 0.1]]]], "sub_ticks": 1}}
+    assert _default_source_frame(src) == (0, 0, 3), "home plane, not the bottom slice"
+    assert _default_source_frame(dict(src, sec_md={})) == (0, 0, 2), "else the middle one"
+    ctx = {"node": "V", "sources": [src], "pri_md": dict(canvas_md), "pri_axes": cax,
+           "dropped": 0, "independent": True}
+    r = SimpleNamespace(_overlay_ctxs={"V": ctx}, _src_override={}, _src_select={},
+                        _ovr_gen=0, _lut_refs=OrderedDict(), _lut_ref_lock=threading.Lock(),
+                        _source=SimpleNamespace(record=lambda rid: None, active="",
+                                                document_of=lambda pid: None))
+    r._rid = lambda nid: nid
+    for name in ("_source_frame", "_lut_ref_frame", "_stash_lut_refs", "overlay_lut_refs",
+                 "overlay_sub_ticks", "overlay_frame_readout", "set_source_select",
+                 "source_label", "_source_label_of", "_pins_of"):
+        setattr(r, name, (lambda f: lambda *a, **k: f(r, *a, **k))(getattr(EngineRunner, name)))
+    t_sec, zw = r._source_frame(src, ctx, 0, 0, 1, 0, None, 0, {}, {})
+    assert (t_sec, zw) == (0, [(3, 1.0)]), (t_sec, zw)
+    ro = r.overlay_frame_readout("V", 0, 0, 0, 0)
+    assert ro[0]["independent"] and (ro[0]["m"], ro[0]["t"], ro[0]["z"]) == (0, 0, 3), ro
+    assert (ro[0]["n_m"], ro[0]["n_t"], ro[0]["n_z"]) == (3, 2, 5), ro
+    r.set_source_select({"OV": (2, 1, 4)})
+    assert r._ovr_gen == 1 and r._src_select == {"OV": (2, 1, 4)}
+    r.set_source_select({"OV": (2, 1, 4)})
+    assert r._ovr_gen == 1, "an unchanged pick re-keys nothing"
+    assert _key_sub(_plane_key("V", None, 0, 0, 0, 1, 64, 0, r._ovr_gen)) == (0, 1)
+    t_sec, zw = r._source_frame(src, ctx, 0, 0, 1, 0, None, 0, {}, dict(r._src_select))
+    assert (t_sec, zw) == (1, [(4, 1.0)]), "its own frame and plane, not the canvas cursor's"
+    ro = r.overlay_frame_readout("V", 0, 0, 0, 0)
+    assert (ro[0]["m"], ro[0]["t"], ro[0]["z"]) == (2, 1, 4), ro
+    frame = r._lut_ref_frame(src, ctx, 0, t_sec, zw, dict(r._src_select))
+    assert frame == ("B", 2, 1, 4), frame
+    r._stash_lut_refs(src, frame)
+    refs = r.overlay_lut_refs("V", 0, 0, 0, 0)
+    assert list(refs) == [1] and int(refs[1].max()) == 2000 + 100 + 40 + 1, refs
+    # a mapped (paired) source's reference is the field covering most of the primary's
+    ctx_m = dict(ctx, independent=False)
+    assert r._lut_ref_frame(src, ctx_m, 0, 0, [(1, 0.25), (2, 0.75)], {}) == ("B", 0, 0, 2)
+
+    # 4. the pooled default window -----------------------------------------------------------
+    pool = np.full((4, 1, 1, 1, 32, 32), 50, np.uint16)
+    pool[1:, 0, 0, 0, 8:24, 8:24] = 3000              # field 0 is blank; 1..3 hold a bright bead
+    r2 = SimpleNamespace(_src_lut_cache={})
+    lut = EngineRunner._source_lut(r2, "P", SimpleNamespace(
+        image=ArrayProvider(pool), metadata={"bit_depth": 12}))
+    assert lut[0]["clim"][1] > 2000, lut          # field 0 alone gave (50, 51)
+    _ok("overlay union axes (2026-10-14): a small field wholly inside a big canvas is no "
+        "sliver (kept) while a corner graze still is; field_rect01 is where the composite "
+        "paints, plain and mirrored; a chain of union Overlays on a canvas is independent "
+        "(a field primary or an ordinary Overlay on a canvas is not); each source shows its "
+        "own (m, t, z) - default field 0, frame 0, home plane - which the readout reports, "
+        "keys apart like a stepper, and whose own field plane is its LUT reference; the "
+        "default window is pooled over the source's fields")
+
+
+def test_plot_per_column_and_lines() -> None:
+    """Plot XY's per-column figures and reference lines (2026-10-14: three timepoints from
+    two files on ONE colour scale, a spheroid's edge as a dotted line).
+
+    1. ``per = column`` makes one figure per distinct value of ``per_by``, in first-seen
+       order, titled by the value; every figure shares the axes and ONE colour range over all
+       rows, so the scale's top is the brightest row of any figure; each figure shows only its
+       rows. The edit-time picture leaves T unknown (the count is in the data) and refuses a
+       blank ``per_by`` at run time with a fix.
+    2. ``x_lines`` takes a number or a column (its median) — a constant column lands on its
+       value — with its label and unit; the open X range widens to show the line.
+    3. The colour bar's top is a tick of its own, labelled with the value.
+    """
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.registry import NODES
+
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    n = 6
+    cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.zeros(n, int),
+            "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+            "tp": np.array(["late", "late", "early", "early", "mid", "mid"]),
+            "dist_um": np.array([800.0, 900.0, 1000.0, 1100.0, 1200.0, 1300.0]),
+            "h_um": np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+            "edge_um": np.full(n, 557.8),
+            "mfi": np.array([5.0, 50.0, 2.0, 918.7, 20.0, 300.0])}
+    seed = Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, cols, layer="b"))
+
+    def plot(params, modes):
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                         "P": NodeInstance("P", "plot.xy", params=dict(
+                             {"table": "b", "x": "dist_um", "y": "h_um"}, **params),
+                             modes=dict({"kind": "scatter"}, **modes))},
+                  edges=[Edge("S", "P", "image", "data")])
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=ax, metadata=seed.metadata)})
+        return e, e.pull("P")
+
+    e, p = plot({"per_by": "tp", "color_by": "mfi", "color_range": "1,",
+                 "x_lines": "edge_um, 1250", "x_line_label": "spheroid edge"},
+                {"per": "column", "color_scale": "log"})
+    spec = p.metadata["figure_spec"]
+    assert p.axes.t == 3 and spec["frame_labels"] == ["late", "early", "mid"], spec["frame_labels"]
+    assert spec["draw"]["color"]["range"] == [1.0, 918.7], spec["draw"]["color"]
+    f1 = FIG.frame_spec(spec, 1)
+    assert f1["series"][0]["c"] == [2.0, 918.7] and f1["axes"]["title"].endswith("early"), f1
+    assert f1["axes"]["x_range"] == spec["axes"]["x_range"], "the figures share their axes"
+    lines = spec["draw"]["x_lines"]
+    assert [round(l["x"], 1) for l in lines] == [557.8, 1250.0], lines
+    assert lines[0]["label"] == "spheroid edge" and lines[0]["unit"] == "µm", lines
+    assert lines[1]["label"] == "" and lines[1]["unit"] == "µm", "a number: no words"
+    assert spec["axes"]["x_range"][0] < 557.8, "the open range widens to show the line"
+    env = e.env("P")
+    assert "t" in set(env.unknown_axes or ()), "how many figures is in the data: T unknown"
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(f1)
+        words = [t.get_text() for t in fig.axes[0].texts]
+        cb = fig.axes[1]
+        tops = [t.get_text() for t in cb.get_yticklabels()]
+    assert any(w.startswith("spheroid edge 558") for w in words), words
+    assert "918.7" in tops, tops
+    try:
+        plot({"color_by": "mfi"}, {"per": "column"})
+        raise AssertionError("a blank Per column must be refused")
+    except Exception as exc:  # noqa: BLE001 — the engine wraps the refusal
+        assert "Per column" in str(exc), exc
+    assert "column" in next(m for m in NODES.get("plot.xy").modes if m.name == "per").choices
+    _ok("plot per column + reference lines (2026-10-14): one figure per value of a column in "
+        "first-seen order, titled by it, sharing axes and ONE colour range over every row "
+        "(top = the brightest of all, ticked and labelled on the bar), each showing its own "
+        "rows; T unknown at edit time; a blank Per column refused; reference lines at a "
+        "column's median or a number, labelled with value and unit, the open X range widened "
+        "to show them")
+
+
+def test_register_positions_exponential() -> None:
+    """A plate put back on the stage, and the gradient its beads read (2026-10-15).
+
+    1. ``table.register_positions`` moves a table's stage positions into a reference table's
+       frame by the objects both contain: a 0.3° turn + an (63, -52, +25) µm move larger than
+       two objects' spacing is recovered from a VOTED shift (two objects 40 µm apart do not
+       mis-pair), shared objects land on their twins, objects the reference never saw land
+       where the transform puts them, a row with no position keeps it, and the ``reg_*``
+       columns hold the move, the residual (NaN unpaired) and the turn. ``shift`` fits no
+       turn; a Name writes a copy and leaves the table; the edit-time columns announce the
+       ``reg_*`` ones; no Reference wire, a Search below the move and a Tolerance below the
+       jitter are refused with the numbers.
+    2. Plot XY ``fit = exponential`` recovers A and λ exactly from ``ln y`` with R² = 1,
+       leaves y <= 0 points out, reports a rising series with a negative λ, needs two x, puts
+       A / λ / R² in the legend, and draws the curve.
+    """
+    import math
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable
+    from nodegraph.registry import NODES
+
+    # 1. register positions ----------------------------------------------------------------
+    ref_xy = np.array([[0.0, 0.0], [3000.0, 200.0], [-2500.0, 900.0], [1200.0, -2600.0],
+                       [-1800.0, -2100.0], [2600.0, 2400.0], [-400.0, 3100.0],
+                       [500.0, 1500.0], [540.0, 1500.0], [-3100.0, -400.0],
+                       [1900.0, -900.0], [-900.0, 1900.0]])
+    ref_z = 5200.0 + 50.0 * np.arange(len(ref_xy))
+    th = math.radians(-0.3)
+    rot = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    move = np.array([63.0, -52.0])
+    # the moving run sees objects 0-9 (not 10, 11) plus two the reference never saw; its
+    # positions are the reference's turned by -th and moved by -move (it is the reference
+    # that the moving run must be turned/moved back onto), with a 1-2 um re-centring jitter
+    keep = list(range(10))
+    jitter = np.array([[1.0, -1.5], [-2.0, 0.5], [0.5, 1.0], [1.5, 1.5], [-1.0, -0.5],
+                       [0.0, 2.0], [-1.5, 0.0], [1.0, 0.0], [-0.5, -1.0], [2.0, -1.0]])
+    inv = np.linalg.inv(rot)
+    mov_xy = (ref_xy[keep] - move) @ inv.T + jitter
+    new_true = np.array([[-2900.0, 2800.0], [2200.0, -2900.0]])   # in the reference frame
+    mov_xy = np.vstack([mov_xy, (new_true - move) @ inv.T, [[np.nan, np.nan]]])
+    mov_z = np.concatenate([ref_z[keep] - 25.0, [5300.0, 5400.0], [np.nan]])
+    nm, nr = len(mov_xy), len(ref_xy)
+
+    def table(xy, z, n):
+        return {"id": np.arange(1, n + 1), "m": np.arange(n), "t": np.zeros(n, int),
+                "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+                "stage_x_um": xy[:, 0].copy(), "stage_y_um": xy[:, 1].copy(),
+                "stage_z_um": np.asarray(z, float).copy(), "mfi": np.arange(n, dtype=float)}
+
+    ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+
+    def seed_of(cols, layer):
+        return Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+            ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+            StructureTable(Domain.LABEL, cols, layer=layer))
+    # the moving table shares its name with a label raster, as every Label table does, and
+    # the wire also carries a mask
+    s_mov = seed_of(table(mov_xy, mov_z, nm), "beads").with_layer(
+        Domain.VOXEL, "beads", np.zeros((1, 1, 1, 1, 4, 4), np.int32)).with_layer(
+        Domain.VOXEL, "mask", np.zeros((1, 1, 1, 1, 4, 4), np.uint8))
+    s_ref = seed_of(table(ref_xy, ref_z, nr), "t1")
+
+    def reg(params, modes=None, wire_ref=True):
+        edges = [Edge("S", "P", "image", "data")]
+        if wire_ref:
+            edges.append(Edge("R", "P", "image", "reference"))
+        g = Graph(nodes={"S": NodeInstance("S", "io.load"), "R": NodeInstance("R", "io.load"),
+                         "P": NodeInstance("P", "table.register_positions",
+                                           params=dict({"table": "beads"}, **params),
+                                           modes=dict(modes or {}))},
+                  edges=edges)
+        env = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 1.0})
+        return Engine(g, computes=COMPUTES, seeds={"S": s_mov, "R": s_ref},
+                      meta_seeds={"S": env, "R": env})
+
+    def cols_of(ds, layer):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.LABEL)
+                if a.layer == layer}
+
+    import nodegraph.catalog._shared.table_ops as TBL
+    in_place = reg({}).pull("P")
+    assert "beads" not in TBL.synthesized(in_place.metadata, Domain.LABEL), \
+        "in place: still the image's own table, drawn by the Viewer"
+    got = cols_of(in_place, "beads")
+    out_xy = np.stack([got["stage_x_um"], got["stage_y_um"]], axis=1)
+    err_shared = np.hypot(*(out_xy[:10] - ref_xy[keep]).T)
+    assert err_shared.max() < 3.5, err_shared                    # jitter <= 2.2 um
+    err_new = np.hypot(*(out_xy[10:12] - new_true).T)
+    assert err_new.max() < 3.0, ("an object the reference never saw lands where the "
+                                 "transform puts it", err_new)
+    assert np.isnan(out_xy[12]).all() and np.isnan(got["stage_z_um"][12]), "no position stays"
+    # the 1-2 um jitter over a +/-3 mm spread moves the fitted turn by ~0.01-0.02 deg
+    assert abs(got["reg_rotation_deg"][0] + 0.3) < 0.03, got["reg_rotation_deg"][0]
+    assert np.allclose(got["reg_dz_um"][:12], 25.0), got["reg_dz_um"]
+    assert np.allclose(got["stage_z_um"][:10], ref_z[keep]), "Z by the pairs' median"
+    assert np.isfinite(got["reg_residual_um"][:10]).all(), "the shared objects are paired"
+    assert np.isnan(got["reg_residual_um"][10:]).all(), "unpaired: NaN residual"
+    assert np.allclose(got["stage_x_um"][:12] - got["reg_dx_um"][:12], mov_xy[:12, 0]), \
+        "reg_dx_um is what was added"
+    sh = cols_of(reg({}, {"model": "shift"}).pull("P"), "beads")
+    assert sh["reg_rotation_deg"][0] == 0.0, "shift fits no turn"
+    sh_err = np.hypot(sh["stage_x_um"][:10] - ref_xy[keep, 0],
+                      sh["stage_y_um"][:10] - ref_xy[keep, 1])
+    assert sh_err.max() > 10.0 > err_shared.max(), ("a turn's error grows with distance "
+                                                    "under shift", sh_err)
+    named = reg({"name": "beads_t1frame", "z": ""}).pull("P")
+    keepme = cols_of(named, "beads")
+    copy = cols_of(named, "beads_t1frame")
+    assert "beads_t1frame" in TBL.synthesized(named.metadata, Domain.LABEL), "a copy is marked"
+    # Landmarks (2026-10-16): a run of NEW objects is moved by the transform fitted on
+    # landmarks both sessions saw (here the shared-object table) — its own rows pair nothing
+    new_ref = np.array([[100.0, -3000.0], [2900.0, -1500.0], [-2000.0, 2500.0]])
+    new_mov = (new_ref - move) @ inv.T
+    s_new = seed_of(table(new_mov, np.full(3, 5250.0), 3), "beads")
+
+    def reg_lm(params, landmarks=True):
+        nodes_ = {"S": NodeInstance("S", "io.load"), "R": NodeInstance("R", "io.load"),
+                  "L": NodeInstance("L", "io.load"),
+                  "P": NodeInstance("P", "table.register_positions",
+                                    params=dict({"table": "beads", "z": ""}, **params))}
+        edges_ = [Edge("S", "P", "image", "data"), Edge("R", "P", "image", "reference")]
+        if landmarks:
+            edges_.append(Edge("L", "P", "image", "landmarks"))
+        env_ = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 1.0})
+        return Engine(Graph(nodes=nodes_, edges=edges_), computes=COMPUTES,
+                      seeds={"S": s_new, "R": s_ref, "L": s_mov},
+                      meta_seeds={"S": env_, "R": env_, "L": env_}).pull("P")
+    lm = cols_of(reg_lm({"landmark_table": "beads"}), "beads")
+    lm_err = np.hypot(lm["stage_x_um"] - new_ref[:, 0], lm["stage_y_um"] - new_ref[:, 1])
+    assert lm_err.max() < 3.5, ("moved by the landmarks' transform", lm_err)
+    assert abs(lm["reg_rotation_deg"][0] + 0.3) < 0.03 and np.isnan(lm["reg_residual_um"]).all()
+    assert np.allclose(lm["stage_z_um"], 5250.0), "blank Z: the focus is left alone"
+    try:
+        reg_lm({}, landmarks=False)
+        raise AssertionError("new objects alone share nothing with the reference")
+    except ValueError as exc:
+        assert "pair" in str(exc) or "Search" in str(exc), exc
+    assert np.allclose(keepme["stage_x_um"][:12], mov_xy[:12, 0]), "a Name leaves the table"
+    assert np.allclose(copy["stage_z_um"][:12], mov_z[:12]) and \
+        np.allclose(copy["reg_dz_um"], 0.0), "Z blank: X / Y only"
+    for params, wire, frag in (({}, False, "Reference"),
+                               ({"search": 20.0}, True, "Search"),
+                               ({"tolerance": 0.2}, True, "Tolerance"),
+                               ({"name": "mask"}, True, "Voxel layer")):
+        try:
+            reg(params, wire_ref=wire).pull("P")
+        except Exception as ex:                        # noqa: BLE001 — the refusal itself
+            assert frag in str(ex), ex
+        else:
+            raise AssertionError(f"Register Positions accepted {params} (reference {wire})")
+    declared = {(lyr, c) for _d, lyr, c in NODES.get("table.register_positions").adds_columns(
+        {"table": "beads"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "stage_x_um"), (Domain.LABEL, "beads", "mfi")))}
+    assert {("beads", "reg_dx_um"), ("beads", "reg_rotation_deg"),
+            ("beads", "mfi")} <= declared, declared
+
+    # 2. exponential trendline -------------------------------------------------------------
+    xs = np.array([900.0, 1800.0, 2400.0, 3500.0, 5000.0])
+    ys = 900.0 * np.exp(-xs / 800.0)
+    f = FIG.xy_exponential(np.append(xs, [4000.0, 4500.0]), np.append(ys, [0.0, -3.0]))
+    assert abs(f["a"] - 900.0) < 1e-6 and abs(f["lam"] - 800.0) < 1e-6, f
+    assert abs(f["r2"] - 1.0) < 1e-12 and f["n"] == 5, "y <= 0 points stay out"
+    assert "λ = 800" in f["text"] and "A = 900" in f["text"], f["text"]
+    assert "λ = 800 µm," in FIG.xy_exponential(xs, ys, unit="µm")["text"], "λ carries x's unit"
+    up = FIG.xy_exponential(xs, 2.0 * np.exp(xs / 1000.0))
+    assert abs(up["lam"] + 1000.0) < 1e-6, "a rising series: negative λ"
+    assert FIG.xy_exponential([100.0, 100.0], [5.0, 6.0]) is None, "one x fixes no curve"
+    noisy = FIG.xy_exponential(np.append(xs, 4200.0), np.append(ys, 0.01))
+    floored = FIG.xy_exponential(np.append(xs, 4200.0), np.append(ys, 0.01), min_y=1.0)
+    assert noisy["lam"] < 700.0 and abs(floored["lam"] - 800.0) < 1e-6, (noisy, floored)
+    ser = FIG.xy_series(xs, ys, None, "none")
+    FIG.decorate_xy(ser, xs, ys, None, fit="exponential", log_y=True)
+    assert ser[0]["fit"]["model"] == "exponential" and "λ = 800" in ser[0]["legend"], ser[0]
+    assert "exponential" in next(m for m in NODES.get("plot.xy").modes
+                                 if m.name == "fit").choices
+    pcols = {"id": np.arange(1, 7), "m": np.zeros(6, int), "t": np.zeros(6, int),
+             "c": np.zeros(6, int), "z": np.zeros(6), "y": np.zeros(6), "x": np.zeros(6),
+             "d_um": np.append(xs, 4200.0), "mfi": np.append(ys, 0.01)}
+    pseed = seed_of(pcols, "b")
+    g = Graph(nodes={"S": NodeInstance("S", "io.load"),
+                     "P": NodeInstance("P", "plot.xy",
+                                       params={"table": "b", "x": "d_um", "y": "mfi",
+                                               "log_y": True, "fit_floor": 1.0},
+                                       modes={"kind": "scatter", "fit": "exponential"})},
+              edges=[Edge("S", "P", "image", "data")])
+    spec = Engine(g, computes=COMPUTES, seeds={"S": pseed},
+                  meta_seeds={"S": MetaEnvelope(axes=ax, metadata=pseed.metadata)}
+                  ).pull("P").metadata["figure_spec"]
+    sfit = spec["series"][0]["fit"]
+    assert abs(sfit["lam"] - 800.0) < 1e-6 and sfit["n"] == 5, ("the Fit floor keeps the "
+                                                                "0.01 out of the fit", sfit)
+    assert len(spec["series"][0]["x"]) == 6, "...and on the figure"
+    with FIG._RENDER_LOCK:
+        fig, _hw = FIG.draw(spec)
+        drawn = [ln for ln in fig.axes[0].lines if len(ln.get_xdata()) == 200]
+    assert drawn, "the decay curve is drawn"
+    _ok("register positions + exponential (2026-10-15): Landmarks move new objects by a transform fitted on shared ones; a 0.3° turn and an 82 um move "
+        "recovered from a voted shift, shared objects on their twins within the jitter, "
+        "unseen objects transformed, no-position rows kept, reg_* columns (move, residual, "
+        "turn), shift fits no turn, Name copies, Z blank = XY only, columns announced, "
+        "missing Reference / small Search / small Tolerance refused; exponential recovers A "
+        "and λ from ln y with R² = 1, drops y <= 0, a Fit floor keeps noise-floor rows out of "
+        "the fit but on the figure, negative λ for a rise, legend + curve")
+
+
+def test_gradient_map_standard_curve() -> None:
+    """A gradient round a point source, its conversion to concentration, and its figure
+    (2026-10-15, IL-8 capture beads round a spheroid).
+
+    1. ``analysis.gradient_map`` on a canvas (+x right, pixel i over [i, i+1]): objects whose
+       values follow ``A·e^(-d/λ)`` exactly give that trend back (A, λ, R² = 1) and a map equal
+       to it at every node; an object sitting ON a node at twice its trend makes that node
+       twice the trend under ``trend_idw`` (exact interpolation) and leaves ``trend`` alone;
+       ``per_by`` makes one frame per group in first-seen order, T unknown at edit time,
+       ``frame_names`` set and the clock dropped; ``exclude`` blanks the source's disc; the
+       objects land on this image's pixels; with a Z column an object 300 µm above the plane
+       no longer pins the node under it, without one it does; ``idw`` runs with no source;
+       the trend methods refuse a missing source, a multi-field image and a blank value; the
+       method keys the memo.
+    2. ``table.standard_curve`` fits Langmuir to the weighted standards (filtered by
+       ``std_where``), inverts it exactly, flags below LOD / below range / in range / above
+       Bmax / no signal, records the curve, and agrees with a typed curve; linear fits
+       through the blank; a Name the table has, a missing Standards wire and a malformed
+       filter are refused; ``standard_points`` weighs by the weight column.
+    3. Plot Field draws the objects as marks with their labels, on a log colour scale, with
+       the colour bar's label typed and an arrow where the values pass the range; frame titles
+       come from ``frame_names``. Plot XY's ``fit_weight`` reaches the fit (absolute =
+       data units) and is gated on the exponential. Measure ignores the camera flip on a
+       stage-Stitched mosaic.
+    """
+    import math
+    import nodegraph.catalog._shared.figure as FIG
+    from nodegraph.catalog.table.standard_curve import standard_points
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import NODES
+    from nodegraph.structure import StructureTable
+
+    # 1. gradient map ------------------------------------------------------------------------
+    W, H, PX = 50, 40, 10.0                          # a 500 x 400 um canvas at 10 um/px
+    cax = AxisSizes(m=1, t=1, z=1, c=1, y=H, x=W)
+    cmd = {"pixel_size_um": PX, "origin_um": [[100.0, 0.0, 0.0]],
+           "stage_layout_source": "canvas", "canvas_flip": [True, False], "dt_s": 60.0}
+    canvas = Dataset(axes=cax, metadata=cmd).with_image(ArrayProvider(np.zeros((1, 1, 1, 1, H, W))))
+    SX, SY, SZ, LAM = 250.0, 200.0, 100.0, 150.0
+    pts_xy = [(330.0, 210.0), (100.0, 100.0), (420.0, 350.0), (60.0, 330.0), (250.0, 30.0),
+              (400.0, 90.0)]
+    rows = []
+    for grp, A in (("early", 900.0), ("late", 1800.0)):
+        for x, y in pts_xy:
+            d = math.hypot(x - SX, y - SY)
+            rows.append((grp, x, y, SZ, A * math.exp(-d / LAM)))
+    n = len(rows)
+
+    def objects(values=None, z=None):
+        v = np.array([r[4] for r in rows]) if values is None else np.asarray(values, float)
+        zz = np.array([r[3] for r in rows]) if z is None else np.asarray(z, float)
+        cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.zeros(n, int),
+                "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+                "stage_x_um": np.array([r[1] for r in rows]),
+                "stage_y_um": np.array([r[2] for r in rows]), "stage_z_um": zz,
+                "mfi": v, "cond": np.array([r[0] for r in rows])}
+        ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+        return Dataset(axes=ax, metadata={"pixel_size_um": 1.0}).with_image(
+            ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+            StructureTable(Domain.LABEL, cols, layer="beads"))
+    sax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+    src = Dataset(axes=sax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(StructureTable(
+            Domain.LABEL, {"id": np.array([1]), "m": np.array([0]), "t": np.array([0]),
+                           "c": np.array([0]), "z": np.array([0.0]), "y": np.array([0.0]),
+                           "x": np.array([0.0]), "stage_x_um": np.array([SX]),
+                           "stage_y_um": np.array([SY]), "stage_z_um": np.array([SZ])},
+            layer="src"))
+
+    def gm(params, modes=None, pts=None, source=True, data=canvas, tail=None):
+        nodes = {"C": NodeInstance("C", "io.load"), "B": NodeInstance("B", "io.load"),
+                 "G": NodeInstance("G", "analysis.gradient_map", params=dict(
+                     {"table": "beads", "value": "mfi", "spacing": 20.0}, **params),
+                     modes=dict(modes or {}))}
+        edges = [Edge("C", "G", "image", "data"), Edge("B", "G", "image", "points")]
+        seeds = {"C": data, "B": pts or objects()}
+        if source:
+            nodes["S"] = NodeInstance("S", "io.load")
+            edges.append(Edge("S", "G", "image", "source"))
+            seeds["S"] = src
+        last = "G"
+        if tail is not None:
+            nodes["P"] = NodeInstance("P", tail[0], params=tail[1], modes=tail[2])
+            edges.append(Edge("G", "P", "out", "data"))
+            last = "P"
+        e = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds=seeds,
+                   meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                               for k, v in seeds.items()})
+        return e, e.pull(last)
+
+    def tab(ds, layer, dom=Domain.POINT):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(dom) if a.layer == layer}
+
+    e, out = gm({"per_by": "cond"})
+    assert out.axes.t == 2 and out.metadata.get("frame_names") == ["early", "late"], \
+        (out.axes, out.metadata.get("frame_names"))
+    assert out.metadata.get("dt_s") is None, "a map of groups has no frame interval"
+    assert "t" in set(e.env("G").unknown_axes), "how many groups is in the data: T unknown"
+    # EVERY per-frame time list goes, payload and envelope alike: the seconds list and a
+    # bundle's per-file clocks too, or a map of groups keeps a stale clock (2026-10-16)
+    timed = canvas.with_metadata(frame_time_s=[0.0], source_frame_time_jd=[[2461000.0]],
+                                 frame_time_jd=[2461000.0])
+    e2, out2 = gm({"per_by": "cond"}, data=timed)
+    for k in ("frame_time_s", "source_frame_time_jd", "frame_time_jd", "dt_s"):
+        assert out2.metadata.get(k) is None, (k, out2.metadata.get(k))
+        assert (e2.env("G").metadata or {}).get(k) is None, k
+    lat, obj = tab(out, "gradient"), tab(out, "gradient_objects")
+    nodes_per = 25 * 20                              # 20 um nodes on a 500 x 400 um canvas
+    assert len(lat["id"]) == 2 * nodes_per and set(lat["t"].tolist()) == {0, 1}
+    for k, A in ((0, 900.0), (1, 1800.0)):
+        mo = obj["t"] == k
+        assert abs(obj["trend_a"][mo][0] - A) < 1e-6 * A, obj["trend_a"][mo]
+        assert abs(obj["trend_lambda_um"][mo][0] - LAM) < 1e-6 and \
+            abs(obj["trend_r2"][mo][0] - 1.0) < 1e-9
+        ml = lat["t"] == k
+        d = np.hypot(lat["stage_x_um"][ml] - SX, lat["stage_y_um"][ml] - SY)
+        want = A * np.exp(-d / LAM)
+        assert np.allclose(lat["mfi"][ml], want, rtol=1e-6), "exact trend: the map IS it"
+        assert np.allclose(lat["trend"][ml], want, rtol=1e-6)
+    # pixel convention: stage x 330 is column 23.0 of a canvas whose origin x is 0
+    assert np.allclose(obj["x"][:len(pts_xy)], [p[0] / PX for p in pts_xy])
+    assert np.allclose(obj["y"][:len(pts_xy)], [p[1] / PX for p in pts_xy])
+    assert np.allclose(lat["stage_x_um"][:3], [10.0, 30.0, 50.0]), lat["stage_x_um"][:3]
+    # an object ON a node (330, 210) at twice its trend: exact under trend_idw only
+    vals = np.array([r[4] for r in rows])
+    vals[0] *= 2.0
+    node = (np.abs(lat["stage_x_um"] - 330.0) < 1e-9) & (np.abs(lat["stage_y_um"] - 210.0) < 1e-9) \
+        & (lat["t"] == 0)
+    assert node.sum() == 1
+    _e, ti = gm({"per_by": "cond"}, pts=objects(vals))
+    lt = tab(ti, "gradient")
+    # the refit trend moves with the outlier; the node under it takes its value exactly
+    assert abs(lt["mfi"][node][0] - vals[0]) < 1e-6 * vals[0], (lt["mfi"][node], vals[0])
+    _e, tr = gm({"per_by": "cond"}, {"method": "trend"}, pts=objects(vals))
+    ltr = tab(tr, "gradient")
+    assert abs(ltr["mfi"][node][0] - ltr["trend"][node][0]) < 1e-9 * ltr["mfi"][node][0]
+    # 3-D: the same object 300 um above the plane no longer pins the node; in XY it does
+    zz = np.array([r[3] for r in rows])
+    zz[0] = SZ + 300.0
+    _e, up = gm({"per_by": "cond"}, pts=objects(vals, zz))
+    lu = tab(up, "gradient")
+    assert lu["mfi"][node][0] < 0.9 * vals[0], "an object 300 um off the plane weighs as far"
+    _e, flat = gm({"per_by": "cond", "z": ""}, pts=objects(vals, zz))
+    lf = tab(flat, "gradient")
+    assert abs(lf["mfi"][node][0] - vals[0]) < 1e-6 * vals[0], "in XY it is ON the node"
+    # exclude blanks the source's disc
+    _e, ex = gm({"per_by": "cond", "exclude": "60"})
+    le = tab(ex, "gradient")
+    inner = np.hypot(le["stage_x_um"] - SX, le["stage_y_um"] - SY) < 60.0
+    assert inner.any() and np.isnan(le["mfi"][inner]).all() and \
+        np.isfinite(le["mfi"][~inner]).all()
+    # blank Per column: one map per frame of `data`, from the rows of that t
+    _e, one = gm({})
+    assert one.axes.t == 1 and "frame_names" not in one.metadata
+    assert one.metadata.get("dt_s") == 60.0, "a per-frame map keeps the clock"
+    # idw needs no source; the trend methods do
+    _e, iw = gm({"per_by": "cond"}, {"method": "idw"}, source=False)
+    li = tab(iw, "gradient")
+    assert np.isfinite(li["mfi"]).all() and np.isnan(li["trend"]).all()
+    for bad, frag, kw in (({}, "SOURCE", {"source": False}),
+                          ({"value": ""}, "Value", {}),
+                          ({}, "ONE field", {"data": Dataset(
+                              axes=AxisSizes(m=2, t=1, z=1, c=1, y=H, x=W), metadata=cmd)
+                              .with_image(ArrayProvider(np.zeros((2, 1, 1, 1, H, W))))})):
+        try:
+            gm(bad, **kw)
+        except Exception as exc:                       # noqa: BLE001 — the refusal itself
+            assert frag in str(exc), exc
+        else:
+            raise AssertionError(f"Gradient Map accepted {bad} {list(kw)}")
+    e1, _ = gm({"per_by": "cond"})
+    e2, _ = gm({"per_by": "cond"}, {"method": "trend"})
+    assert e1.entry("G").recipe_hash != e2.entry("G").recipe_hash, "method keys the memo"
+    cols_decl = {(lyr, c) for _d, lyr, c in NODES.get("analysis.gradient_map").adds_columns(
+        {"value": "mfi"}, {"domain": "label"},
+        ((Domain.LABEL, "beads", "stage_x_um"), (Domain.LABEL, "beads", "cond")))}
+    assert {("gradient", "mfi"), ("gradient", "trend"), ("gradient_objects", "cond"),
+            ("gradient_objects", "trend_lambda_um")} <= cols_decl, cols_decl
+
+    # 2. standard curve ----------------------------------------------------------------------
+    BM, KD = 5000.0, 5000.0
+    lang = lambda c: BM * c / (KD + c)                    # noqa: E731
+    std_rows = []                                          # (conc, signal, area, sighting)
+    for c in (500.0, 1000.0, 2500.0, 5000.0):
+        std_rows += [(c, lang(c), 80.0, 0), (c, lang(c), 40.0, 0), (c, 0.5 * lang(c), 80.0, 1)]
+    std_rows += [(0.0, b, 80.0, 0) for b in (4.0, 6.0, 5.0, 7.0)]
+    ns = len(std_rows)
+    stab = {"id": np.arange(1, ns + 1), "m": np.zeros(ns, int), "t": np.zeros(ns, int),
+            "c": np.zeros(ns, int), "z": np.zeros(ns), "y": np.zeros(ns), "x": np.zeros(ns),
+            "condition_value": np.array([r[0] for r in std_rows]),
+            "rpe_bgsub": np.array([r[1] for r in std_rows]),
+            "area": np.array([r[2] for r in std_rows]),
+            "sighting": np.array([r[3] for r in std_rows])}
+    stds = Dataset(axes=sax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, stab, layer="standard_curve"))
+    conc = np.array([100.0, 800.0, 3000.0])
+    sig = np.concatenate([lang(conc), [BM + 10.0, 1.0, np.nan]])
+    nd = len(sig)
+    dtab = {"id": np.arange(1, nd + 1), "m": np.zeros(nd, int), "t": np.zeros(nd, int),
+            "c": np.zeros(nd, int), "z": np.zeros(nd), "y": np.zeros(nd), "x": np.zeros(nd),
+            "rpe_bgsub": sig}
+    dat = Dataset(axes=sax, metadata={"pixel_size_um": 1.0}).with_image(
+        ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+        StructureTable(Domain.LABEL, dtab, layer="beads"))
+
+    def sc(params, modes=None, standards=True):
+        nodes = {"D": NodeInstance("D", "io.load"),
+                 "K": NodeInstance("K", "table.standard_curve", params=dict(
+                     {"table": "beads", "signal": "rpe_bgsub", "name": "il8_pg_ml"}, **params),
+                     modes=dict(modes or {}))}
+        edges = [Edge("D", "K", "image", "data")]
+        seeds = {"D": dat}
+        if standards:
+            nodes["S"] = NodeInstance("S", "io.load")
+            edges.append(Edge("S", "K", "image", "standards"))
+            seeds["S"] = stds
+        e = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds=seeds,
+                   meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                               for k, v in seeds.items()})
+        return e.pull("K")
+
+    fit = sc({"std_weight": "area", "std_where": "sighting=0"})
+    t = tab(fit, "beads", Domain.LABEL)
+    cur = fit.metadata["standard_curve"]["il8_pg_ml"]
+    assert abs(cur["bmax"] - BM) < 1e-3 and abs(cur["kd"] - KD) < 1e-3 and cur["r2"] > 1 - 1e-12
+    assert cur["range"] == [500.0, 5000.0]
+    bl = np.array([4.0, 6.0, 5.0, 7.0])
+    assert abs(cur["lod_signal"] - (bl.mean() + 3 * bl.std(ddof=1))) < 1e-9
+    assert np.allclose(t["il8_pg_ml"][:3], conc, rtol=1e-6), t["il8_pg_ml"]
+    assert np.isnan(t["il8_pg_ml"][3]) and np.isnan(t["il8_pg_ml"][5])
+    assert [str(f) for f in t["il8_pg_ml_flag"]] == \
+        ["below range", "in range", "in range", "above Bmax", "below LOD", "no signal"], \
+        t["il8_pg_ml_flag"]
+    assert "il8_pg_ml" not in tab(dat, "beads", Domain.LABEL), "the input is untouched"
+    unfiltered = sc({"std_weight": "area"}).metadata["standard_curve"]["il8_pg_ml"]
+    assert unfiltered["bmax"] < 0.8 * BM, "the half-signal second imagings pull the curve down"
+    typed = tab(sc({"bmax": BM, "kd": KD}, {"curve": "typed"}, standards=False), "beads",
+                Domain.LABEL)
+    assert np.allclose(typed["il8_pg_ml"][:3], conc, rtol=1e-9)
+    assert str(typed["il8_pg_ml_flag"][0]) == "in range", "a typed curve knows no range"
+    lin = sc({"std_where": "sighting=0"}, {"model": "linear"})
+    lc = lin.metadata["standard_curve"]["il8_pg_ml"]
+    assert lc["model"] == "linear" and lc["slope"] > 0
+    # Uncertainty = monte_carlo (2026-10-29): each row's SD from refits on perturbed standards
+    # (McGhee et al. 2022, Appendix B.1). Standards with no spread give SD 0; spread gives a
+    # positive SD that grows relatively toward the curve's top, and repeats exactly
+    mc_mode = {"uncertainty": "monte_carlo"}
+    exact = sc({"std_weight": "area", "std_where": "sighting=0", "mc_runs": 40}, mc_mode)
+    te = tab(exact, "beads", Domain.LABEL)
+    assert np.allclose(te["il8_pg_ml_sd"][:3], 0.0, atol=1e-6), te["il8_pg_ml_sd"]
+    assert np.isnan(te["il8_pg_ml_sd"][3]) and np.isnan(te["il8_pg_ml_sd"][5]), \
+        "above Bmax and no signal have no SD"
+    ue = exact.metadata["standard_curve"]["il8_pg_ml"]["uncertainty"]
+    assert ue["runs"] == 40 and ue["fitted"] == 40 and ue["column"] == "il8_pg_ml_sd", ue
+    spread_p = {"std_weight": "area", "mc_runs": 300, "x_rel_sd": 0.02}
+    n1 = tab(sc(spread_p, mc_mode), "beads", Domain.LABEL)
+    n2 = tab(sc(spread_p, mc_mode), "beads", Domain.LABEL)
+    rel = n1["il8_pg_ml_sd"][:3] / n1["il8_pg_ml"][:3]
+    assert (n1["il8_pg_ml_sd"][:3] > 0).all() and rel[2] > rel[0], (rel, n1["il8_pg_ml_sd"])
+    assert np.array_equal(n1["il8_pg_ml_sd"], n2["il8_pg_ml_sd"], equal_nan=True), "seeded"
+    assert "il8_pg_ml_sd" not in tab(fit, "beads", Domain.LABEL), "off by default"
+    sc_cols = lambda m: {c for _d, _l, c in NODES.get("table.standard_curve").adds_columns(  # noqa: E731
+        {"table": "beads", "name": "il8_pg_ml"}, m, ((Domain.LABEL, "beads", "rpe_bgsub"),))}
+    assert "il8_pg_ml_sd" in sc_cols(mc_mode) and "il8_pg_ml_sd" not in sc_cols({}), sc_cols({})
+    pts, blank = standard_points(np.array([1.0, 1.0, 0.0]), np.array([10.0, 20.0, 3.0]),
+                                 np.array([3.0, 1.0, 1.0]))
+    assert pts == [(1.0, 12.5, 2)] and blank["mean"] == 3.0 and blank["n"] == 1
+    for bad, frag, kw in (({"name": "rpe_bgsub"}, "already has", {}),
+                          ({}, "Standards", {"standards": False}),
+                          ({"std_where": "sighting"}, "column=value", {}),
+                          ({"std_where": "nope=1"}, "nope", {})):
+        try:
+            sc(bad, **kw)
+        except Exception as exc:                       # noqa: BLE001 — the refusal itself
+            assert frag in str(exc), exc
+        else:
+            raise AssertionError(f"Standard Curve accepted {bad}")
+
+    # 3. the figure: marks, log scale, colour-bar label, titles; Plot XY weighting -----------
+    import importlib.util
+    if importlib.util.find_spec("matplotlib") is not None:
+        _e, fig = gm({"per_by": "cond"}, tail=(
+            "plot.field", {"table": "gradient", "value": "mfi", "marks": "gradient_objects",
+                           "mark_label": "mfi", "color_label": "MFI (counts)",
+                           "color_range": ", 500"},
+            {"color_scale": "log"}))
+        v = fig.image.spec_for(0, 1, 0)
+        assert v["draw"]["scale"] == "log" and v["draw"]["value_label"] == "MFI (counts)"
+        # top typed under the map's peak; blank low end = 1st percentile of the positives
+        assert v["draw"]["extend"] == "both", v["draw"]["extend"]
+        assert v["draw"]["range"][0] > 0, "a blank low end on a log scale is positive"
+        mk = v["frames"][0]["marks"]
+        assert len(mk) == len(pts_xy) and abs(mk[0][1] - 33.0) < 1e-9 and \
+            mk[0][2] == f"{2 * 900.0 * math.exp(-math.hypot(80.0, 10.0) / LAM):.0f}", mk[0]
+        assert v["axes"]["title"].endswith("late"), v["axes"]["title"]
+        with FIG._RENDER_LOCK:
+            f_, _hw = FIG.draw(v)
+            words = [tx.get_text() for tx in f_.axes[0].texts]
+        assert mk[0][2] in words, words
+    assert FIG.frame_clock({"frame_names": ["a", "b"], "dt_s": 5.0}, 2)[1] == ["a", "b"]
+    xs = np.array([500.0, 1000.0, 1500.0, 2000.0, 3000.0])
+    ys = 900.0 * np.exp(-xs / 800.0)
+    ys_out = ys.copy()
+    ys_out[0] *= 1.5
+    fa = FIG.xy_exponential(xs, ys_out, weight="absolute")
+    fr = FIG.xy_exponential(xs, ys_out)
+    assert fa["weight"] == "absolute" and fr["weight"] == "relative" and \
+        abs(fa["lam"] - fr["lam"]) > 1.0, (fa, fr)
+    assert abs(FIG.xy_exponential(xs, ys, weight="absolute")["lam"] - 800.0) < 1e-3
+    ser = FIG.xy_series(xs, ys_out, None, "none")
+    FIG.decorate_xy(ser, xs, ys_out, None, fit="exponential", fit_weight="absolute")
+    assert ser[0]["fit"]["weight"] == "absolute"
+    # Trendline span: the curve is DRAWN from the span's low end; the fit does not move
+    sp = FIG.xy_series(xs, ys, None, "none")
+    FIG.decorate_xy(sp, xs, ys, None, fit="exponential", fit_span=(100.0, None))
+    assert sp[0]["fit"]["x0"] == 100.0 and sp[0]["fit"]["x1"] == 3000.0, sp[0]["fit"]
+    assert abs(sp[0]["fit"]["lam"] - 800.0) < 1e-6
+    if importlib.util.find_spec("matplotlib") is not None:
+        for span, lo, hi in (("trend_lambda_um,", LAM, None), ("50, 400", 50.0, 400.0)):
+            _e, pxy = gm({"per_by": "cond"}, tail=(
+                "plot.xy", {"table": "gradient_objects", "x": "distance_um", "y": "mfi",
+                            "group_by": "cond", "fit_span": span},
+                {"domain": "point", "kind": "scatter", "fit": "exponential"}))
+            psp = pxy.metadata["figure_spec"]
+            for ser_ in psp["series"]:
+                assert abs(ser_["fit"]["x0"] - lo) < 1e-9, (span, ser_["fit"]["x0"])
+                if hi is not None:
+                    assert abs(ser_["fit"]["x1"] - hi) < 1e-9
+                assert abs(ser_["fit"]["lam"] - LAM) < 1e-6, "the span moves no parameter"
+    fw = next(m for m in NODES.get("plot.xy").modes if m.name == "fit_weight")
+    assert dict(fw.available_in or {}).get("fit") == frozenset({"exponential"})
+    # Measure on a stage-Stitched mosaic: the camera flip applies there too (a mosaic keeps
+    # the camera's handedness — 2026-10-16, a whole-well bead mosaic vs the bead runs)
+    from nodegraph.catalog.analysis.measure import _flip
+
+    class _Ctx:
+        params = {"flip_x": True, "flip_y": False}
+    mos = Dataset(axes=sax, metadata={"__sampling__": ["stitch[stage[4 tiles]]"]})
+    cam = Dataset(axes=sax, metadata={})
+    assert _flip(_Ctx(), mos) == (True, False) and _flip(_Ctx(), cam) == (True, False)
+    _ok("gradient map + standard curve (2026-10-15): an exact exponential comes back (A, λ, "
+        "R² = 1) and IS the map; an object on a node pins it under trend_idw, not under "
+        "trend; one frame per group (T unknown at edit time, names, no clock); exclude "
+        "blanks the source; 3-D distances let a far object weigh as far; idw needs no "
+        "source, the trend methods refuse without one; Standard Curve recovers Bmax/Kd from "
+        "weighted, filtered standards, inverts exactly and flags LOD / range / Bmax; typed and "
+        "linear curves; its Monte Carlo writes each row's SD (0 for spread-free standards, "
+        "growing toward the top, seeded, announced at edit time); Plot Field marks, log "
+        "scale, colour-bar label, extend arrow and group "
+        "titles; Plot XY's absolute weighting and trendline span (a number or a column's "
+        "median, drawn only); Measure flips a mosaic like a camera field")
+
+
+def test_point_source_fit() -> None:
+    """Crank's point source round a secreting spheroid (2026-10-16, IL-8 capture beads).
+
+    1. ``table.point_source_fit`` on beads made by the model itself: Rate = constant gives
+       each timepoint's rate back and, with Diffusivity = fit, D; piecewise gives a rate
+       history back; half_space halves the rates; Background = uniform gives each timepoint's
+       well level back beside its rate (square-root weighting); a row's time is its clock less
+       the earliest
+       row's plus Source started; the model column equals the input; the rates table has a
+       row per timepoint whose bootstrap interval holds the rate; the record carries the
+       standard curve's signal and curve; a blank Value and a taken Name are refused.
+    2. Plot XY's ``point_source`` trendline draws that model per timepoint, in pg/mL and back
+       through the curve in the signal's units, through each timepoint's own beads; it refuses
+       an X that is not the fitted distance; Error = column draws a column's half-widths.
+    3. Gradient Map's point-source trend refits only the profile's amplitude, exactly, on the
+       concentration and through the curve; If/Else splits a Label table with no raster.
+    """
+    import math
+    import nodegraph.catalog._shared.point_source as PS
+    from nodegraph.catalog.analysis.gradient_map import point_source_trend
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.registry import NODES
+    from nodegraph.structure import StructureTable
+
+    D_TRUE, JD0, H = 25.0, 2461000.0, 3600.0
+    r = np.array([800.0, 1100.0, 1500.0, 1900.0, 2300.0, 2800.0, 3300.0, 3900.0])
+    t = np.array([15.0, 25.0]) * H                     # T1 15 h after the source started
+    curve = {"model": "langmuir", "bmax": 5000.0, "kd": 5000.0, "signal": "mfi"}
+
+    def beads(conc_of):
+        """Two timepoints of the same eight distances, concentrations from ``conc_of``."""
+        rr = np.concatenate([r, r])
+        tt = np.concatenate([np.full(r.size, t[0]), np.full(r.size, t[1])])
+        conc = conc_of(rr, tt)
+        n = rr.size
+        cols = {"id": np.arange(1, n + 1), "m": np.zeros(n, int), "t": np.zeros(n, int),
+                "c": np.zeros(n, int), "z": np.zeros(n), "y": np.zeros(n), "x": np.zeros(n),
+                "dist": rr, "conc": conc, "mfi": PS.to_signal(conc, curve),
+                "jd": JD0 + (tt - t[0]) / 86400.0,
+                "cond": np.array(["T1"] * r.size + ["T2"] * r.size)}
+        ax = AxisSizes(m=1, t=1, z=1, c=1, y=4, x=4)
+        return Dataset(axes=ax, metadata={"pixel_size_um": 1.0,
+                                          "standard_curve": {"conc": curve}}).with_image(
+            ArrayProvider(np.zeros((1, 1, 1, 1, 4, 4)))).with_structure(
+            StructureTable(Domain.LABEL, cols, layer="beads"))
+
+    def pull(ds, params, modes=None, tail=None):
+        nodes = {"B": NodeInstance("B", "io.load"),
+                 "F": NodeInstance("F", "table.point_source_fit", params=dict(
+                     {"table": "beads", "distance": "dist", "value": "conc", "group": "cond",
+                      "time": "jd", "start_h": 15.0, "bootstrap": 20}, **params),
+                     modes=dict(modes or {}))}
+        edges = [Edge("B", "F", "image", "data")]
+        last = "F"
+        if tail is not None:
+            nodes["P"] = NodeInstance("P", tail[0], params=tail[1], modes=tail[2])
+            edges.append(Edge("F", "P", "out", "data"))
+            last = "P"
+        e = Engine(Graph(nodes=nodes, edges=edges), computes=COMPUTES, seeds={"B": ds},
+                   meta_seeds={"B": MetaEnvelope(axes=ds.axes, metadata=ds.metadata)})
+        return e.pull(last)
+
+    def tab(ds, layer):
+        return {a.name: np.asarray(a.values) for a in ds.layers_on(Domain.LABEL)
+                if a.layer == layer}
+
+    # 1. constant rates, D fitted ------------------------------------------------------------
+    q_true = {"T1": 0.4, "T2": 0.7}
+    const = beads(lambda rr, tt: np.where(tt == t[0], q_true["T1"], q_true["T2"])
+                  * PS.unit_response(rr, tt, D_TRUE))
+    out = pull(const, {}, {"rate": "constant", "diffusivity": "fit"})
+    rec = out.metadata["point_source_fit"]["conc"]
+    assert abs(rec["D"] - D_TRUE) / D_TRUE < 0.02, rec["D"]
+    rates = tab(out, "crank_rates")
+    assert list(rates["label"]) == ["T1", "T2"], rates["label"]
+    for k, lab in enumerate(("T1", "T2")):
+        assert abs(rates["q_fg_s"][k] - q_true[lab]) / q_true[lab] < 0.02, rates["q_fg_s"]
+        assert rates["q_lo_fg_s"][k] <= rates["q_fg_s"][k] * (1 + 1e-6) and \
+            rates["q_hi_fg_s"][k] >= rates["q_fg_s"][k] * (1 - 1e-6), rates
+    assert np.allclose(rates["t_h"], [15.0, 25.0]), rates["t_h"]
+    assert rec["signal"] == "mfi" and rec["curve"]["model"] == "langmuir"
+    # at the true D the model column IS the data
+    exact = pull(const, {"D": D_TRUE}, {"rate": "constant"})
+    bt = tab(exact, "beads")
+    assert np.allclose(bt["crank"], bt["conc"], rtol=1e-6), (bt["crank"], bt["conc"])
+    # a source on an impermeable floor doubles every concentration: half the rate
+    half = tab(pull(const, {"D": D_TRUE}, {"rate": "constant", "boundary": "half_space"}),
+               "crank_rates")
+    assert np.allclose(half["q_fg_s"], [0.2, 0.35], rtol=1e-4), half["q_fg_s"]
+    # a finite well's far field: a uniform level per timepoint comes back beside the rate,
+    # under square-root weighting, and the model column carries it
+    level = {"T1": 30.0, "T2": 400.0}
+    walled = beads(lambda rr, tt: np.where(tt == t[0], q_true["T1"], q_true["T2"])
+                   * PS.unit_response(rr, tt, D_TRUE)
+                   + np.where(tt == t[0], level["T1"], level["T2"]))
+    wout = pull(walled, {"D": D_TRUE}, {"rate": "constant", "background": "uniform",
+                                        "weight": "sqrt"})
+    wr = tab(wout, "crank_rates")
+    assert np.allclose(wr["q_fg_s"], [0.4, 0.7], rtol=1e-3), wr["q_fg_s"]
+    assert np.allclose(wr["background_pg_ml"], [30.0, 400.0], rtol=1e-3), wr
+    wb = tab(wout, "beads")
+    assert np.allclose(wb["crank"], wb["conc"], rtol=1e-4)
+    # a flat profile (Run 4's late hourly passes) has no point source: the rate is the bound
+    # itself, 0, not the ~1e-20 'trf' stops at, which printed as "q = 3.54e-20 fg/s"
+    flat = tab(pull(beads(lambda rr, tt: np.where(tt == t[0], 50.0, 900.0) + 0.0 * rr),
+                    {"D": D_TRUE}, {"rate": "constant", "background": "uniform",
+                                    "weight": "sqrt"}), "crank_rates")
+    assert np.all(np.asarray(flat["q_fg_s"]) == 0.0), flat["q_fg_s"]
+    assert np.allclose(flat["background_pg_ml"], [50.0, 900.0], rtol=1e-3), flat
+    # Uncertainty = monte_carlo (2026-10-29, the paper's Appendix B.3): with every spread 0 the
+    # runs ARE the least-squares fit (SD 0); with spread, the mean stays near the truth, the
+    # SD is positive, lo/hi are mean -/+ SD, and the seed repeats it exactly
+    mcm = {"rate": "constant", "background": "uniform", "weight": "absolute",
+           "uncertainty": "monte_carlo"}
+    mcp = {"D": D_TRUE, "mc_runs": 300, "D_sd": 0.0, "t_sd": 0.0, "r_sd": 0.0,
+           "value_rel_sd": 0.0}
+    m0 = tab(pull(walled, mcp, mcm), "crank_rates")
+    assert np.allclose(m0["q_fg_s"], [0.4, 0.7], rtol=1e-6), m0["q_fg_s"]
+    assert np.allclose(m0["q_sd_fg_s"], 0.0, atol=1e-9), m0["q_sd_fg_s"]
+    assert np.allclose(m0["background_pg_ml"], [30.0, 400.0], rtol=1e-6), m0
+    assert np.allclose(m0["background_sd_pg_ml"], 0.0, atol=1e-9), m0
+    spread = dict(mcp, D_sd=5.0, r_sd=30.0, t_sd=600.0, value_rel_sd=0.1)
+    mo = pull(walled, spread, mcm)
+    m1, m2 = tab(mo, "crank_rates"), tab(pull(walled, spread, mcm), "crank_rates")
+    assert (m1["q_sd_fg_s"] > 0).all() and (m1["background_sd_pg_ml"] > 0).all(), m1
+    assert np.allclose(m1["q_fg_s"], [0.4, 0.7], rtol=0.15), m1["q_fg_s"]
+    assert np.array_equal(m1["q_fg_s"], m2["q_fg_s"]), "the Monte Carlo is seeded"
+    assert np.allclose(m1["q_lo_fg_s"], m1["q_fg_s"] - m1["q_sd_fg_s"])
+    assert np.allclose(m1["q_ci_fg_s"], m1["q_sd_fg_s"])
+    # D's draw is lognormal: with its SD as large as D itself (a normal draw would put 16 % of
+    # runs at D <= 0 and some just above, where a run needs ~1e100 fg/s) the mean stays sane
+    wide = tab(pull(walled, dict(spread, D_sd=D_TRUE), mcm), "crank_rates")
+    assert np.isfinite(wide["q_fg_s"]).all() and \
+        (wide["q_fg_s"] < 3 * np.array([0.4, 0.7])).all(), wide["q_fg_s"]
+    mrec = mo.metadata["point_source_fit"]["conc"]
+    assert mrec["uncertainty"]["method"] == "monte_carlo" and mrec["uncertainty"]["runs"] == 300
+    assert all("q_nominal_fg_s" in g and "q_sd_fg_s" in g for g in mrec["groups"]), mrec
+    # each timepoint's stream is seeded by its LABEL: T1 alone gets what T1 got beside T2 (a
+    # subset of passes fitted for a combined plot agrees with the full fit)
+    rr2 = np.concatenate([r, r])
+    tt2 = np.concatenate([np.full(r.size, t[0]), np.full(r.size, t[1])])
+    yy2 = 0.5 * PS.unit_response(rr2, tt2, D_TRUE) + 10.0
+    kw_mc = dict(D=D_TRUE, background="uniform", n_runs=200, D_sd=5.0, t_sd=60.0, r_sd=20.0)
+    both = PS.monte_carlo(rr2, tt2, yy2, 0.1 * yy2, np.repeat([0, 1], r.size), 2,
+                          labels=["T1", "T2"], **kw_mc)
+    alone = PS.monte_carlo(rr2[:r.size], tt2[:r.size], yy2[:r.size], 0.1 * yy2[:r.size],
+                           np.zeros(r.size, int), 1, labels=["T1"], **kw_mc)
+    assert both["q_mean"][0] == alone["q_mean"][0] and both["q_sd"][0] == alone["q_sd"][0], \
+        (both, alone)
+    # a per-row SD column (here 100 % of each value) widens the spread the relative 0 had not
+    msd = tab(pull(walled, dict(mcp, value_sd="conc"), mcm), "crank_rates")
+    assert (msd["q_sd_fg_s"] > 0).all(), msd["q_sd_fg_s"]
+    # Fit span: a near bead read 10x too bright pulls the rate up unless the span drops it;
+    # a column bound is that column's median
+    bright = beads(lambda rr, tt: np.where(tt == t[0], q_true["T1"], q_true["T2"])
+                   * PS.unit_response(rr, tt, D_TRUE) * np.where(rr == r[0], 10.0, 1.0))
+    absm = {"rate": "constant", "weight": "absolute"}
+    skewed = tab(pull(bright, {"D": D_TRUE}, absm), "crank_rates")
+    clean = pull(bright, {"D": D_TRUE, "fit_span": f"{r[1] - 1:g},"}, absm)
+    assert (skewed["q_fg_s"] > 1.2 * np.array([0.4, 0.7])).all(), skewed["q_fg_s"]
+    assert np.allclose(tab(clean, "crank_rates")["q_fg_s"], [0.4, 0.7], rtol=1e-6)
+    assert clean.metadata["point_source_fit"]["conc"]["n"] == 2 * (r.size - 1)
+    by_col = pull(bright, {"D": D_TRUE, "fit_span": "dist,"}, absm)
+    assert by_col.metadata["point_source_fit"]["conc"]["n"] == 2 * int((r >= np.median(r)).sum())
+    assert np.allclose(tab(by_col, "crank_rates")["q_fg_s"], [0.4, 0.7], rtol=1e-6)
+    psf_cols = {c for _d, lyr, c in NODES.get("table.point_source_fit").adds_columns(
+        {"name": "crank"}, {}, ()) if lyr == "crank_rates"}
+    assert {"q_sd_fg_s", "background_sd_pg_ml"} <= psf_cols, psf_cols
+    # piecewise: a rate history comes back from both timepoints at once
+    hist = {"rate": "piecewise", "D": D_TRUE, "breaks_s": [0.0, t[0], t[1]],
+            "q_fg_s": [0.3, 0.9]}
+    pw = tab(pull(beads(lambda rr, tt: PS.predict(rr, tt, hist)), {"D": D_TRUE},
+                  {"rate": "piecewise"}), "crank_rates")
+    assert np.allclose(pw["q_fg_s"], [0.3, 0.9], rtol=1e-3), pw["q_fg_s"]
+    assert np.allclose(pw["t_mid_h"], [7.5, 20.0]), pw["t_mid_h"]
+    for bad, bad_modes, why in (
+            ({"value": ""}, {}, "Value"), ({"name": "conc"}, {}, "already has"),
+            ({"fit_span": "1,2,3"}, {}, "low, high"), ({"fit_span": "nope,"}, {}, "nope"),
+            ({"mc_runs": 10}, {"uncertainty": "monte_carlo", "weight": "sqrt"}, "absolute"),
+            ({"mc_runs": 10}, {"uncertainty": "monte_carlo", "weight": "absolute",
+                               "rate": "piecewise"}, "constant"),
+            ({"mc_runs": 1}, {"uncertainty": "monte_carlo", "weight": "absolute"}, "at least 2"),
+            ({"value_sd": "nope"}, {"uncertainty": "monte_carlo", "weight": "absolute"},
+             "Value SD")):
+        try:
+            pull(const, bad, bad_modes)
+            raise AssertionError(f"Point-Source Fit must refuse {bad} {bad_modes}")
+        except ValueError as exc:
+            assert why in str(exc), str(exc)
+
+    # 2. Plot XY draws the fitted model, in pg/mL and back through the curve ------------------
+    plot = {"table": "beads", "x": "dist", "group_by": "cond"}
+    pmodes = {"domain": "label", "kind": "scatter", "fit": "point_source"}
+    for y in ("conc", "mfi"):
+        fig = pull(const, {"D": D_TRUE}, {"rate": "constant"},
+                   tail=("plot.xy", dict(plot, y=y), pmodes))
+        series = fig.metadata["figure_spec"]["series"]
+        assert [s["label"] for s in series] == ["T1", "T2"], series
+        for s in series:
+            f = s["fit"]
+            assert f["model"] == "curve" and "D = 25" in f["note"], f
+            # the curve starts at the series' nearest bead and passes through it
+            assert abs(f["x"][0] - s["x"][0]) < 1e-9 and \
+                abs(f["y"][0] - s["y"][0]) / s["y"][0] < 1e-6, (y, f["y"][0], s["y"][0])
+            assert "q = " in s["legend"], s["legend"]
+    try:
+        pull(const, {"D": D_TRUE}, {"rate": "constant"},
+             tail=("plot.xy", dict(plot, y="conc", x="jd"), pmodes))
+        raise AssertionError("a point-source curve on another X must be refused")
+    except ValueError as exc:
+        assert "fitted against" in str(exc), str(exc)
+    fig = pull(const, {}, {"rate": "constant"},
+               tail=("plot.xy", {"table": "crank_rates", "x": "t_h", "y": "q_fg_s",
+                                 "error_column": "q_ci_fg_s"},
+                     {"domain": "label", "error": "column"}))
+    s = fig.metadata["figure_spec"]["series"][0]
+    assert s["err"] is not None and len(s["err"]) == 2, s
+
+    # 3. Gradient Map's trend: the profile's amplitude, refitted exactly --------------------
+    prof = lambda d: 2.0 * PS.unit_response(d, t[1], D_TRUE)        # noqa: E731
+    use = np.ones(r.size, bool)
+    got = point_source_trend(r, 3.0 * prof(r), use, prof, None, "relative")
+    assert abs(got["scale"] - 3.0) < 1e-9 and abs(got["r2"] - 1.0) < 1e-9, got
+    sig = PS.to_signal(3.0 * prof(r), curve)
+    got = point_source_trend(r, sig, use, prof, curve, "relative")
+    assert abs(got["scale"] - 3.0) < 1e-4, got
+    assert np.allclose(got["fn"](r), sig, rtol=1e-4)
+    # If/Else on a Label table with no raster splits the table alone
+    nodes = {"B": NodeInstance("B", "io.load"),
+             "I": NodeInstance("I", "analysis.if_else", params={
+                 "labels": "beads", "column1": "dist", "op1": "<=", "value1": 2000.0,
+                 "pass_name": "near", "fail_name": "far"},
+                 modes={"target": "label", "terms": "1"})}
+    e = Engine(Graph(nodes=nodes, edges=[Edge("B", "I", "image", "data")]),
+               computes=COMPUTES, seeds={"B": const},
+               meta_seeds={"B": MetaEnvelope(axes=const.axes, metadata=const.metadata)})
+    split = e.pull("I")
+    assert len(tab(split, "near")["id"]) == 8 and len(tab(split, "far")["id"]) == 8
+    _ok("point-source fit (2026-10-16): Crank's continuous point source (McGhee et al. 2022, "
+        "Eq. 2) gives each timepoint's rate and D back from beads it made, a piecewise rate "
+        "history back by superposition, half the rate on an impermeable floor, a finite "
+        "well's uniform level back beside each rate under square-root weighting; times from "
+        "each row's clock plus Source started; a rates table with bootstrap intervals; the "
+        "paper's Monte Carlo (spread-free runs ARE the fit, SD 0; with spread the mean holds, "
+        "lo/hi = mean ∓ SD, seeded; a per-row SD column) and Fit span (a too-bright near bead "
+        "dropped; a column's median as the bound); refusals; the "
+        "fit's record carries the standard curve, so Plot XY draws the model through each "
+        "timepoint's beads in pg/mL and in MFI, and refuses another X; Error = column draws "
+        "a column's half-widths; Gradient Map refits only the profile's amplitude, exactly; "
+        "If/Else splits a raster-less Label table")
+
+
+def _pixel_fixture():
+    """The Members = pixel fixture: 2 frames × 2 planes × 2 channels, a BIJECTION image (every
+    voxel a different number, so an address off by one in any axis is a different value) and
+    three regions — region 1 a 3×3 square (whose distances are known by hand)."""
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+    M, T, Z, C, Y, X = 1, 2, 2, 2, 10, 12
+    ax = AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X)
+    meta = {"pixel_size_um": 0.5, "z_step_um": 2.0, "bit_depth": 16,
+            "channel_names": ["DAPI", "GFP"]}
+    t_, z_, c_, y_, x_ = np.meshgrid(np.arange(T), np.arange(Z), np.arange(C), np.arange(Y),
+                                     np.arange(X), indexing="ij")
+    img = (100000.0 * t_ + 10000.0 * z_ + 1000.0 * c_ + 100.0 * y_ + x_)[None].astype(float)
+    lab = np.zeros((M, T, Z, C, Y, X), dtype=np.int64)
+    lab[0, 0, 0, :, 1:4, 1:4] = 1               # 3x3 square: centre (2, 2)
+    lab[0, 1, 1, :, 5:9, 6:11] = 2
+    lab[0, 0, 1, :, 6:8, 0:2] = 3
+    ltab = _ST(D.LABEL, {"id": np.array([1, 2, 3]), "m": np.zeros(3, np.int64),
+                         "t": np.array([0, 1, 0]), "c": np.zeros(3, np.int64),
+                         "z": np.array([0.0, 1.0, 1.0]), "y": np.array([2.0, 6.5, 6.5]),
+                         "x": np.array([2.0, 8.0, 0.5])}, layer="labels", z_kind="plane_index")
+    ds = (Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img))
+          .with_layer(D.VOXEL, "labels", lab).with_structure(ltab))
+    return ax, meta, img, lab, ds
+
+
+def test_measure_pixels() -> None:
+    """``analysis.measure`` with Members = pixel (2026-11-02) — one row per voxel.
+
+    A third ``target``: the voxels of chosen regions (or of the volume) become a Point table of
+    their own, so the distribution INSIDE an object — rim vs core, colocalization, a histogram
+    — is a table rather than a summary. What is asserted, and what each would catch:
+
+    1. **Parity.** ``intensity`` averaged per ``label_id`` IS the label branch's
+       ``mean_intensity`` and the row count its ``area`` — every voxel gathered, each in the
+       right region, nothing twice.
+    2. **Every address.** Against a bijection image, each per-channel column is the image at
+       the row's own (t, z, c, y, x) — a transposed axis is a different number, not a near one.
+    3. **Schema.** Invariant coordinates, ``z_kind = plane_index`` (no sub-pixel part), marked
+       as a pixel table, µm from the calibration, and the edit-time column catalog equal to
+       what the pull wrote (a column the catalog misses is unpickable downstream).
+    4. **ids** narrow to the named regions; ids matching none are refused, as is a non-id.
+    5. **volume** writes m·t·z·c·y·x rows, background ``label_id`` 0.
+    6. **A plain mask** is accepted here — the label branch rightly refuses it.
+    7. **max_rows** refuses before reading anything, naming the count.
+    8. **geometry** by hand on the 3×3 square: centre 2 px from outside, rim 1 px; centroid
+       distance 0 at the centre, √2 px at a corner.
+    9. **raw** redirects the sampled pixels.
+    10. **Re-running** replaces an earlier pixel table whole; a detection table's name is
+        refused rather than overwritten.
+    11. **Table Join on `label`** hands each pixel its region's columns.
+    12. The three targets **memoize apart**.
+    """
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import COORD_COLUMNS as _COORD
+    from nodegraph.structure import StructureTable as _ST
+    from nodegraph.tables import pixel_layers
+    ax, meta, img, lab, base = _pixel_fixture()
+    env = MetaEnvelope(axes=ax, metadata=meta)
+    define_node("io.pixseed", "S", outputs=[OutDataset()])
+
+    def run(nodes, edges, sink, seed=base, extra=None):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b, *sock in edges:
+            g.connect(a, b, **({"dst_socket": sock[0]} if sock else {}))
+        seeds = {"S": seed, **(extra or {})}
+        e = Engine(g, computes=COMPUTES, seeds=seeds,
+                   meta_seeds={k: MetaEnvelope(axes=v.axes, metadata=v.metadata)
+                               for k, v in seeds.items()})
+        return e, e.pull(sink)
+
+    def table(out, layer="pixels"):
+        return {a.name: np.asarray(a.values) for a in out.layers_on(D.POINT)
+                if a.layer == layer}
+
+    PX = {"modes": {"target": "pixel"}}
+    e, out = run([("S", "io.pixseed", {}), ("Q", "analysis.measure", PX)], [("S", "Q")], "Q")
+    px = table(out)
+
+    # ── 1. parity with the label branch ───────────────────────────────────────────
+    _, obj = run([("S", "io.pixseed", {}),
+                  ("Q", "analysis.measure", {"params": {"stats": "mean,count"}})],
+                 [("S", "Q")], "Q")
+    ids = obj.get(D.LABEL, "id", layer="labels").values.tolist()
+    means = obj.get(D.LABEL, "mean_intensity", layer="labels").values
+    areas = obj.get(D.LABEL, "area", layer="labels").values
+    for i, mean, area in zip(ids, means, areas):
+        sel = px["label_id"] == i
+        assert int(sel.sum()) == int(area), (i, int(sel.sum()), area)
+        assert np.isclose(float(px["intensity"][sel].astype(float).mean()), float(mean)), \
+            (i, px["intensity"][sel].mean(), mean)
+    assert len(px["id"]) == int(np.count_nonzero(lab))
+
+    # ── 2. every row is the image at its own address ──────────────────────────────
+    t, z, c, y, x = (px[k].astype(int) for k in ("t", "z", "c", "y", "x"))
+    assert np.array_equal(px["intensity"], img[0, t, z, c, y, x].astype(np.float32))
+    assert np.array_equal(px["DAPI_intensity"], img[0, t, z, 0, y, x].astype(np.float32))
+    assert np.array_equal(px["GFP_intensity"], img[0, t, z, 1, y, x].astype(np.float32))
+    assert np.array_equal(px["label_id"], lab[0, t, z, c, y, x])
+
+    # ── 3. schema, provenance, the edit-time catalog ──────────────────────────────
+    assert set(_COORD) <= set(px), sorted(px)
+    assert out.structure_zkind(D.POINT, "pixels") == "plane_index"
+    assert pixel_layers(out.metadata) == {"pixels"}
+    assert np.allclose(px["x_um"], x * 0.5) and np.allclose(px["z_um"], z * 2.0)
+    assert np.array_equal(px["id"], np.arange(1, len(px["id"]) + 1))
+    declared = {col for d, lyr, col in e.env("Q").column_names
+                if d is D.POINT and lyr == "pixels"}
+    assert declared == set(px), (sorted(declared ^ set(px)))
+    assert (D.POINT, "pixels") in e.env("Q").layer_names
+    assert "pixel_size_um" in dict(e.entry("Q").reads)
+
+    # ── 4. ids ────────────────────────────────────────────────────────────────────
+    _, o2 = run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure", {**PX, "params": {"ids": "1, 3"}})],
+                [("S", "Q")], "Q")
+    assert set(table(o2)["label_id"].tolist()) == {1, 3}
+    for bad, msg in (("99", "none of the ids"), ("1, two", "is not a region id")):
+        try:
+            run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure", {**PX, "params": {"ids": bad}})], [("S", "Q")], "Q")
+            raise AssertionError(f"ids {bad!r} must be refused")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+
+    # ── 5. volume ─────────────────────────────────────────────────────────────────
+    _, o3 = run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure",
+                  {"modes": {"target": "pixel", "pixels_of": "volume"}})], [("S", "Q")], "Q")
+    vol = table(o3)
+    assert len(vol["id"]) == lab.size
+    assert int((vol["label_id"] == 0).sum()) == int((lab == 0).sum())
+
+    # ── 6. a plain mask: honest here, refused by the label branch ────────────────
+    mask_ds = (Dataset(axes=ax, metadata=meta).with_image(base.image)
+               .with_layer(D.VOXEL, "mask", (lab > 0).astype(np.uint8)))
+    _, o4 = run([("S", "io.pixseed", {}),
+                 ("Q", "analysis.measure", {**PX, "params": {"labels": "mask"}})],
+                [("S", "Q")], "Q", seed=mask_ds)
+    assert set(table(o4)["label_id"].tolist()) == {1}
+    assert len(table(o4)["id"]) == int(np.count_nonzero(lab))
+    try:
+        run([("S", "io.pixseed", {}),
+             ("Q", "analysis.measure", {"params": {"labels": "mask"}})],
+            [("S", "Q")], "Q", seed=mask_ds)
+        raise AssertionError("the label branch must still refuse a bare mask")
+    except ValueError as exc:
+        assert "not a LABEL raster" in str(exc), exc
+
+    # ── 7. max_rows ───────────────────────────────────────────────────────────────
+    try:
+        run([("S", "io.pixseed", {}),
+             ("Q", "analysis.measure", {**PX, "params": {"max_rows": 5}})], [("S", "Q")], "Q")
+        raise AssertionError("max_rows must refuse")
+    except ValueError as exc:
+        assert f"{int(np.count_nonzero(lab)):,} rows" in str(exc), exc
+
+    # ── 8. geometry by hand on the 3x3 square (2-D: plane_index labels) ──────────
+    if _HAVE_SKIMAGE:                                   # scipy rides with skimage here
+        _, o5 = run([("S", "io.pixseed", {}),
+                     ("Q", "analysis.measure",
+                      {**PX, "params": {"geometry": "edge_dist,centroid_dist", "ids": "1"}})],
+                    [("S", "Q")], "Q")
+        g5 = table(o5)
+        at = lambda yy, xx: np.flatnonzero((g5["y"] == yy) & (g5["x"] == xx) & (g5["c"] == 0))[0]  # noqa: E731
+        assert np.isclose(g5["edge_dist_um"][at(2, 2)], 1.0), g5["edge_dist_um"][at(2, 2)]
+        assert np.isclose(g5["edge_dist_um"][at(1, 1)], 0.5)
+        assert np.isclose(g5["centroid_dist_um"][at(2, 2)], 0.0)
+        assert np.isclose(g5["centroid_dist_um"][at(1, 1)], np.sqrt(2) * 0.5)
+
+    # ── 9. raw ────────────────────────────────────────────────────────────────────
+    define_node("io.pixraw", "R", outputs=[OutDataset()])
+    raw_ds = Dataset(axes=ax, metadata=meta).with_image(ArrayProvider(img + 7.0))
+    _, o6 = run([("S", "io.pixseed", {}), ("R", "io.pixraw", {}),
+                 ("Q", "analysis.measure", PX)], [("S", "Q"), ("R", "Q", "raw")], "Q",
+                extra={"R": raw_ds})
+    assert np.allclose(table(o6)["intensity"], px["intensity"] + 7.0)
+
+    # ── 10. re-run replaces whole; a detection table's name is refused ────────────
+    _, o7 = run([("S", "io.pixseed", {}), ("Q", "analysis.measure", PX),
+                 ("Q2", "analysis.measure", {**PX, "params": {"ids": "2"}})],
+                [("S", "Q"), ("Q", "Q2")], "Q2")
+    t7 = table(o7)
+    assert set(t7["label_id"].tolist()) == {2} and len({len(v) for v in t7.values()}) == 1
+    spots = _ST(D.POINT, {"id": np.array([1]), "m": np.array([0]), "t": np.array([0]),
+                          "c": np.array([0]), "z": np.array([0.0]), "y": np.array([1.0]),
+                          "x": np.array([1.0])}, layer="spots", z_kind="plane_index")
+    try:
+        run([("S", "io.pixseed", {}),
+             ("Q", "analysis.measure", {**PX, "params": {"pixels": "spots"}})],
+            [("S", "Q")], "Q", seed=base.with_structure(spots))
+        raise AssertionError("a detection table's name must be refused")
+    except ValueError as exc:
+        assert "already a Point table" in str(exc), exc
+
+    # ── 11. Table Join on `label`: every pixel gets its region's columns ──────────
+    _, o8 = run([("S", "io.pixseed", {}),
+                 ("O", "analysis.measure", {"params": {"stats": "mean,count"}}),
+                 ("Q", "analysis.measure", PX),
+                 ("J", "table.join", {"modes": {"domain": "point", "other_domain": "label",
+                                                "on": "label"},
+                                      "params": {"table": "pixels", "other_table": "labels"}})],
+                [("S", "O"), ("O", "Q"), ("Q", "J")], "J")
+    j = table(o8, "joined")
+    want = dict(zip(ids, means))
+    assert np.allclose(j["other_mean_intensity"],
+                       [want[int(i)] for i in j["label_id"].tolist()])
+
+    # ── 12. the three targets memoize apart ───────────────────────────────────────
+    hashes = set()
+    with_spots = base.with_structure(spots)          # the point target needs a Point table
+    for target in ("label", "point", "pixel"):
+        eng, _o = run([("S", "io.pixseed", {}),
+                       ("Q", "analysis.measure", {"modes": {"target": target}})],
+                      [("S", "Q")], "Q", seed=with_spots)
+        hashes.add(eng.entry("Q").recipe_hash)
+    assert len(hashes) == 3, hashes
+    _ok("measure pixels (2026-11-02): one row per voxel as a Point table (plane_index, "
+        "marked) — intensity per label_id reproduces mean_intensity and area; every "
+        "per-channel column is the image at its own address; catalog == pull; ids narrow and "
+        "refuse a miss; volume writes every voxel; a mask is accepted (the label branch "
+        "still refuses it); max_rows refuses first; edge/centroid distances by hand; raw "
+        "redirects; a re-run replaces whole and a detection table is never overwritten; "
+        "Table Join on `label` hands each pixel its region's columns")
+
+
+def test_table_export_split() -> None:
+    """The table export (2026-11-02): a pixel table — or one longer than a spreadsheet opens
+    — goes to a file of its own, written column-wise; everything else keeps the one long
+    file it always had. And ``io.write_table`` writes the same files from inside a graph.
+
+    1. CSV and Parquet: the object table stays in the long file (domain/layer columns), the
+       pixel table goes to ``<stem>_pixels``, every row of each.
+    2. A lone pixel table is written to the path asked for.
+    3. An over-long ordinary table splits off the same way (threshold patched down).
+    4. The node: auto format with no extension writes the shared CSV and the pixel Parquet,
+       hands the Dataset on unchanged, ``refuse`` checks every file first, a mismatched
+       extension and an empty path are refused, per_table gives every table a file.
+    5. The old ``nodelab_v2`` import paths are the same objects.
+    """
+    import os
+    import tempfile
+    import nodegraph.table_export as TE
+    from nodegraph.nodes import COMPUTES
+    from nodegraph.tables import mark_pixel_table
+    from nodegraph.structure import StructureTable as _ST
+    ax, meta, img, lab, base = _pixel_fixture()
+    define_node("io.expseed", "S", outputs=[OutDataset()])
+
+    def pull(nodes, edges, sink, seed=base):
+        g = Graph()
+        for nid, op, kw in nodes:
+            g.add(NodeInstance(nid, op, **kw))
+        for a, b in edges:
+            g.connect(a, b)
+        e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                   meta_seeds={"S": MetaEnvelope(axes=seed.axes, metadata=seed.metadata)})
+        return e.pull(sink)
+
+    PX = {"modes": {"target": "pixel"}}
+    out = pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX)], [("S", "Q")], "Q")
+    n_px = int(np.count_nonzero(lab))
+    tmp = tempfile.mkdtemp(prefix="nd2tab_")
+
+    # ── 1. split: long file for the regions, a file of its own for the pixels ─────
+    files = TE.export_dataset_files(out, os.path.join(tmp, "a.csv"))
+    assert [os.path.basename(p) for p, _n in files] == ["a.csv", "a_pixels.csv"], files
+    assert dict((os.path.basename(p), n) for p, n in files) == {"a.csv": 3,
+                                                               "a_pixels.csv": n_px}
+    with open(os.path.join(tmp, "a.csv"), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert lines[0].startswith("domain,layer,") and len(lines) == 4
+    assert not any(ln.startswith("point,") for ln in lines)
+    with open(os.path.join(tmp, "a_pixels.csv"), encoding="utf-8") as f:
+        assert len(f.read().splitlines()) == n_px + 1
+    assert not any(n.endswith((".part.csv", ".part.parquet")) for n in os.listdir(tmp))
+    try:
+        import pyarrow.parquet as _pq
+    except ImportError:                                 # pragma: no cover - env without it
+        _pq = None
+    if _pq is not None:
+        TE.export_dataset_files(out, os.path.join(tmp, "b.parquet"))
+        back = _pq.read_table(os.path.join(tmp, "b_pixels.parquet"))
+        assert back.num_rows == n_px and "label_id" in back.column_names
+
+    # ── 2. a lone pixel table is written to the path asked for ────────────────────
+    cols = {a.name: a.values for a in out.layers_on(D.POINT) if a.layer == "pixels"}
+    lone = mark_pixel_table(Dataset(axes=ax, metadata={}).with_structure(
+        _ST(D.POINT, cols, layer="pixels", z_kind="plane_index")), "pixels")
+    files = TE.export_dataset_files(lone, os.path.join(tmp, "lone.csv"))
+    assert [os.path.basename(p) for p, _n in files] == ["lone.csv"]
+
+    # ── 3. an over-long ordinary table splits off too ─────────────────────────────
+    one = _ST(D.POINT, {"id": np.array([1]), "m": np.array([0]), "t": np.array([0]),
+                        "c": np.array([0]), "z": np.array([0.0]), "y": np.array([1.0]),
+                        "x": np.array([1.0])}, layer="spots", z_kind="plane_index")
+    keep = TE.EXCEL_MAX_ROWS
+    try:
+        TE.EXCEL_MAX_ROWS = 3                           # 2 data rows fit, 3 labels do not
+        files = TE.export_dataset_files(base.with_structure(one),
+                                        os.path.join(tmp, "long.csv"))
+        assert [(os.path.basename(p), n) for p, n in files] == [
+            ("long.csv", 1), ("long_labels.csv", 3)], files
+    finally:
+        TE.EXCEL_MAX_ROWS = keep
+
+    # ── 4. the node ───────────────────────────────────────────────────────────────
+    stem = os.path.join(tmp, "run")
+    W = ("W", "io.write_table", {"params": {"path": stem}})
+    w_out = pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX), W],
+                 [("S", "Q"), ("Q", "W")], "W")
+    assert set(w_out.attributes) == set(out.attributes), "Export Table must pass through"
+    assert os.path.exists(stem + ".csv")
+    if _pq is not None:
+        assert _pq.read_table(stem + "_pixels.parquet").num_rows == n_px
+    for kw, msg in (({"params": {"path": stem}, "modes": {"existing": "refuse"}},
+                     "already exist"),
+                    ({"params": {"path": stem + ".parquet"}, "modes": {"format": "csv"}},
+                     "but Format is csv"),
+                    ({"params": {"path": ""}}, "has no destination")):
+        try:
+            pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX),
+                  ("W", "io.write_table", kw)], [("S", "Q"), ("Q", "W")], "W")
+            raise AssertionError(f"Export Table must refuse: {msg}")
+        except ValueError as exc:
+            assert msg in str(exc), exc
+    per = os.path.join(tmp, "per")
+    pull([("S", "io.expseed", {}), ("Q", "analysis.measure", PX),
+          ("W", "io.write_table", {"params": {"path": per},
+                                   "modes": {"format": "csv", "layout": "per_table"}})],
+         [("S", "Q"), ("Q", "W")], "W")
+    assert os.path.exists(per + "_labels.csv") and os.path.exists(per + "_pixels.csv")
+
+    # ── 5. the old import paths ───────────────────────────────────────────────────
+    import nodelab_v2.export as _old_export
+    import nodelab_v2.tables as _old_tables
+    import nodegraph.tables as _new_tables
+    assert _old_export.export_dataset is TE.export_dataset
+    assert _old_tables.all_tables is _new_tables.all_tables
+    _ok("table export split (2026-11-02): a pixel table (and an over-long one) gets a file of "
+        "its own, column-wise, CSV and Parquet; the rest keep the long file; a lone pixel "
+        "table lands on the path asked for; Export Table writes the same from a graph, "
+        "passes the Dataset through, refuses an existing file / a mismatched format / no "
+        "path, and per_table splits every table; the nodelab_v2 paths re-export the engine's")
+
+
 def main() -> int:
     test_domains()
     test_reducers()
@@ -33609,6 +36634,8 @@ def main() -> int:
     test_select_plane_split_z()
     test_select_frame_split_t()
     test_time_shift()
+    test_trim()
+    test_time_metadata()
     test_split_groups()
     test_split_pick_group()
     test_shift_node()
@@ -33677,6 +36704,7 @@ def main() -> int:
     test_overlay_frozen_in_z()
     test_overlay_after_geometry_change()
     test_util_merge()
+    test_placement_handedness_ground_truth()
     test_display_resolution_policy()
     test_held_views()
     test_overlay_zoom_detail()
@@ -33734,8 +36762,1058 @@ def main() -> int:
     test_frame_timing()
     test_cone_signature()
     test_solo_scope_plan()
+    test_lattice_tables_elided_batch()
+    test_nd2_true_clock()
+    test_standard_curve_trendline()
+    test_unique_objects_langmuir()
+    test_curate_objects()
+    test_pooled_pixel_spread()
+    test_bead_distance_plot()
+    test_overlay_union_axes()
+    test_plot_per_column_and_lines()
+    test_register_positions_exponential()
+    test_gradient_map_standard_curve()
+    test_point_source_fit()
+    test_measure_pixels()
+    test_table_export_split()
+    test_figure_core()
+    test_figure_page()
+    test_figure_paper()
+    test_figure_recipes_builtin()
+    test_figure_headless_render()
+    test_figure_data()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
+
+
+def test_figure_core() -> None:
+    """The Qt-free core of the Figure Editor (V5.00 step 1, ``nodegraph/figure``): the
+    document schema (defaults, every error naming its path, canonical JSON, digests, twin
+    inheritance), the read plans and the zoom box a popout's stage metadata resolves to
+    on its parent, the derived arrays (reslice, coded projections, kymograph, profile,
+    MSD, survival, colocalisation), the new series kinds, the statistics, the chart
+    geometry of every chart kind, the page checks, the generated legend sentence, and the
+    overlay-maths shim. The design record is ``CodeLog/ClaudesPlan/V5.00_figure_editor.md``;
+    the fixture here is its §4.2 example — a montage of a plate, a popout placed by stage
+    metadata, a twin with a normalised speed layer, an MSD chart."""
+    import json as _json
+    import math as _math
+    import numpy as _np
+    from nodegraph.dataset import AxisSizes as _AX
+    from nodegraph.figure import bind as B, charts as C, derive as D, layout as L
+    from nodegraph.figure import legend_text as LT, schema as S, series as SR, stats as ST
+
+    # ── schema ────────────────────────────────────────────────────────────────
+    doc = S.new_document("overlay", "double_column")
+    doc["sources"] = [{"id": "s_plate", "source": "pg1:plate", "label": "plate"},
+                      {"id": "s_close", "source": "pg2:closeup"},
+                      {"id": "s_tr", "source": "pg3:cells"}]
+    doc["items"] = [
+        {"id": "overview", "kind": "montage", "rect_mm": [0, 0, 120, 80], "letter": "A",
+         "image": {"source": "s_plate", "channels": [{"c": 0, "rgb": "#ffffff"}],
+                   "decor": {"scale_bar_um": 50}},
+         "montage": {"tile_by": "m", "columns": 2}},
+        {"id": "zoom1", "kind": "image", "rect_mm": [124, 0, 56, 40], "letter": "B",
+         "image": {"source": "s_close", "frame": {"t": "cursor", "z": "max"},
+                   "region": {"from": "placement"},
+                   "channels": [{"c": 0, "rgb": "#ffffff", "mode": "auto_pct"}],
+                   "decor": {"scale_bar_um": 20, "time_stamp": "elapsed"}}},
+        {"id": "zoom2", "kind": "image", "rect_mm": [124, 42, 56, 40], "letter": "C",
+         "image": {"layers": [{"domain": "track", "layer": "cells", "kind": "field",
+                               "column": "speed",
+                               "limits": {"mode": "normalized", "vmax": 0.8}}]}},
+        {"id": "cb1", "kind": "colorbar", "rect_mm": [124, 84, 56, 6],
+         "of": {"item": "zoom2", "layer": 0}, "label": "v / v_max"},
+        {"id": "msd", "kind": "chart", "rect_mm": [0, 84, 100, 36], "letter": "D",
+         "chart": {"kind": "msd", "source": "s_tr", "table": "cells",
+                   "group_by": "condition",
+                   "axes": {"x_label": "lag (s)", "y_label": "MSD (µm²)"}}},
+    ]
+    doc["links"] = [
+        {"kind": "zoom", "parent": "overview", "child": "zoom1"},
+        {"kind": "twin", "a": "zoom1", "b": "zoom2", "share": ["region", "frame", "channels"]},
+        {"kind": "lut_share", "items": ["zoom1", "zoom2"]},
+        {"kind": "cursor", "items": ["overview", "zoom1", "zoom2"], "axes": ["t"]},
+    ]
+    nd = S.normalize(doc)
+    assert nd["items"][1]["image"]["frame"]["z"] == "max"
+    assert nd["page"]["width_mm"] == 180.0 and nd["items"][3]["orientation"] == "horizontal"
+    eff = S.effective_image(nd, "zoom2")
+    assert eff["source"] == "s_close" and eff["region"]["from"] == "placement" \
+        and eff["layers"][0]["column"] == "speed" and eff["decor"] == {}
+    cj = S.canonical_json(nd)
+    assert cj == S.canonical_json(S.normalize(_json.loads(cj)))
+    d1 = S.digest(nd)
+    nd2 = _json.loads(cj)
+    nd2["items"][0]["rect_mm"][0] = 1.0
+    assert S.digest(nd2) != d1 and S.item_digest(nd, "zoom2") != S.item_digest(nd2, "overview")
+    bad = _json.loads(cj)
+    bad["items"][1]["image"]["channels"][0]["rgb"] = "red"
+    try:
+        S.normalize(bad)
+        raise AssertionError("a bad colour normalized")
+    except S.FigureError as e:
+        assert e.path == "items[1].image.channels[0].rgb", e.path
+    bad = _json.loads(cj)
+    bad["links"].append({"kind": "zoom", "parent": "zoom1", "child": "zoom1"})
+    try:
+        S.normalize(bad)
+        raise AssertionError
+    except S.FigureError as e:
+        assert "cannot zoom into itself" in str(e)
+    bad = _json.loads(cj)
+    bad["links"].append({"kind": "twin", "a": "zoom2", "b": "zoom1"})
+    try:
+        S.normalize(bad)
+        raise AssertionError
+    except S.FigureError as e:
+        assert "cycle" in str(e)
+    assert S.check({"items": [{"id": "x", "kind": "nope", "rect_mm": [0, 0, 1, 1]}]})[0] \
+        .startswith("items[0].kind")
+    _ok("figure schema: defaults, paths in errors, canonical JSON, digest, twin inheritance")
+
+    # ── layout and page checks ────────────────────────────────────────────────
+    chk = L.page_checks(nd)
+    codes = {(c["code"], c["item"]) for c in chk}
+    assert ("scale_bar", "zoom2") in codes and ("scale_bar", "zoom1") not in codes, codes
+    assert not any(c["code"] == "letter_order" for c in chk)
+    assert L.letters(28)[-2:] == ["AA", "AB"] and L.letters(2, "(A)") == ["(A)", "(B)"]
+    assert L.snap_mm(10.4, 1.0) == 10.0 and L.snap_mm(10.4, 0.0) == 10.4
+    assert L.align([(0, 0, 10, 5), (3, 8, 4, 4)], "left")[1][0] == 0
+    dd = L.distribute([(0, 0, 10, 5), (30, 0, 10, 5), (12, 0, 10, 5)], "x")
+    xs = sorted(r[0] for r in dd)
+    assert abs((xs[1] - xs[0]) - (xs[2] - xs[1])) < 1e-9
+    rg = _json.loads(cj)
+    rg["items"][0]["image"]["channels"] = [{"c": 0, "rgb": "#ff0000"}, {"c": 1, "rgb": "#00ff00"}]
+    assert any(c["code"] == "red_green" for c in L.page_checks(S.normalize(rg)))
+    _ok("figure layout: letters, snap, align, distribute; checks flag a bar-less twin and "
+        "a red/green merge")
+
+    # ── bind: placement by stage metadata ─────────────────────────────────────
+    pmd = {"pixel_size_um": 1.0, "origin_um": [[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]]}
+    pax = _AX(m=2, t=3, z=1, c=1, y=100, x=100)
+    cmd = {"pixel_size_um": 0.25, "origin_um": [[0.0, 10.0, 120.0]]}
+    cax = _AX(m=1, t=3, z=5, c=1, y=20, x=20)
+    envs = {"s_plate": (pax, pmd), "s_close": (cax, cmd), "s_tr": (cax, cmd)}
+    zb = B.zoom_box(nd, nd["links"][0], envs)
+    assert zb["refusal"] == "" and zb["parent_m"] == 1 and abs(zb["coverage"] - 1.0) < 1e-9, zb
+    assert all(abs(a - b) < 1e-6 for a, b in zip(zb["rect_px"], (10, 15, 20, 25))), zb["rect_px"]
+    plans = B.read_plans(nd, envs, cursor={"t": 2})
+    assert plans["zoom1"].t == 2 and plans["zoom1"].z == "max" \
+        and plans["zoom2"].source == "s_close" and plans["zoom2"].t == 2
+    assert plans["overview"].channels == (0,) and plans["overview"].window is None
+    doc_r = _json.loads(cj)
+    doc_r["items"][1]["image"]["region"] = {"from": "rect_um", "rect_um": [11, 13, 121, 123]}
+    rp = B.region_plan(S.normalize(doc_r), "zoom1", envs)
+    assert rp.ok and all(abs(a - b) < 1e-6 for a, b in zip(rp.window, (0.2, 0.6, 0.2, 0.6))), rp
+    assert B.window_px(rp.window, 20, 20) == (4, 12, 4, 12)
+    tables = {("label", "cells"): {"id": _np.array([1, 2]), "m": _np.array([0, 0]),
+                                   "t": _np.array([0, 0]), "y": _np.array([10.0, 5.0]),
+                                   "x": _np.array([10.0, 5.0]),
+                                   "area": _np.array([_math.pi * 4, _math.pi])}}
+    doc_o = _json.loads(cj)
+    doc_o["items"][1]["image"]["region"] = {"from": "object", "object": 1, "margin_um": 0.5}
+    rp = B.region_plan(S.normalize(doc_o), "zoom1", envs, tables=tables)
+    assert rp.ok and abs(rp.window[0] - 0.3) < 1e-6 and abs(rp.window[1] - 0.7) < 1e-6, rp
+    rp = B.region_plan(S.normalize(doc_o), "zoom1", envs, tables=None)
+    assert not rp.ok and "no tables" in rp.refusal
+    zb2 = B.zoom_box(nd, nd["links"][0], {"s_plate": (pax, {}), "s_close": (cax, cmd)})
+    assert zb2["refusal"] and zb2["rect_px"] is None
+    far = dict(cmd, origin_um=[[0.0, 500.0, 500.0]])
+    zb3 = B.zoom_box(nd, nd["links"][0], {"s_plate": (pax, pmd), "s_close": (cax, far)})
+    assert "does not overlap" in zb3["refusal"]
+    _ok("figure bind: a popout's box lands on the parent tile its stage origin says, "
+        "µm and object regions become plane windows, unplaceable sources are refused")
+
+    # ── derive ────────────────────────────────────────────────────────────────
+    stack = _np.zeros((4, 8, 8))
+    stack[2, 3, :] = 5.0
+    xz = D.reslice(stack, "xz", 3)
+    assert xz.shape == (4, 8) and xz[2].max() == 5 and xz[1].max() == 0
+    assert D.reslice(stack, "xz", 3, z_step_um=2.0, pixel_size_um=1.0).shape[0] == 7
+    assert D.reslice(stack, "yz", 0).shape == (4, 8)
+    code, mx = D.coded_projection(stack)
+    assert code[3, 0] == 2 and mx[3, 0] == 5 and code[0, 0] == 0
+    rgb = D.coded_rgb(code, mx, n=4)
+    assert rgb.shape == (8, 8, 3) and rgb.dtype == _np.uint8 and rgb[3, 0].max() > 0 \
+        and rgb[0, 0].max() == 0
+    T, H, W = 6, 10, 20
+    mov = _np.zeros((T, H, W))
+    for t in range(T):
+        mov[t, 5, 3 + t] = 1.0
+    ky = D.kymograph(mov, (5, 0), (5, 19))
+    assert ky.shape == (6, 20) and all(int(_np.argmax(ky[t])) == 3 + t for t in range(T))
+    s, prof = D.profile(mov[0], (5, 0), (5, 19), pixel_size_um=0.5)
+    assert prof.shape == (20,) and abs(s[-1] - 9.5) < 1e-9 and int(_np.argmax(prof)) == 3
+    assert D.profile(_np.stack([mov[0], mov[1]]), (5, 0), (5, 19))[1].shape == (2, 20)
+    tid = _np.repeat([1, 2], 10)
+    tt = _np.tile(_np.arange(10), 2)
+    yy = _np.zeros(20)
+    xx = _np.concatenate([_np.arange(10), _np.arange(10)]).astype(float)
+    r = D.msd(tid, tt, yy, xx, dt=1.0, max_lag=4)
+    assert r["lag"] == [1, 2, 3, 4] and [round(v, 6) for v in r["msd"]] == [1, 4, 9, 16]
+    assert abs(D.power_fit(r["lag"], r["msd"])["alpha"] - 2) < 1e-9
+    t_, s_ = D.survival([3, 5, 5, 8])
+    assert list(t_) == [0, 3, 5, 8] and abs(s_[1] - 0.75) < 1e-12 and abs(s_[2] - 0.25) < 1e-12 \
+        and s_[-1] == 0
+    cl = D.coloc(_np.arange(100.0), _np.arange(100.0) * 2 + 1)
+    assert abs(cl["pearson"] - 1) < 1e-9 and cl["n"] == 100
+    _ok("figure derive: reslice (resampled to square), depth/time code, kymograph, profile, "
+        "MSD (α = 2 for constant velocity), Kaplan–Meier, Pearson/Manders")
+
+    # ── series ────────────────────────────────────────────────────────────────
+    bs = SR.bar_series(["a", "b", "a", "b"], [1, 2, 3, 4], ["g1", "g1", "g2", "g2"])
+    assert bs[0]["categories"] == ["a", "b"] and bs[0]["y"] == [1.0, 2.0] and bs[1]["y"] == [3.0, 4.0]
+    st_ = SR.strip_series([1, 2, 3], None, jitter=0.2)
+    assert len(st_[0]["offsets"]) == 3 and max(abs(o) for o in st_[0]["offsets"]) <= 0.2
+    assert st_ == SR.strip_series([1, 2, 3], None, jitter=0.2)          # deterministic
+    sp = SR.superplot_series([1, 2, 3, 4], ["c"] * 4, ["r1", "r1", "r2", "r2"])
+    assert [m["mean"] for m in sp[0]["means"]] == [1.5, 3.5]
+    ro = SR.rose_series([0, 10, 350, 95], bins=4)
+    assert ro[0]["counts"] == [2.0, 1.0, 0.0, 1.0]
+    sv = SR.survival_series([3, 5, 5, 8], dt=2.0)
+    assert sv[0]["t"][-1] == 16.0 and sv[0]["median"] == 10.0
+    ms = SR.msd_series(tid, tt, yy, xx, dt=1.0, max_lag=4)
+    assert ms[0]["tracks"] == 2 and abs(ms[0]["fit"]["alpha"] - 2) < 1e-9
+    rng = _np.random.default_rng(0)
+    hb = SR.hexbin_series(rng.normal(size=500), rng.normal(size=500), gridsize=10)
+    assert sum(hb["counts"]) == 500 and len(hb["hex"]) == 6
+    nz = SR.normalize_series([{"label": "", "x": [0, 1, 2], "y": [2, 4, 6],
+                               "err": [0.2, 0.2, 0.2]}], "first")
+    assert nz[0]["y"] == [1.0, 2.0, 3.0] and abs(nz[0]["err"][0] - 0.1) < 1e-12
+    assert SR.xy_series is __import__("nodegraph.catalog._shared.figure",
+                                      fromlist=["xy_series"]).xy_series
+    _ok("figure series: bars, strips, SuperPlots, roses, survival, MSD, hexbins, "
+        "normalisation; the plot nodes' helpers are the same objects")
+
+    # ── stats ─────────────────────────────────────────────────────────────────
+    rng = _np.random.default_rng(3)
+    res = ST.compare({"a": rng.normal(0, 1, 40), "b": rng.normal(2, 1, 40)}, test="welch")
+    assert res[0]["p"] < 1e-4 and res[0]["stars"] == "***" and res[0]["n_a"] == 40
+    res = ST.compare({"a": rng.normal(0, 1, 40), "b": rng.normal(2, 1, 40),
+                      "c": rng.normal(0, 1, 40)}, test="tukey")
+    assert len(res) == 3
+    res = ST.compare({"a": [1, 2, 3], "b": [2, 3, 4], "c": [3, 4, 5]}, test="kruskal")
+    assert res[0]["a"] == "all" and _math.isfinite(res[0]["p"])
+    res = ST.compare({"a": [1.0], "b": [2.0, 3.0]}, test="welch")
+    assert _math.isnan(res[0]["p"]) and res[0]["stars"] == "n/a"
+    assert ST.bracket_levels([(0, 1), (1, 2), (0, 2)]) == [0, 1, 2]
+    assert ST.bracket_levels([(0, 1), (2, 3)]) == [0, 0]
+    assert ST.stars(0.03) == "*" and ST.p_text(0.0004) == "p < 0.001"
+    assert ST.correlation([1, 2, 3, 4], [2, 4, 6, 8.5])["r"] > 0.99
+    _ok("figure stats: Welch, Tukey, Kruskal, a too-small pair is NaN not an exception, "
+        "bracket levels never cross")
+
+    # ── charts ────────────────────────────────────────────────────────────────
+    style = {"font_pt": 8, "line_width": 1, "marker_size": 3, "palette": "colorblind",
+             "grid": False, "dark": False}
+    ch = S.chart_defaults()
+    ch.update(kind="xy")
+    ch["axes"].update(x_label="t (s)", y_label="area (µm²)")
+    ch["draw"].update(mode="line_markers", error="sem", error_style="band")
+    ch["fit"]["model"] = "linear"
+    ser = SR.xy_series([0, 0, 1, 1, 2, 2], [1, 3, 2, 4, 3, 5], ["a"] * 6, "sem")
+    g = C.chart_geometry(ch, ser, rect_mm=[0, 0, 85, 65], style=style)
+    ax = g["axes_mm"]
+    assert 0 < ax[0] and ax[0] + ax[2] <= 85 and ax[1] > 0 and ax[1] + ax[3] <= 65, ax
+    roles = [m["role"] for m in g["marks"]]
+    assert "series" in roles and "band" in roles and "fit" in roles, roles
+    ml = [m for m in g["marks"] if m["kind"] == "markers"][0]["pts_mm"]
+    assert len(ml) == 3 and ml[0][0] < ml[1][0] < ml[2][0] and ml[0][1] > ml[1][1] > ml[2][1]
+    assert g["legend"] and "R²" in g["legend"]["entries"][0]["label"]
+    assert any(t["role"] == "y_label" and t["rotate"] == -90.0 for t in g["texts"])
+    hit = C.nearest_mark(g, ml[1][0], ml[1][1])
+    assert hit and hit["index"] == 1
+    da = C.data_at(g, ml[1][0], ml[1][1])
+    assert da["inside"] and abs(da["x"] - 1) < 0.05 and abs(da["y"] - 3) < 0.1, da
+    ch2 = S.chart_defaults()
+    ch2.update(kind="xy")
+    ch2["axes"].update(log_x=True, log_y=True)
+    g2 = C.chart_geometry(ch2, SR.xy_series([1, 10, 100, 1000], [1, 10, 100, 1000]),
+                          rect_mm=[0, 0, 85, 65], style=style)
+    labs = [t["label"] for t in g2["x"]["ticks"]]
+    assert "10²" in labs and g2["x"]["scale"] == "log", labs
+    gb = C.chart_geometry(dict(S.chart_defaults(), kind="bar"), bs, rect_mm=[0, 0, 85, 65],
+                          style=style)
+    rects = [m for m in gb["marks"] if m["kind"] == "rects"]
+    assert len(rects) == 2 and len(rects[0]["rects_mm"]) == 2 and gb["x"]["categories"] == ["a", "b"]
+    assert gb["y"]["lim"][0] == 0.0
+    for sub in ("histogram", "kde", "box", "violin", "ecdf", "strip"):
+        ch3 = S.chart_defaults()
+        ch3.update(kind="distribution", sub_kind=sub)
+        vals = list(rng.normal(0, 1, 50)) + list(rng.normal(1, 1, 50))
+        grp = ["a"] * 50 + ["b"] * 50
+        ser3 = SR.strip_series(vals, grp) if sub == "strip" else SR.distribution_series(vals, grp)
+        if sub in ("box", "violin", "strip"):
+            ch3["stats"] = {"test": "mann_whitney", "pairs": []}
+        g3 = C.chart_geometry(ch3, ser3, rect_mm=[0, 0, 85, 65], style=style)
+        assert g3["marks"], sub
+        if sub in ("box", "violin", "strip"):
+            assert any(m["kind"] == "bracket" for m in g3["marks"]) and g3["stats"], sub
+            assert g3["x"]["categories"] == ["a", "b"]
+        if sub == "histogram":
+            assert sum(len(m["rects_mm"]) for m in g3["marks"] if m["kind"] == "rects") > 0
+    rows, cols, mat = SR.heatmap_grid([0, 0, 1, 1], [0, 1, 0, 1], [1, 2, 3, 4])
+    gh = C.chart_geometry(dict(S.chart_defaults(), kind="heatmap"), (rows, cols, mat),
+                          rect_mm=[0, 0, 85, 65], style=style)
+    cells = [m for m in gh["marks"] if m["kind"] == "cells"][0]["cells"]
+    assert len(cells) == 4 and gh["colorbar"]["lo"] == 1.0 and gh["colorbar"]["hi"] == 4.0
+    top = min(c["rect_mm"][1] for c in cells)
+    assert all(c["rect_mm"][1] == top for c in cells if c["row"] == 0)   # row 0 at the top
+    gx = C.chart_geometry(dict(S.chart_defaults(), kind="hexbin"), hb, rect_mm=[0, 0, 85, 65],
+                          style=style)
+    assert gx["colorbar"] and any(m["role"] == "hexbin" for m in gx["marks"])
+    gr = C.chart_geometry(dict(S.chart_defaults(), kind="rose"), ro, rect_mm=[0, 0, 65, 65],
+                          style=style)
+    assert any(m["kind"] == "wedge" and len(m["wedges"]) == 3 for m in gr["marks"])
+    gs = C.chart_geometry(dict(S.chart_defaults(), kind="survival"), sv,
+                          rect_mm=[0, 0, 85, 65], style=style)
+    assert gs["y"]["lim"][0] == 0.0 and any(m["role"] == "series" for m in gs["marks"])
+    gm = C.chart_geometry(dict(S.chart_defaults(), kind="msd"), ms, rect_mm=[0, 0, 85, 65],
+                          style=style)
+    assert gm["x"]["scale"] == "log" and any(m["role"] == "fit" for m in gm["marks"])
+    cht = S.chart_defaults()
+    cht.update(kind="timeseries")
+    gt = C.chart_geometry(cht, SR.xy_series([0, 60, 120, 180], [1, 2, 3, 4]),
+                          rect_mm=[0, 0, 85, 65], style=style)
+    assert gt["x"]["scale"] == "time" and gt["x"]["ticks"][0]["label"].count(":") == 1
+    assert C.fmt_number(0.25, 0.05) == "0.25" and C.fmt_number(1500000) == "1.5×10⁶" \
+        and C.fmt_time(3725) == "1:02 h" and C.fmt_log(1000) == "10³"
+    _ok("figure charts: xy with band + linear fit, log ticks, bars, every distribution "
+        "kind with brackets, heatmap (row 0 on top), hexbin, rose, survival, MSD, time "
+        "axis; hover maps page mm back to data")
+
+    # ── legend text ───────────────────────────────────────────────────────────
+    md = dict(cmd, acquisition_info=[
+        ["Objective", [["Objective", "Plan Apo 20x"], ["Numerical aperture", "0.75"],
+                       ["Immersion refractive index", "1.0"]]],
+        ["Confocal", [["Pinhole", "30 µm"], ["Zoom", "1.0"], ["Modality", "confocal"]]]],
+        channel_names=["GFP"], channel_acquisition=[[["Excitation", "488 nm"],
+                                                     ["Emission", "525 nm"]]],
+        z_step_um=1.0, dt_s=30.0)
+    envs2 = dict(envs)
+    envs2["s_close"] = (cax, md)
+    txt = LT.legend_sentence(nd, envs2, lut_windows={"zoom1": [(0, 110, 2400)]})
+    for needle in ("Plan Apo 20x", "NA 0.75", "pinhole 30 µm", "size 0.25 µm", "z step 1 µm",
+                   "frames every 30 s", "GFP (excitation 488 nm / emission 525 nm)",
+                   "Scale bars 50 µm, 20 µm", "maximum intensity projection", "110–2400",
+                   "speed as a colour map, 0–1 of 0.8", "mean squared displacement",
+                   "per condition"):
+        assert needle in txt, (needle, txt)
+    assert LT.legend_sentence(S.new_document(), {}) == ""
+    _ok("figure legend text: objective, NA, pinhole, sampling, channels, scale bars, "
+        "projection, display range, overlays and charts from the envelopes alone")
+
+    # ── overlay maths moved down ──────────────────────────────────────────────
+    from nodelab_v2 import overlay_render as _OR
+    from nodegraph.catalog._shared import overlay_math as _OM
+    assert _OR.colormap_lut is _OM.colormap_lut and _OR.COLORMAPS is _OM.COLORMAPS \
+        and _OR.scalar_rgba is _OM.scalar_rgba
+    _ok("overlay maths: nodelab_v2.overlay_render is a shim over "
+        "nodegraph.catalog._shared.overlay_math")
+
+
+def test_figure_page() -> None:
+    """V5.00 step 2: an Analysis page is a FIGURE page. It carries a
+    :class:`nodelab_v2.figure_document.FigureDocument` beside its graph document, which is
+    the figure's SHADOW graph — one hidden Page Input per figure source, added, re-bound and
+    removed by the figure's own edits and never touching a hand-placed node — so
+    ``compose`` drops the inputs and maps each source to the upstream Output's run id, the
+    page summary names the sources, the outline lists the items after them, the file
+    carries the figure on the page record and a round trip is byte-identical, a bad figure
+    is refused by page and spec path with the workspace untouched, a V4 Analysis page
+    holding nodes opens as a Free page "(graph)" (its linked pages with it) while an empty
+    one is simply a figure page, a figure page cannot be linked or be a master, a unique
+    copy has its own figure, seeding and reset know figure pages."""
+    import json as _json
+    from nodegraph.figure import schema as FS
+    from nodegraph.memo import Memo
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.document import GraphDocument
+    from nodelab_v2.figure_document import FigureDocument
+    from nodelab_v2.workspace import FIGURE_KIND, Workspace, standard_kinds
+    OPS.ensure_ops()
+
+    # File → New: the fourth page is a figure page, the others are not
+    ws = Workspace.standard(GraphDocument())
+    an = [p for p in ws.pages.values() if p.kind == FIGURE_KIND][0]
+    assert an.figure is not None and an.figure.goal is None and not an.doc.nodes
+    assert all(p.figure is None for p in ws.pages.values() if p.kind != FIGURE_KIND)
+
+    # the fixture chain + a figure page reading two outputs
+    ws, ds, env, ax = _ws_fixture()
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    rev0 = ws.revision
+    changed = fp.figure.edit(lambda d: d.update(goal="overlay", sources=[
+        {"id": "raw", "source": "pg1:raw", "label": "raw"},
+        {"id": "smooth", "source": "pg2:smooth"}]))
+    assert changed and ws.revision > rev0 and fp.figure.revision == 1
+    assert not fp.figure.edit(lambda d: None), "a no-op edit bumps nothing"
+    sid = {s: FigureDocument.shadow_id(s) for s in ("raw", "smooth")}
+    assert set(fp.doc.nodes) == set(sid.values()), set(fp.doc.nodes)
+    assert all(fp.doc.nodes[n].op_key == "page.input" for n in sid.values())
+    assert fp.doc.nodes[sid["raw"]].params["source"] == "pg1:raw"
+    assert ws.page_summary(fp.id) == (["Input · raw", "Refine · smooth"], [])
+    envs = fp.figure.envelopes(ws, fp.id)
+    assert set(envs) == {"raw", "smooth"} and envs["raw"].axes == ax
+    assert fp.figure.source_labels(ws, fp.id) == {"raw": "Input · raw",
+                                                  "smooth": "Refine · smooth"}
+    comp = ws.compose(fp.id)
+    assert not any(n.op_key == "page.input" for n in comp.graph.nodes.values())
+    assert fp.figure.run_ids(comp, fp.id) == {"raw": "pg1/O", "smooth": "pg2/O"}
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    assert eng.pull("pg2/O").axes == ax
+    # re-bind and removal follow the figure; an unbound source is labelled and has no envelope
+    fp.figure.edit(lambda d: d.__setitem__("sources", [{"id": "raw", "source": "pg2:smooth"}]))
+    assert set(fp.doc.nodes) == {sid["raw"]} \
+        and fp.doc.nodes[sid["raw"]].params["source"] == "pg2:smooth"
+    fp.figure.edit(lambda d: d.__setitem__("sources", [{"id": "raw", "source": "pg2:gone"}]))
+    assert fp.figure.envelopes(ws, fp.id) == {}
+    assert fp.figure.source_labels(ws, fp.id) == {"raw": "pg2:gone (unbound)"}
+    assert fp.figure.run_ids(ws.compose(fp.id), fp.id) == {"raw": f"{fp.id}/{sid['raw']}"}
+    # a hand-placed node is never the sync's to touch
+    fp.doc.add_node("page.input", node_id="mine", params={"source": "pg1:raw"})
+    fp.figure.edit(lambda d: d.__setitem__("sources", []))
+    assert set(fp.doc.nodes) == {"mine"}
+    # items in the outline, after the input rows
+    fp.figure.edit(lambda d: d.update(
+        sources=[{"id": "raw", "source": "pg1:raw", "label": "raw"}],
+        items=[{"id": "img", "kind": "image", "rect_mm": [0, 0, 40, 30], "letter": "A",
+                "image": {"source": "raw"}},
+               {"id": "ch", "kind": "chart", "rect_mm": [0, 32, 40, 30], "letter": "B",
+                "chart": {"kind": "xy", "source": "raw"}}]))
+    rows = ws.page_outline(fp.id)
+    assert [r.role for r in rows] == ["input", "input", "node", "node"], rows
+    assert rows[2].title == "A · image" and rows[2].detail == "Input · raw" and rows[2].why_not
+    assert rows[3].title == "B · chart" and rows[3].detail == "xy · Input · raw"
+
+    # the file: the figure rides the page record; a round trip is byte-identical
+    d = ws.to_dict()
+    rec = next(r for r in d["workspace"]["pages"] if r["id"] == fp.id)
+    assert rec["figure"]["goal"] == "overlay" and rec["figure"]["schema"] == FS.SCHEMA \
+        and "graph" in rec
+    assert all("figure" not in r for r in d["workspace"]["pages"] if r["id"] != fp.id)
+    s = _json.dumps(d, sort_keys=True)
+    ws2 = Workspace()
+    ws2.load_dict(_json.loads(s))
+    f2 = ws2.pages[fp.id]
+    assert f2.kind == FIGURE_KIND and f2.figure is not None \
+        and f2.figure.digest() == fp.figure.digest()
+    assert set(f2.doc.nodes) == {sid["raw"], "mine"}
+    assert _json.dumps(ws2.to_dict(), sort_keys=True) == s
+    assert ws2.page_outline(fp.id)[2].title == "A · image"
+    # a bad figure is refused by page and spec path, and the workspace is untouched
+    bad = _json.loads(s)
+    brec = next(r for r in bad["workspace"]["pages"] if r["id"] == fp.id)
+    brec["figure"]["items"][0]["rect_mm"] = [0, 0, -1, 1]
+    before = _json.dumps(ws2.to_dict(), sort_keys=True)
+    try:
+        ws2.load_dict(bad)
+        raise AssertionError("a bad figure loaded")
+    except ValueError as exc:
+        assert fp.id in str(exc) and "items[0].rect_mm" in str(exc), exc
+    assert _json.dumps(ws2.to_dict(), sort_keys=True) == before
+    # LEGACY: a V4 Analysis page holding nodes (no figure) opens as a Free page "(graph)",
+    # and a page linked to it follows; an EMPTY V4 Analysis page is simply a figure page
+    old = _json.loads(s)
+    orec = next(r for r in old["workspace"]["pages"] if r["id"] == fp.id)
+    del orec["figure"]
+    old["workspace"]["pages"].append({"id": "pg99", "name": "Figures (linked)",
+                                      "kind": FIGURE_KIND, "master": fp.id, "overrides": {}})
+    ws3 = Workspace()
+    ws3.load_dict(old)
+    p3 = ws3.pages[fp.id]
+    assert p3.kind == "free" and p3.name == "Figures (graph)" and p3.figure is None
+    assert set(p3.doc.nodes) == {sid["raw"], "mine"}
+    assert ws3.page_summary(fp.id)[0] == ["Input · raw", "Input · raw"]
+    lk = ws3.pages["pg99"]
+    assert lk.kind == "free" and lk.master == fp.id and lk.name == "Figures (linked) (graph)"
+    old2 = _json.loads(s)
+    orec2 = next(r for r in old2["workspace"]["pages"] if r["id"] == fp.id)
+    del orec2["figure"]
+    orec2["graph"]["nodes"] = type(orec2["graph"]["nodes"])()
+    orec2["graph"]["edges"] = type(orec2["graph"]["edges"])()
+    ws4 = Workspace()
+    ws4.load_dict(old2)
+    assert ws4.pages[fp.id].kind == FIGURE_KIND and ws4.pages[fp.id].figure is not None \
+        and ws4.pages[fp.id].figure.sources == []
+    # a current file whose linked page names a figure page as master is refused
+    bad2 = _json.loads(s)
+    bad2["workspace"]["pages"].append({"id": "pg98", "name": "L", "kind": FIGURE_KIND,
+                                       "master": fp.id, "overrides": {}})
+    try:
+        Workspace().load_dict(bad2)
+        raise AssertionError("a page linked to a figure page loaded")
+    except ValueError as exc:
+        assert "cannot be linked" in str(exc)
+
+    # a figure page cannot be linked or be a master; a unique copy carries its own figure
+    try:
+        ws.duplicate_page(fp.id, dependent=True)
+        raise AssertionError("linked a figure page")
+    except ValueError as exc:
+        assert "cannot be linked" in str(exc)
+    try:
+        ws.set_master(fp.id)
+        raise AssertionError("a figure page became a master")
+    except ValueError as exc:
+        assert "figure" in str(exc)
+    cp = ws.duplicate_page(fp.id)
+    assert cp.figure is not None and cp.figure is not fp.figure \
+        and cp.figure.digest() == fp.figure.digest()
+    assert set(cp.doc.nodes) == {sid["raw"], "mine"}
+    cp.figure.edit(lambda d: d.__setitem__("goal", "plot"))
+    assert fp.figure.goal == "overlay", "the copy's figure is its own"
+    # seeding never seeds a figure page; reset drops the figure of the page it keeps
+    assert ws.seed_input(ws.add_page("Another", FIGURE_KIND).id) is None
+    ws.set_active(fp.id)
+    ws.reset()
+    first = ws.pages[list(ws.pages)[0]]
+    assert first.id == fp.id and first.kind == "input" and first.figure is None
+    assert [p.kind for p in ws.pages.values()] == list(standard_kinds())
+    assert ws.pages[list(ws.pages)[-1]].figure is not None
+    first.doc.add_node("io.load")                 # the kept document still edits normally
+    _ok("figure page (V5.00 step 2): an Analysis page carries a FigureDocument whose sources "
+        "are hidden Page Inputs on its graph — composed, summarised and outlined like any "
+        "page; the figure rides the file and round-trips byte-identical, a bad one is "
+        "refused by path; a V4 Analysis graph opens as a Free page (graph) with its linked "
+        "pages; no linking, no mastering, a copy has its own figure; seeding and reset agree")
+
+
+def test_figure_data() -> None:
+    """The figure's Data step (V5.00 step 4): a data entry compiles into the shadow graph
+    as ``analysis.if_else`` (its filter) → ``table.aggregate`` (its summary), with
+    ``table.concat`` in front when it pools several sources; ``run_ids`` names its terminal
+    stage; the composed graph pulls through it on the real catalog; the chart modules
+    resolve series and geometry from the summary, and a chart's CSV is its values; removing
+    the entry removes its stages; the schema refuses a bad op and an unknown source."""
+    from nodegraph.figure import charts as C
+    from nodegraph.figure import schema as FS
+    from nodegraph.memo import Memo
+    from nodegraph.tables import all_tables
+    from nodelab_v2 import ops as OPS
+    from nodelab_v2.figure_document import DATA_PREFIX, FigureDocument
+    from nodelab_v2.workspace import FIGURE_KIND, Workspace
+
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+    P1.doc.add_node("analysis.label", node_id="L")
+    P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.doc.connect("X", "out", "T", "data")
+    P1.doc.connect("T", "out", "L", "data")
+    P1.doc.connect("L", "out", "O", "data")
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    entry = {"id": "d1", "from": ["cells"], "domain": "label", "table": "labels",
+             "where": [["area", ">", 1]],
+             "aggregate": {"group_by": ["t"], "value": "area", "reducers": ["mean", "count"],
+                           "name": "summary"}}
+    fp.figure.edit(lambda d: d.update(
+        goal="plot", sources=[{"id": "cells", "source": "pg3:cells"}], data=[entry],
+        items=[{"id": "ch", "kind": "chart", "rect_mm": [0, 0, 60, 45], "letter": "A",
+                "chart": {"kind": "bar", "data": "d1", "x": "t", "y": "area_mean"}}]))
+    fig = fp.figure
+    assert fig.data_stages(fig.data[0]) == ["where", "agg"], fig.data_stages(fig.data[0])
+    w_id, a_id = fig.data_id("d1", "where"), fig.data_id("d1", "agg")
+    src = FigureDocument.shadow_id("cells")
+    assert set(fp.doc.nodes) == {src, w_id, a_id}, set(fp.doc.nodes)
+    assert fp.doc.nodes[w_id].op_key == "analysis.if_else" \
+        and fp.doc.nodes[w_id].params["column1"] == "area" \
+        and fp.doc.nodes[w_id].params["op1"] == ">" \
+        and fp.doc.nodes[w_id].params["labels"] == "labels"
+    assert fp.doc.nodes[a_id].op_key == "table.aggregate" \
+        and fp.doc.nodes[a_id].params == {"table": "d1_pass", "group_by": "t", "value": "area",
+                                          "reducers": "mean,count", "name": "summary"}
+    assert (src, "out", w_id, "data") in fp.doc.edges and (w_id, "out", a_id, "data") in fp.doc.edges
+    assert fig.data_terminal("d1") == a_id and fig.data_table_name("d1") == "summary"
+    comp = ws.compose(fp.id)
+    rids = fig.run_ids(comp, fp.id)
+    assert rids == {"cells": "pg3/O", "d1": f"{fp.id}/{a_id}"}, rids
+    eng = OPS.headless_engine(comp.graph, seeds={"pg1/L": ds}, meta_seeds=comp.meta_seeds,
+                              memo=Memo())
+    out = eng.pull(rids["d1"])
+    tables = all_tables(out)
+    assert ("label", "summary") in tables, sorted(tables)
+    summ = tables[("label", "summary")]
+    assert "area_mean" in summ and "n" in summ and len(summ["area_mean"]) == 1 \
+        and float(summ["area_mean"][0]) > 0 and int(summ["area_count"][0]) == 1, (
+            {k: v.tolist() for k, v in summ.items()})
+    area = float(summ["area_mean"][0])
+    # the chart modules, Qt-free: series from the table, geometry with the default measure
+    from nodelab_v2.figure_editor import charts_data as CD
+    chart = FS.normalize(fig.to_dict())["items"][0]["chart"]
+    chart = dict(chart, table=fig.data_table_name("d1"))
+    series, units, note = CD.resolve_series(chart, tables, {})
+    assert not note and len(series) == 1 and series[0]["y"] == [area], (series, note)
+    g = C.chart_geometry(chart, series, rect_mm=[0, 0, 60, 45],
+                         style={"font_pt": 8, "line_width": 1, "marker_size": 3,
+                                "palette": "colorblind"})
+    bars = [m for m in g["marks"] if m["kind"] == "rects" and m["role"] == "bars"]
+    assert bars and len(bars[0]["rects_mm"]) == 1 and g["x"]["categories"] == ["0"], (
+        bars, g["x"])
+    csv = CD.chart_csv(chart, series).splitlines()
+    assert csv[0] == "series,category,mean,err,n" and csv[1].split(",")[1:3] == ["0", str(area)], csv
+    # an XY chart over the raw labels carries the row ride-along per point
+    xy = dict(FS.chart_defaults(), kind="xy", source="cells", table="labels", x="x", y="area")
+    s2, _u, note = CD.resolve_series(xy, all_tables(eng.pull("pg3/O")), {})
+    assert not note and s2[0]["rows"] and s2[0]["rows"][0].count(",") == 4, (s2, note)
+    hit = C.nearest_mark(C.chart_geometry(xy, s2, rect_mm=[0, 0, 60, 45],
+                                          style={"font_pt": 8}), 30.0, 22.5, within_mm=60)
+    assert hit is not None and hit["series"] == 0
+    # pooling two sources adds a concat in front; removing the entry removes its stages
+    fig.edit(lambda d: d.update(
+        sources=[{"id": "cells", "source": "pg3:cells"}, {"id": "more", "source": "pg3:cells"}],
+        data=[dict(entry, **{"from": ["cells", "more"]})]))
+    c_id = fig.data_id("d1", "concat")
+    assert fig.data_stages(fig.data[0]) == ["concat", "where", "agg"]
+    assert fp.doc.nodes[c_id].op_key == "table.concat" \
+        and {e[0] for e in fp.doc.edges if e[2] == c_id} == {src, FigureDocument.shadow_id("more")}
+    assert (c_id, "out", w_id, "data") in fp.doc.edges
+    fig.edit(lambda d: d.update(data=[], items=[]))
+    assert not any(n.startswith(DATA_PREFIX) for n in fp.doc.nodes), set(fp.doc.nodes)
+    # the schema: a bad op, an unknown source, a chart naming a missing entry
+    for bad, path in (({"id": "d2", "from": ["cells"], "where": [["area", "~", 1]]}, "data[0].where[0].op"),
+                      ({"id": "d2", "from": ["nope"]}, "data[0].from[0]")):
+        try:
+            FS.normalize(dict(fig.to_dict(), data=[bad]))
+        except FS.FigureError as exc:
+            assert exc.path == path, (exc.path, path)
+        else:
+            raise AssertionError(f"accepted {bad}")
+    try:
+        FS.normalize(dict(fig.to_dict(), items=[{"id": "c", "kind": "chart", "rect_mm": [0, 0, 1, 1],
+                                                 "chart": {"data": "ghost"}}]))
+    except FS.FigureError as exc:
+        assert exc.path == "items[0].chart.data", exc.path
+    else:
+        raise AssertionError("a chart may not name a missing data entry")
+    print("[ok] figure data: where → aggregate compile into the shadow graph, pull through "
+          "the real catalog, series + geometry + CSV from the summary, concat for pooled "
+          "sources, removal, schema refusals")
+
+
+def test_figure_paper() -> None:
+    """Paper-readiness (V5.00 step 5), Qt-free: panels re-letter in reading order with a
+    popout unlettered; style sync applies the preset to the page and clears item
+    overrides; every chart palette passes the ΔE validator on both page colours as drawn
+    (a grey ramp re-spaced, black lifted on a dark page); a summary table reduces a table
+    per group with the statistics asked for and formats for print; the export bundle
+    composes the canonical document, the legend sentence, a provenance record naming the
+    sources, run ids, lineage and files, and a CSV per data file; ``write_bundle`` puts
+    them beside the picture."""
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph.catalog._shared.figure import PALETTES
+    from nodegraph.figure import bundle as FB
+    from nodegraph.figure import layout as L
+    from nodegraph.figure import schema as S
+    from nodegraph.figure import tables as FT
+
+    # re-lettering: rows top to bottom, left to right; the zoom child gets none
+    doc = S.normalize({"page": {"letters": "A"}, "sources": [{"id": "s", "source": "pg1:raw"}],
+                       "items": [{"id": "b", "kind": "chart", "rect_mm": [50, 1, 30, 20],
+                                  "chart": {"kind": "xy", "source": "s"}},
+                                 {"id": "a", "kind": "image", "rect_mm": [0, 0, 40, 30],
+                                  "image": {"source": "s"}},
+                                 {"id": "c", "kind": "image", "rect_mm": [0, 35, 40, 30],
+                                  "image": {"source": "s"}},
+                                 {"id": "z", "kind": "image", "rect_mm": [45, 35, 10, 10],
+                                  "letter": "Q", "image": {"source": "s", "region": {
+                                      "from": "rect_frac", "rect_frac": [0, .5, 0, .5]}}},
+                                 {"id": "t", "kind": "text", "rect_mm": [0, 70, 10, 5],
+                                  "text": "hi", "pt": 12.0},
+                                 {"id": "sh", "kind": "shape", "rect_mm": [0, 80, 10, 5],
+                                  "width_pt": 3.0}],
+                       "links": [{"kind": "zoom", "parent": "c", "child": "z"}]})
+    assert L.reletter(doc) == {"a": "A", "b": "B", "c": "C", "z": ""}, L.reletter(doc)
+    assert L.reletter(dict(doc, page=dict(doc["page"], letters="(A)")))["b"] == "(B)"
+    assert L.reletter(dict(doc, page=dict(doc["page"], letters="none"))) == \
+        {"a": "", "b": "", "c": "", "z": ""}
+    assert L.reading_order([{"id": "r", "rect_mm": [60, 2, 10, 10]},
+                            {"id": "l", "rect_mm": [0, 0, 50, 40]},
+                            {"id": "d", "rect_mm": [0, 45, 10, 10]}]) == ["l", "r", "d"]
+    # style sync: the preset lands on the page, overrides clear
+    synced = L.style_sync(doc, "talk")
+    assert synced["page"]["font_pt"] == 14.0 and synced["page"]["line_width"] == 1.5 \
+        and synced["page"]["style"] == "talk" and not synced["page"]["dark"]
+    assert S.item(synced, "t")["pt"] is None and S.item(synced, "sh")["width_pt"] == 1.5
+    assert L.style_sync(doc, "dark")["page"]["dark"] is True
+    S.normalize(synced)                                   # still a valid document
+    # the palette validator: every palette, both pages, as drawn
+    for name, cols in PALETTES.items():
+        for dark in (False, True):
+            eff = L.effective_palette(cols, dark=dark)
+            rep = L.palette_report(eff, background=L.DARK_PAGE if dark else L.LIGHT_PAGE)
+            assert not rep, (name, dark, rep)
+            assert len(eff) == len(cols)
+    assert L.palette_report(["#000000", "#050505"]) and \
+        L.palette_report(["#ffffff"], background=L.LIGHT_PAGE)
+    assert L.effective_palette(PALETTES["colorblind"], dark=True)[-1] != "#000000" \
+        and L.effective_palette(PALETTES["colorblind"], dark=False) == PALETTES["colorblind"]
+    assert 2.0 < L.delta_e("#ff0000", "#fe0000") < 3.0 or L.delta_e("#ff0000", "#fe0000") < 3.0
+    # a summary table
+    cols = {"id": np.arange(6), "t": np.array([0, 0, 0, 1, 1, 1]),
+            "area": np.array([10.0, 20.0, 30.0, 1.0, 2.0, np.nan]),
+            "name": np.array(["a", "b", "c", "d", "e", "f"])}
+    header, rows = FT.summary_table(cols, ["area"], group_by="t", stats=["n", "mean", "sem"])
+    assert header == ["t", "n", "area mean", "area SEM"], header
+    assert rows[0][:3] == ["0", "3", "20"] and rows[1][:2] == ["1", "2"], rows
+    header, rows = FT.summary_table(cols, [], stats=["n", "median", "max"], decimals=1)
+    assert header == ["n", "area median", "area max"] and rows == [["5", "10.0", "30.0"]], (
+        header, rows)
+    assert FT.table_csv(header, rows).splitlines()[1] == "5,10.0,30.0"
+    try:
+        FT.summary_table(cols, ["area"], stats=["mode"])
+        raise AssertionError("an unknown statistic must be ignored, not raise")
+    except ValueError:
+        raise
+    except AssertionError:
+        pass
+    # the bundle
+    ax = AxisSizes(m=1, t=3, z=1, c=2, y=64, x=64)
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_bundle_") as tmp:
+        src = _os.path.join(tmp, "cells.nd2")
+        with open(src, "wb") as f:
+            f.write(b"\0" * 10)
+        env = MetaEnvelope(axes=ax, metadata={"pixel_size_um": 0.325, "dt_s": 2.0,
+                                               "channel_names": ["DAPI", "GFP"],
+                                               "source_path": [src],
+                                               "source_file": ["cells.nd2"]})
+        files = FB.bundle_files(doc, {"s": env}, data_files={"A chart": "x,y\n1,2\n"},
+                                run_ids={"s": "pg1/O"}, lineage={"s": "abc123"},
+                                lut_windows={"a": [(0, 10.0, 200.0)]}, app_version="test 1")
+        assert set(files) == {"figure.json", "legend.txt", "provenance.json",
+                              "data/A_chart.csv"}, set(files)
+        assert _json.loads(files["figure.json"]) == S.normalize(doc)
+        assert "0.325" in files["legend.txt"], files["legend.txt"]
+        prov = _json.loads(files["provenance.json"])
+        assert prov["app_version"] == "test 1" and prov["figure_digest"] == S.digest(doc)
+        s0 = prov["sources"][0]
+        assert s0["run_id"] == "pg1/O" and s0["lineage"] == "abc123" \
+            and s0["files"][0]["path"] == src and s0["files"][0]["size"] == 10 \
+            and "mtime" in s0["files"][0] and s0["channel_names"] == ["DAPI", "GFP"], s0
+        assert prov["lut_windows"] == {"a": [[0, 10.0, 200.0]]}
+        stem = _os.path.join(tmp, "fig")
+        written = FB.write_bundle(stem, files)
+        assert sorted(_os.path.basename(p) for p in written) == \
+            ["A_chart.csv", "fig.figure.json", "fig.legend.txt", "fig.provenance.json"], written
+        assert _os.path.isdir(stem + ".data")
+        assert FB.write_bundle(stem, {"legend.txt": ""}) == []
+    _ok("figure paper: re-letter in reading order (popout unlettered), style sync, every "
+        "palette passes ΔE on both pages, summary table per group, the bundle's four files")
+
+
+def test_figure_recipes_builtin() -> None:
+    """Figure templates (V5.00 step 6): every built-in recipe loads and its stubbed figure
+    passes the schema; bound to a synthetic catalog, every slot finds a row carrying what
+    it needs, every placeholder resolves (a Page Output value, a layer name, a measured
+    column) and the result normalizes; a catalog without the need reports the slot and
+    keeps the placeholder; a figure in hand round-trips to a recipe and back; the user
+    folder shadows a built-in by name and can be switched off."""
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph.figure import schema as S
+    from nodelab_v2 import figure_recipes as FR
+
+    saved = {k: _os.environ.get(k) for k in (FR.ENV_ENABLED, FR.ENV_DIR)}
+    _os.environ[FR.ENV_ENABLED] = "0"
+    try:
+        recipes = FR.list_recipes()
+        assert len(recipes) >= 5 and all(r.builtin for r in recipes), [r.name for r in recipes]
+        slugs = {r.slug for r in recipes}
+        assert {"segment-measure-summary", "tracking-summary", "standard-curve",
+                "plate-overview-with-popout"} <= slugs, slugs
+        cat = [{"value": "pg3:cells", "label": "P1 · cells", "image": True, "channels": 2,
+                "channel_names": ["DAPI", "GFP"],
+                "axes": {"m": 3, "t": 4, "z": 1, "c": 2, "y": 64, "x": 64},
+                "labels": [("labels", ["id", "m", "t", "z", "y", "x", "area", "mean_intensity"])],
+                "points": [], "fields": [("piv", ["id", "y", "x", "disp_y", "disp_x", "speed"])],
+                "tracks": [("tracks", ["id", "track_id", "t", "y", "x", "track_length"])],
+                "mesh": []},
+               {"value": "pg1:raw", "label": "Input · raw", "image": True, "channels": 1,
+                "channel_names": [], "axes": {"m": 3, "t": 4, "z": 1, "c": 1, "y": 64, "x": 64},
+                "labels": [], "points": [], "tracks": [], "fields": [], "mesh": []}]
+        for r in recipes:
+            doc, missing = FR.bind_recipe(r, cat)
+            assert not missing, (r.slug, missing)
+            nd = S.normalize(doc)
+            text = S.canonical_json(nd)
+            assert "slot:" not in text, (r.slug, [l for l in text.split(",") if "slot:" in l][:3])
+            assert nd["sources"] and all(s["source"].startswith("pg") for s in nd["sources"])
+            for it in nd["items"]:
+                if it["kind"] in ("image", "montage"):
+                    assert it["image"]["channels"], (r.slug, it["id"])
+            assert FR.applicable(r, cat)
+        seg = FR.find_recipe("Segment & measure summary")
+        assert seg is not None and seg.slug == "segment-measure-summary"
+        doc, _m = FR.bind_recipe(seg, cat)
+        field = S.item(doc, "field")
+        assert field["image"]["layers"][0]["layer"] == "labels" \
+            and S.item(doc, "areas")["chart"]["value"] == "area" \
+            and S.item(doc, "summary")["table"]["columns"] == ["area"] \
+            and field["image"]["channels"][1]["label"] == "GFP", doc["items"]
+        curve = FR.bind_recipe(FR.find_recipe("standard-curve"), cat)[0]
+        assert S.item(curve, "curve")["chart"]["x"] == "area" \
+            and S.item(curve, "curve")["chart"]["y"] == "mean_intensity"
+        strain = FR.find_recipe("strain-speed-field-panel")
+        doc, _m = FR.bind_recipe(strain, cat)
+        assert S.item(doc, "heat")["image"]["layers"][0]["column"] == "speed"
+        # the plate recipe prefers the row the caller picks; a catalog without the need
+        plate = FR.find_recipe("plate-overview-with-popout")
+        doc, _m = FR.bind_recipe(plate, cat, picks={"plate": "pg1:raw"})
+        assert doc["sources"][0]["source"] == "pg1:raw" \
+            and S.item(doc, "overview")["image"]["channels"][0]["rgb"] == "#ffffff"
+        doc, missing = FR.bind_recipe(seg, cat[1:])
+        assert missing == ["cells"] and doc["sources"][0]["source"] == "slot:cells"
+        assert not FR.applicable(seg, cat[1:]) and FR.applicable(plate, cat[1:])
+        S.normalize(FR._stub(doc, ["cells"]))
+        # a figure → recipe → figure
+        rec = FR.recipe_from_figure(S.normalize(FR.bind_recipe(seg, cat)[0]), cat,
+                                    name="Mine", description="my own")
+        assert rec.slots == [{"id": "cells", "needs": "labels", "label": "P1 · cells"}]
+        back, _m = FR.bind_recipe(rec, cat)
+        assert S.canonical_json(S.normalize(back)) == \
+            S.canonical_json(S.normalize(FR.bind_recipe(seg, cat)[0])), "the round trip drifted"
+        # a bad recipe
+        for bad, why in (({"format": "x"}, "format"),
+                         ({"format": FR.RECIPE_FORMAT, "slots": [], "figure": {}}, "slot"),
+                         ({"format": FR.RECIPE_FORMAT, "slots": [{"id": "a", "needs": "blob"}],
+                           "figure": {}}, "needs")):
+            try:
+                FR.recipe_from_dict(bad)
+            except ValueError as exc:
+                assert why in str(exc), (why, exc)
+            else:
+                raise AssertionError(f"accepted {bad}")
+        # the user folder: a saved recipe shadows the built-in of its name
+        with _tempfile.TemporaryDirectory(prefix="nd2sb_figrec_") as tmp:
+            _os.environ[FR.ENV_ENABLED] = "1"
+            _os.environ[FR.ENV_DIR] = tmp
+            mine = FR.FigureRecipe(seg.name, "shadowed", seg.slots, seg.figure)
+            path = FR.save_recipe(mine)
+            assert _os.path.exists(path)
+            got = FR.find_recipe(seg.name)
+            assert got is not None and not got.builtin and got.description == "shadowed"
+            assert len(FR.list_recipes()) == len(recipes)
+            _os.environ[FR.ENV_ENABLED] = "0"
+            assert FR.find_recipe(seg.name).builtin
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+    _ok("figure recipes: five built-ins load, bind to a catalog with every placeholder "
+        "resolved, report an unfillable slot, round-trip through recipe_from_figure, user "
+        "folder shadows by name")
+
+
+def test_figure_headless_render() -> None:
+    """The headless renderer (V5.00 step 6): a figure job built from a workspace (the
+    composed graph, the figure, its run ids, a seed per loader) renders in a subprocess
+    under the offscreen platform to a PNG of the page's pixel size with the bundle
+    beside it; two renders are identical bytes; the workspace-file route gives the same
+    picture; a LabLink draft of the figure page carries the figure and a ``figure`` output
+    the worker's validator accepts."""
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tempfile
+    from PIL import Image as _Image
+    from nodelab_v2 import figure_render as FRD
+    from nodelab_v2.lablink import protocol as LP
+    from nodelab_v2.lablink import recipe as LR
+    from nodelab_v2.workspace import FIGURE_KIND
+
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+    P1.doc.add_node("analysis.label", node_id="L")
+    P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.doc.connect("X", "out", "T", "data")
+    P1.doc.connect("T", "out", "L", "data")
+    P1.doc.connect("L", "out", "O", "data")
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    fp.figure.edit(lambda d: d.update(
+        goal="composite",
+        sources=[{"id": "cells", "source": "pg3:cells", "label": "cells"}],
+        items=[{"id": "img", "kind": "image", "rect_mm": [2, 2, 40, 30], "letter": "A",
+                "image": {"source": "cells",
+                          "channels": [{"c": 0, "rgb": "#ffffff", "mode": "auto_pct"}],
+                          "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                          "decor": {"scale_bar_um": 5.0}}},
+               {"id": "ch", "kind": "chart", "rect_mm": [45, 2, 38, 30], "letter": "B",
+                "chart": {"kind": "distribution", "sub_kind": "histogram", "source": "cells",
+                          "domain": "label", "table": "labels", "value": "area"}},
+               {"id": "tb", "kind": "table", "rect_mm": [2, 36, 60, 20], "letter": "C",
+                "table": {"source": "cells", "domain": "label", "table": "labels",
+                          "columns": ["area"], "group_by": "t", "stats": ["n", "mean"]}}]))
+    live = FRD.build_job(ws, "Figures")           # the in-memory seed sizes its stack
+    assert live["format"] == FRD.JOB_FORMAT and live["page"] == fp.id \
+        and live["run_ids"] == {"cells": "pg3/O"} and list(live["seeds"]) == ["pg1/L"] \
+        and live["seeds"]["pg1/L"]["path"] == "" and live["seeds"]["pg1/L"]["axes"]["x"] == 32, live
+    try:
+        FRD.figure_page_id(ws, "P1")
+        raise AssertionError("a graph page is not a figure page")
+    except ValueError:
+        pass
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_headless_") as tmp:
+        wsf = _os.path.join(tmp, "ws.nd2graph.json")
+        ws.save_file(wsf)
+        from nodelab_v2.workspace import Workspace as _WS
+        ws2 = _WS()
+        ws2.load_file(wsf)                        # what the file route sees: no meta seed
+        job = FRD.build_job(ws2, "Figures")
+        assert job["run_ids"] == live["run_ids"] and "axes" not in job["seeds"]["pg1/L"]
+        jp = _os.path.join(tmp, "job.json")
+        with open(jp, "w", encoding="utf8") as fh:
+            _json.dump(job, fh)
+        penv = dict(_os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1")
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        pngs = []
+        for k in (1, 2):
+            out = _os.path.join(tmp, f"f{k}.png")
+            cmd = [_sys.executable, "-B", "-m", "nodelab_v2.figure_render", "--job", jp,
+                   "--out", out] + (["--bundle"] if k == 1 else [])
+            p = _sp.run(cmd, capture_output=True, text=True, env=penv, cwd=root, timeout=600)
+            assert p.returncode == 0, (p.returncode, p.stderr[-2000:])
+            with open(out, "rb") as fh:
+                pngs.append(fh.read())
+        assert pngs[0] == pngs[1], "two headless renders of one job differ"
+        page = fp.figure.document["page"]
+        with _Image.open(_os.path.join(tmp, "f1.png")) as a:
+            size = a.size
+        want = (int(round(page["width_mm"] * page["dpi"] / 25.4)),
+                int(round(page["height_mm"] * page["dpi"] / 25.4)))
+        assert size == want, (size, want)
+        names = sorted(_os.listdir(tmp))
+        assert {"f1.svg", "f1.figure.json", "f1.legend.txt", "f1.provenance.json",
+                "f1.data"} <= set(names), names
+        data = sorted(_os.listdir(_os.path.join(tmp, "f1.data")))
+        assert any(n.endswith("_chart.csv") for n in data) \
+            and any(n.endswith("_table.csv") for n in data), data
+        with open(_os.path.join(tmp, "f1.provenance.json"), encoding="utf8") as fh:
+            prov = _json.load(fh)
+        assert prov["sources"][0]["run_id"] == "pg3/O" and prov["sources"][0]["lineage"] \
+            and "img" in prov["lut_windows"], prov["sources"]
+        out3 = _os.path.join(tmp, "f3.png")
+        p = _sp.run([_sys.executable, "-B", "-m", "nodelab_v2.figure_render", wsf,
+                     "--page", "Figures", "--out", out3], capture_output=True, text=True,
+                    env=penv, cwd=root, timeout=600)
+        assert p.returncode == 0, p.stderr[-2000:]
+        with open(out3, "rb") as fh:
+            assert fh.read() == pngs[0], "the workspace-file route drew a different page"
+    # LabLink: a draft of the figure page ships the figure and declares the output
+    draft = LR.draft_from_workspace(ws, fp.id, name="fig-recipe")
+    man = draft.to_manifest()
+    assert man["figure"]["page"] == fp.id and man["figure"]["doc"]["items"] \
+        and f'"{man["figure"]["run_ids"]["cells"]}"' in _json.dumps(draft.graph_doc), \
+        man["figure"]["run_ids"]
+    kinds = [o["kind"] for o in man["outputs"]]
+    assert "figure" in kinds and "figure" in LP.ARTIFACT_KINDS, kinds
+    assert man["targets"]["primary"] == man["figure"]["run_ids"]["cells"], man["targets"]
+    _ok("figure headless render: job from a workspace, subprocess PNG at the page size, "
+        "identical twice, bundle beside it, the file route matches, a LabLink draft ships "
+        "the figure with a figure output")
+
+
+def test_figure_polish() -> None:
+    """Step 7, Qt-free: a plane read above its pixel budget on a provider without a
+    pyramid is strided (never interpolated) with the level shape and box following the
+    stride, and the budget is for the WINDOW (a region asks for a finer level); the
+    Report's captions name what each lettered panel shows in reading order and its HTML
+    carries the picture, the captions, the legend and the provenance; ``report`` is a
+    goal the schema accepts."""
+    from nodegraph.figure import report as FRP
+    from nodegraph.figure import schema as S
+    from nodelab_v2.figure_editor import render as R
+
+    ws, ds, env, ax = _ws_fixture()                      # a 32 × 32 ArrayProvider, no pyramid
+    img = dict(S.image_defaults(), source="s", channels=[dict(S.channel_defaults(), c=0)])
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=1024)
+    assert plane.shape == (32, 32) and shape == (32, 32) and box == (0, 32, 0, 32)
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=8)
+    assert plane.shape == (8, 8) and shape == (8, 8) and box == (0, 8, 0, 8), (plane.shape, shape, box)
+    assert float(plane.max()) == 100.0, "a stride keeps the values it keeps"
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=8, window=(0.25, 0.75, 0.25, 0.75))
+    assert plane.shape == (16, 16) and shape == (32, 32) and box == (8, 24, 8, 24), (
+        plane.shape, shape, box)                          # within 2× of the budget: as read
+    plane, shape, box = R.read_plane(ds, 0, 0, 0, 0, max_px=4, window=(0.25, 0.75, 0.25, 0.75))
+    assert plane.shape == (4, 4) and shape == (8, 8) and box == (2, 6, 2, 6), (
+        plane.shape, shape, box)                          # strided ×4, box in strided px
+    r = R.render_image(ds, img, (0, 0, 0, 0), max_px=8)
+    assert r.image.width() == 8 and r.plane_shape == (8, 8) and r.level_shape == (8, 8)
+    r2 = R.render_image(ds, img, (0, 0, 0, 0))
+    assert r2.image.width() == 32 and r2.pixel_size_um == 0.5 and abs(r.pixel_size_um - 2.0) < 1e-9, (
+        r2.pixel_size_um, r.pixel_size_um)
+
+    # the budget is for the window: a fake two-level pyramid picks the finer level for a
+    # quarter-plane window at the same budget that the whole plane reads coarse
+    class _Pyr:
+        levels = 2
+
+        def level_axes(self, lv):
+            n = 64 >> lv
+            return AxisSizes(m=1, t=1, z=1, c=1, y=n, x=n)
+
+        def get_region(self, level, m, t, z, c, y0, y1, x0, x1):
+            return np.full((y1 - y0, x1 - x0), float(level), dtype=float)
+
+    assert R._pick_level(_Pyr(), 32)[0] == 1 and R._pick_level(_Pyr(), 33)[0] == 0
+    fake = Dataset(axes=AxisSizes(m=1, t=1, z=1, c=1, y=64, x=64), metadata={}).with_image(_Pyr())
+    whole, _s, _b = R.read_plane(fake, 0, 0, 0, 0, max_px=32)
+    part, _s, _b = R.read_plane(fake, 0, 0, 0, 0, max_px=32, window=(0.0, 0.25, 0.0, 0.25))
+    assert float(whole[0, 0]) == 1.0 and float(part[0, 0]) == 0.0, (whole[0, 0], part[0, 0])
+
+    # the report
+    doc = S.normalize({
+        "goal": "report",
+        "sources": [{"id": "cells", "source": "pg3:cells", "label": "P1 · cells"}],
+        "data": [{"id": "d1", "from": ["cells"], "where": [["area", ">", 50]],
+                  "aggregate": {"group_by": ["t"], "value": "area", "reducers": ["mean"]}}],
+        "items": [
+            {"id": "img", "kind": "image", "rect_mm": [0, 0, 40, 30], "letter": "A",
+             "image": {"source": "cells", "frame": {"m": 0, "t": 3, "z": "max"},
+                       "channels": [{"c": 0, "rgb": "#ffffff", "label": "DAPI"},
+                                    {"c": 1, "rgb": "#00ff00"}],
+                       "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                       "decor": {"scale_bar_um": 20}}},
+            {"id": "ch", "kind": "chart", "rect_mm": [45, 0, 40, 30], "letter": "B",
+             "chart": {"kind": "bar", "data": "d1", "x": "t", "y": "area_mean",
+                       "stats": {"test": "welch"}}},
+            {"id": "tb", "kind": "table", "rect_mm": [0, 35, 40, 20], "letter": "C",
+             "table": {"source": "cells", "columns": ["area"], "group_by": "t",
+                       "stats": ["n", "mean"]}},
+            {"id": "txt", "kind": "text", "rect_mm": [0, 60, 40, 5], "text": "note"}]})
+    env2 = MetaEnvelope(axes=AxisSizes(m=1, t=4, z=2, c=2, y=64, x=64),
+                        metadata={"channel_names": ["DAPI", "GFP"]})
+    caps = FRP.panel_captions(doc, {"cells": env2}, labels={"cells": "P1 · cells"})
+    assert [c[0] for c in caps] == ["A", "B", "C"], caps
+    a, b, c = (t for _l, t in caps)
+    assert a.startswith("P1 · cells — DAPI, GFP (frame 3, maximum projection); object outlines. "
+                        "Scale bar 20 µm."), a
+    assert b.startswith("Area_mean per t; welch test, from P1 · cells; kept where area > 50; "
+                        "area per t (mean)."), b
+    assert c == "Area (n, mean) per t, from P1 · cells.", c
+    html = FRP.report_html(doc, title="Study 1", picture="fig.png", legend="Images show A.",
+                           captions=caps, provenance={"sources": [
+                               {"id": "cells", "label": "P1 · cells", "source": "pg3:cells",
+                                "run_id": "pg3/O", "lineage": "abc", "files": [{"name": "x.nd2"}]}],
+                               "data": doc["data"], "app_version": "v", "written": "now",
+                               "figure_digest": "0123456789abcdef"}, svg="fig.svg",
+                           data_files=["fig.data/B_ch_chart.csv"])
+    for needle in ("<img src=\"fig.png\"", "<dt>A</dt>", "Scale bar 20 µm", "Images show A.",
+                   "pg3/O", "x.nd2", "kept where area &gt; 50", "fig.svg", "B_ch_chart.csv",
+                   "figure 0123456789ab"):
+        assert needle in html, needle
+    assert "<script" not in html and html.count("<html") == 1
+    assert S.normalize({"goal": "report"})["goal"] == "report"
+    _ok("figure polish: a plane over budget is strided with its box and level shape, the "
+        "budget is the window's, report captions per lettered panel and a self-contained "
+        "HTML with picture, captions, legend and provenance")
 
 
 if __name__ == "__main__":

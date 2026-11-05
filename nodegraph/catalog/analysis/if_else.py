@@ -340,6 +340,17 @@ def _compute_if_else(ctx: EvalContext) -> Dataset:
         ctx.progress(1, 1, f"if/else {shown} ({match}){tail}")
         return out
 
+    if layer not in {a.name for a in ds.layers_on(Domain.VOXEL)}:
+        # A Label TABLE with no raster behind it (2026-10-16): Table Concat's or Standard
+        # Curve's rows from several files, whose ids index no one image. There is no raster to
+        # rewrite, so the split is the table's alone — as the point branch's always is.
+        out = ds
+        for name, sel in ((pass_name, keep), (fail_name, ~keep)):
+            out = out.with_structure(StructureTable(
+                Domain.LABEL, {k: np.asarray(v)[sel] for k, v in cols.items()},
+                layer=name, z_kind=zk))
+        ctx.progress(1, 1, f"if/else {shown} ({match}){tail} — table only (no raster)")
+        return out
     raster6, rzk = _label_raster(ds, layer, node="if/else")
     # One pass over the raster per side, plane by plane, so the progress bar is real and no
     # frame-sized boolean outlives the plane it belongs to. The parent's dtype is preserved:
@@ -506,7 +517,9 @@ register_node(
                  "Which Label instance to split — a raster plus its table, from Segmentation, "
                  "Connected Components or Histogram Threshold. This layer is left UNCHANGED "
                  "on the wire; the two sides go to the output layers named below, so all "
-                 "three are available downstream and the viewer can show what moved."),
+                 "three are available downstream and the viewer can show what moved. A "
+                 "Label table with no raster (Table Concat's rows from several files) is "
+                 "split as a table only."),
         InString("points", "Point layer", field=False, default="spots",
                  layer_in=Domain.POINT, available_in={"target": frozenset({"point"})},
                  description=

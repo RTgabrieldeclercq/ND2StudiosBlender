@@ -482,6 +482,10 @@ class RecipeDraft:
     graph_doc: Dict[str, Any] = field(default_factory=dict)
     #: Loader node ids, in graph order — one declared input each.
     loaders: Tuple[str, ...] = ()
+    #: A published FIGURE page (V5.00 step 6): ``{"page", "doc", "run_ids"}`` — the figure
+    #: document and its source ids mapped to the recipe's (renamed) node ids, so the worker
+    #: can render the page as the run's picture (``nodelab_v2.figure_render``).
+    figure: Optional[Dict[str, Any]] = None
 
     def exposed(self) -> Dict[Tuple[str, str], str]:
         """``(node_id, param) -> knob name`` for every knob, so conditions can be resolved."""
@@ -514,6 +518,8 @@ class RecipeDraft:
         }
         if self.description:
             manifest["description"] = self.description
+        if self.figure:
+            manifest["figure"] = self.figure
         return manifest
 
     def outputs(self) -> List[Dict[str, Any]]:
@@ -533,6 +539,10 @@ class RecipeDraft:
             {"name": "metrics", "kind": "metrics", "policy": "auto",
              "filename": "{stem}_metrics.json"},
         ]
+        if self.figure:
+            # the figure page rendered offscreen: the run's picture, with its bundle beside
+            out.insert(2, {"name": "figure", "kind": "figure", "policy": "auto",
+                           "filename": "{stem}_figure.png"})
         return out
 
 
@@ -700,12 +710,22 @@ def draft_from_workspace(ws: Any, page_id: str, *, name: str, target: str = "",
             chosen.append(KnobDraft(candidate=cand, name=names[cand.key],
                                     minimum=lo, maximum=hi, derive=cand.can_derive))
     guess = target or _guess_target(composed.graph, prefix=f"{page_id}/")
+    figure = None
+    fig = getattr(ws.pages[page_id], "figure", None)
+    if fig is not None:                       # a figure page ships its document (V5.00)
+        rids = fig.run_ids(composed, page_id)
+        figure = {"page": page_id, "doc": fig.to_dict(),
+                  "run_ids": {sid: mapping.get(rid, rid) for sid, rid in rids.items()},
+                  "labels": fig.source_labels(ws, page_id)}
+        if not target and figure["run_ids"]:
+            # a figure has no node of its own worth pulling: its first source is the target
+            guess = next(iter(rids.values()))
     return RecipeDraft(
         name=name, title=name.replace("-", " ").strip().capitalize(),
         target=mapping.get(guess, guess), knobs=chosen, allow_zones=bool(zones),
         graph_doc=graph_doc, loaders=loaders,
         requires_metadata=tuple(derive_required_metadata(renamed_graph)),
-        conditional_metadata=tuple(conditional_metadata(renamed_graph)))
+        conditional_metadata=tuple(conditional_metadata(renamed_graph)), figure=figure)
 
 
 def _ensure_dim_levers(graph: Any, graph_doc: Dict[str, Any]) -> None:

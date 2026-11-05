@@ -41,7 +41,6 @@ from nodegraph.streaming import WindowView
 from nodegraph.catalog._base import register_node
 from nodegraph.catalog._shared.dim_footprint import _DIM_GRAN
 from nodegraph.catalog._shared.frame_subset import subset_lattice_layers, subset_structure_rows
-from nodegraph.catalog._shared.placement_entry import handedness_for
 from nodegraph.catalog._shared.sampling import _sampled
 
 
@@ -117,12 +116,14 @@ def _compute_crop_to(ctx: EvalContext) -> Dataset:
     has no honest output. :func:`~nodegraph.placement.source_window` does the clamping, so
     this node cannot drift from what the overlay already does with a partly-covered field.
 
-    **Handedness is derived, not defaulted.** ``flip_x``/``flip_y`` describe how the camera
-    is mounted relative to the stage, and they are *inapplicable* to an already-stitched
-    input whose pixels are already laid out in stage coordinates — applying them again
-    mirrors the mosaic inside its own footprint (measured 784 µm out on the WellA3 pair).
-    :func:`~nodegraph.catalog._shared.placement_entry.handedness_for` is the one place that
-    decides, shared with ``util.merge``.
+    **Handedness applies to a stitched input too.** ``flip_x``/``flip_y`` describe how the
+    camera is mounted relative to the stage, and a stage-Stitched mosaic keeps each tile's
+    pixels as taken, so it runs the camera's way and takes the same flip as a raw field.
+    Until 2026-10-16 the flip was forced off for a stitched input, on the theory that a
+    mosaic is laid out in stage coordinates. That theory was wrong: it cropped the mirror of
+    the requested window about the mosaic's centre. The 784 µm WellA3 measurement it rested
+    on came from the Overlay compositor, which walked every non-canvas primary the wrong way
+    (:func:`nodegraph.placement.frame_mapping`).
 
     Two deliberate asymmetries with the ``meta_transform``
     -----------------------------------------------------
@@ -212,9 +213,8 @@ def _compute_crop_to(ctx: EvalContext) -> Dataset:
             f"to the {coverage:.0%} that exists.")
 
     # ── 3. µm box → this file's pixel grid ────────────────────────────────────
-    flip_x, flip_y, hand_warn = handedness_for(
-        ds, bool(ctx.params.get("flip_x", True)), bool(ctx.params.get("flip_y", False)))
-    warnings.extend(hand_warn)
+    flip_x = bool(ctx.params.get("flip_x", True))
+    flip_y = bool(ctx.params.get("flip_y", False))
     frac = source_window(box, best_box, flip_y=flip_y, flip_x=flip_x)
     if frac is None:                                     # unreachable after `_overlapping`
         raise ValueError(_miss_message(ds, ax, ref, box, ref_used))
@@ -681,18 +681,15 @@ register_node(
                "wrong place, which is the worst failure mode this node has. The tell is a "
                "crop that misses by roughly the width of one field, or a 'does not touch "
                "the data at all' refusal on two files you know overlap. Default on, "
-               "matching Merge and Overlay. IGNORED, with a note, when the data is an "
-               "already-stitched canvas: a stitch has already resolved handedness and its "
-               "output is laid out in stage coordinates, so flipping again would mirror "
-               "the mosaic inside its own footprint (measured 784 µm out on the WellA3 "
-               "pair)."),
+               "matching Merge and Overlay. It applies to a stage-Stitched mosaic exactly "
+               "as to a raw field: a mosaic keeps its tiles' pixels as taken, so it runs "
+               "the camera's way."),
         InBool("flip_y", "Flip Y", default=False, field=False,
                description=
                "The Y twin of Flip X — whether image +Y runs opposite stage +Y. Default "
                "OFF, because the common mounting inverts X only; turn it on if the crop "
                "lands mirrored top-to-bottom rather than left-to-right. Same failure mode "
-               "and the same tell, and it is ignored under the same condition (an "
-               "already-stitched input)."),
+               "and the same tell, and it applies to a stitched mosaic too."),
     ],
     outputs=[OutDataset()],
     modes=[

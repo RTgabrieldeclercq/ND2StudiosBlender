@@ -1,0 +1,33 @@
+{
+  "format": "nd2studios.figure-recipe/1",
+  "name": "Standard curve",
+  "description": "Two measured columns against each other with a linear fit and its equation, and a table of the points — the figure a calibration earns.",
+  "goal": "plot",
+  "tags": ["calibration", "fit"],
+  "slots": [
+    {"id": "standards", "needs": "table", "label": "any output with a measured table (two numeric columns)"}
+  ],
+  "figure": {
+    "goal": "plot",
+    "page": {"preset": "single_column", "width_mm": 85.0, "height_mm": 110.0, "dpi": 300,
+             "style": "paper", "font": "sans", "font_pt": 8.0, "palette": "colorblind",
+             "letters": "A"},
+    "sources": [{"id": "standards", "source": "slot:standards"}],
+    "items": [
+      {"id": "curve", "kind": "chart", "rect_mm": [4.0, 4.0, 77.0, 62.0], "letter": "A",
+       "chart": {"kind": "xy", "source": "standards", "domain": "label",
+                 "table": "slot:standards.table", "x": "slot:standards.table.column",
+                 "y": "slot:standards.table.column2",
+                 "draw": {"mode": "scatter", "error": "none", "error_style": "bars",
+                          "step": false, "stacked": false, "points": true},
+                 "fit": {"model": "linear", "span": null},
+                 "axes": {"title": "", "x_label": "", "y_label": ""},
+                 "legend": {"show": true, "loc": "inside"}}},
+      {"id": "points", "kind": "table", "rect_mm": [4.0, 70.0, 77.0, 36.0], "letter": "B",
+       "table": {"source": "standards", "domain": "label", "table": "slot:standards.table",
+                 "columns": ["slot:standards.table.column", "slot:standards.table.column2"],
+                 "group_by": "", "stats": ["n", "mean", "sd"], "decimals": -1}}
+    ],
+    "links": []
+  }
+}
