@@ -36782,6 +36782,7 @@ def main() -> int:
     test_figure_recipes_builtin()
     test_figure_headless_render()
     test_figure_data()
+    test_htmlview()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
 
@@ -37814,6 +37815,252 @@ def test_figure_polish() -> None:
     _ok("figure polish: a plane over budget is strided with its box and level shape, the "
         "budget is the window's, report captions per lettered panel and a self-contained "
         "HTML with picture, captions, legend and provenance")
+
+
+def test_htmlview() -> None:
+    """The standalone interactive HTML view (2026-11-05): a 16-bit plane packs as two
+    stacked grey halves and comes back exactly (and the same bytes twice); quantisation is
+    exact for integers up to 16 bits and affine for floats, with a hole code for a raster;
+    a plane is read at the pixel budget as a ceiling; the view document carries the shown
+    planes, the channels (emission colours, Auto or the Viewer's window), the times, the
+    positions and the overlays as data (points with palette slots, the label raster per
+    frame with its keys, trajectories) with the Viewer's own look fields; a projection, a
+    window and the frames grammar narrow it; the byte budget refuses with the numbers; the
+    page is self-contained; ``io.write_html`` writes it through the Engine as a tap and
+    refuses an empty path, an existing file and an over-budget page; the headless
+    renderer writes a figure page with its image live and its chart hoverable."""
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tempfile
+    import dataclasses as _dc
+    from nodegraph.htmlview import (BudgetExceeded, build_view, parse_frames, view_html,
+                                    write_html)
+    from nodegraph.htmlview import document as HD
+    from nodegraph.htmlview import planes as HP
+    from nodegraph.htmlview import png as HPNG
+    from nodegraph.provider import ArrayProvider
+    from nodegraph.structure import StructureTable as _ST
+    from nodelab_v2 import overlays as OV
+
+    # ── packing ──────────────────────────────────────────────────────────────────
+    a = ((np.arange(64 * 48, dtype=np.int64).reshape(48, 64) * 517) % 65536).astype(np.uint16)
+    png1, png2 = HPNG.encode_png(HPNG.pack_u16(a)), HPNG.encode_png(HPNG.pack_u16(a))
+    assert png1 == png2 and HPNG.decode_png(png1).shape == (96, 64)
+    assert np.array_equal(HPNG.unpack_u16(HPNG.decode_png(png1)), a), "u16 round trip"
+    b = (a % 256).astype(np.uint8)
+    assert np.array_equal(HPNG.decode_png(HPNG.encode_png(b)), b), "u8 round trip"
+    assert HPNG.plane_png(b)[1] == "u8" and HPNG.plane_png(a)[1] == "u16"
+    codes, sc, off, n0 = HP.quantize(np.array([[0, 4095], [7, 65535]], np.int32))
+    assert sc == 1.0 and off == 0.0 and not n0 and codes.dtype == np.uint16
+    codes, sc, off, n0 = HP.quantize(np.array([[-1.5, 2.5]]))
+    assert np.allclose(codes * sc + off, [[-1.5, 2.5]]) and codes.tolist() == [[0, 65535]]
+    codes, sc, off, n0 = HP.quantize(np.array([[np.nan, 1.0, 3.0]]), nan0=True)
+    assert n0 and codes[0, 0] == 0 and codes[0, 1] == 1 and abs(codes[0, 2] * sc + off - 3.0) < 1e-6
+    rec = HP.plane_record(np.full((4, 4), 300, np.uint16))
+    assert rec["enc"] == "u16" and rec["w"] == 4 and "scale" not in rec \
+        and rec["png"].startswith("data:image/png;base64,")
+
+    # ── the fixture: 2 positions × 4 frames × 2 planes × 2 channels, labels, points, a track
+    M, T, Z, C, Y, X = 2, 4, 2, 2, 64, 64
+    yy, xx = np.mgrid[0:Y, 0:X]
+    img = np.zeros((1, M, T, Z, C, Y, X), np.uint16)
+    lab = np.zeros((M, T, Z, C, Y, X), np.int32)
+    rows = {k: [] for k in ("id", "m", "t", "c", "z", "y", "x")}
+    nid = 0
+    for t in range(T):
+        cx = 20 + 5 * t
+        img[0, :, t, :, 0] = (np.exp(-((xx - cx) ** 2 + (yy - 30) ** 2) / 40.0) * 3000 + 100).astype(np.uint16)
+        img[0, :, t, :, 1] = (np.exp(-((xx - 44) ** 2 + (yy - 44) ** 2) / 60.0) * 1500 + 50).astype(np.uint16)
+        for m in range(M):
+            for i, (cy, cxx, r2) in enumerate(((30, cx, 36), (44, 44, 25))):
+                nid += 1
+                lab[m, t, :, :, (xx - cxx) ** 2 + (yy - cy) ** 2 < r2] = nid
+                for k, v in (("id", nid), ("m", m), ("t", t), ("c", 0), ("z", 0), ("y", cy), ("x", cxx)):
+                    rows[k].append(v)
+    cols = {k: np.asarray(v) for k, v in rows.items()}
+    md = {"pixel_size_um": 0.5, "channel_names": ["DAPI", "GFP"], "channel_emission_nm": [461, 509],
+          "dt_s": 2.5, "position_name": ["A1", "A2"], "stage_xy_um": [[100.0, 200.0], [300.0, 400.0]],
+          "bit_depth": 12}
+    ds = Dataset(axes=AxisSizes(m=M, t=T, z=Z, c=C, y=Y, x=X), metadata=md)
+    ds = ds.with_image(ArrayProvider(img)).with_layer(Domain.VOXEL, "cells", lab)
+    ds = ds.with_structure(_ST(Domain.LABEL, dict(cols, area=np.full(len(cols["id"]), 100.0)),
+                               layer="cells", z_kind="plane_index"))
+    ds = ds.with_structure(_ST(Domain.POINT, dict(cols, id=cols["id"] + 100), layer="spots",
+                               z_kind="plane_index"))
+    first = [cols["id"][i] for i in range(len(cols["id"])) if cols["m"][i] == 0 and cols["x"][i] != 44]
+    tr = {"track_id": np.full(T, 7, np.int64), "t": np.arange(T), "member_id": np.asarray(first)}
+    ds = ds.with_structure(_ST(Domain.TRACK, tr, layer="tracks", z_kind="plane_index"))
+
+    # ── reading at a budget ──────────────────────────────────────────────────────
+    plane, k = HP.read_plane(ds, 0, 0, 0, 0, max_px=64)
+    assert plane.shape == (64, 64) and k == 1
+    plane, k = HP.read_plane(ds, 0, 0, 0, 0, max_px=16)
+    assert plane.shape == (16, 16) and k == 4 and int(plane.max()) == int(img[0, 0, 0, 0, 0, ::4, ::4].max())
+    plane, k = HP.read_plane(ds, 0, 1, "max", 0, max_px=64)
+    assert plane.shape == (64, 64) and int(plane.max()) == int(img[0, 0, 1, :, 0].max())
+    assert parse_frames("0-9:3", 10) == [0, 3, 6, 9] and parse_frames("last", 5) == [4] \
+        and parse_frames("2,1,2", 5) == [2, 1] and parse_frames("", 3) == [0, 1, 2]
+    try:
+        parse_frames("0-9", 5)
+        raise AssertionError("an out-of-range frame must be refused")
+    except ValueError as exc:
+        assert "outside" in str(exc)
+
+    # ── the view document ────────────────────────────────────────────────────────
+    doc = build_view(ds, title="t", state={"coords": (1, 2, 0, 0),
+                                           "channels": {1: {"lo": 60.0, "hi": 900.0, "gamma": 0.7,
+                                                            "rgb": [255, 0, 255], "on": False}}})
+    assert doc["format"] == HD.FORMAT and len(doc["frames"]) == M * T * Z * C \
+        and doc["plane"] == {"h": 64, "w": 64, "sx": 1.0, "sy": 1.0, "x0": 0, "y0": 0, "stride": 1}
+    assert doc["start"] == {"m": 1, "t": 2, "z": "0"} and doc["shown"]["z"] == ["0", "1"]
+    c0, c1 = doc["channels"]
+    assert c0["name"] == "DAPI" and c0["rgb"] == [0, 127, 255] and c0["auto"] and c0["on"] \
+        and c0["range"] == [0.0, 4095.0] and 90 < c0["lo"] < 200 < c0["hi"], c0
+    assert c1 == dict(c1, name="GFP", rgb=[255, 0, 255], lo=60.0, hi=900.0, gamma=0.7, auto=False,
+                      on=False), c1
+    assert doc["times"]["seconds"] == [0.0, 2.5, 5.0, 7.5] and doc["positions"]["names"] == ["A1", "A2"] \
+        and doc["pixel_size_um"] == 0.5 and doc["plane_um"] == 0.5
+    ov = doc["overlays"]
+    assert set(ov["look"]) == set(HD.LOOK_DEFAULTS) and not ov["unsupported"]
+    for tab, fields in HD.LOOK_DEFAULTS.items():       # the page's look fields are the Viewer's
+        have = {f.name for f in _dc.fields(OV.OverlaySettings().group(tab))}
+        assert set(fields) <= have, (tab, set(fields) - have)
+    pts = ov["points"]
+    assert pts["layers"] == ["spots"] and len(pts["id"]) == M * T * 2 and len(pts["slot"]) == len(pts["id"]) and all(isinstance(v, int) for v in pts["slot"]) \
+        and set(pts["m"]) == {0, 1}, pts["layers"]
+    labs = ov["labels"]
+    assert labs["layer"] == "cells" and len(labs["frames"]) == M * T * Z and labs["keys"] is not None
+    lab_rec = labs["frames"]["0,1,0"]
+    dec = HPNG.decode_png(__import__("base64").b64decode(lab_rec["png"].split(",", 1)[1]))
+    assert lab_rec["enc"] == "u8", lab_rec["enc"]             # ids up to 16 fit a byte
+    back = HPNG.unpack_u16(dec) if lab_rec["enc"] == "u16" else dec.astype(np.uint16)
+    assert np.array_equal(back, lab[0, 1, 0, 0].astype(np.uint16)), "the label plane travels exactly"
+    trk = ov["tracks"]["tracks"]
+    assert len(trk) == 1 and trk[0]["id"] == 7 and trk[0]["m"] == 0 and trk[0]["t"] == [0, 1, 2, 3] \
+        and trk[0]["x"] == [20.0, 25.0, 30.0, 35.0], trk
+    assert "viridis" in doc["cmaps"] and len(doc["cmaps"]["turbo"]) == 256
+    d2 = build_view(ds, z="max", t_frames="1-3:2", channels="0", window=(0.25, 0.75, 0.25, 0.75))
+    assert sorted(d2["frames"]) == ["0,1,max,0", "0,3,max,0", "1,1,max,0", "1,3,max,0"] \
+        and d2["plane"]["w"] == 32 and d2["plane"]["x0"] == 16 and "labels" not in d2["overlays"] \
+        and any("projection" in n for n in d2["overlays"]["notes"]), d2["overlays"]["notes"]
+    d3 = build_view(ds, z=1, t_frames=[0], m_frames="1", overlays=False)
+    assert list(d3["frames"]) == ["1,0,1,0", "1,0,1,1"] and "points" not in d3["overlays"]
+    try:
+        build_view(ds, budget_mb=0.001)
+        raise AssertionError("the budget must refuse")
+    except BudgetExceeded as exc:
+        assert "0.001 MB" in str(exc) and "of 32 planes" in str(exc), exc
+
+    # ── the page ─────────────────────────────────────────────────────────────────
+    html = view_html(doc)
+    assert "ND2V.mount(" in html and 'id="nd2v-doc"' in html and "<style>" in html \
+        and 'src="http' not in html and 'href="http' not in html and "</script>" in html
+    assert _json.loads(html.split('id="nd2v-doc">', 1)[1].split("</script>", 1)[0])["title"] == "t"
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_html_") as tmp:
+        out = write_html(_os.path.join(tmp, "v.html"), html)
+        assert _os.path.exists(out) and not any(n.endswith(".part.html") for n in _os.listdir(tmp))
+
+        # ── the node, through the Engine ───────────────────────────────────────
+        from nodegraph.nodes import COMPUTES
+        define_node("io.htmlseed", "HS", outputs=[OutDataset()])
+
+        def pull(kw, seed=ds):
+            g = Graph()
+            g.add(NodeInstance("S", "io.htmlseed"))
+            g.add(NodeInstance("W", "io.write_html", **kw))
+            g.connect("S", "W")
+            e = Engine(g, computes=COMPUTES, seeds={"S": seed},
+                       meta_seeds={"S": MetaEnvelope(axes=seed.axes, metadata=seed.metadata)})
+            return e.pull("W")
+
+        target = _os.path.join(tmp, "node")
+        got = pull({"params": {"path": target, "frames": "0-1", "max_px": 32},
+                    "modes": {"planes": "max"}})
+        assert set(got.attributes) == set(ds.attributes) and got.axes == ds.axes, "a tap"
+        assert _os.path.exists(target + ".html")
+        with open(target + ".html", encoding="utf8") as fh:
+            page = fh.read()
+        node_doc = _json.loads(page.split('id="nd2v-doc">', 1)[1].split("</script>", 1)[0])
+        assert node_doc["plane"]["w"] == 32 and sorted(node_doc["frames"]) == [
+            "0,0,max,0", "0,0,max,1", "0,1,max,0", "0,1,max,1", "1,0,max,0", "1,0,max,1",
+            "1,1,max,0", "1,1,max,1"] and node_doc["provenance"]["node"] == "io.write_html"
+        for kw, msg in (({"params": {"path": ""}}, "no destination"),
+                        ({"params": {"path": target}, "modes": {"existing": "refuse"}},
+                         "already exists"),
+                        ({"params": {"path": target + "3", "frames": "0-99"}}, "outside")):
+            try:
+                pull(kw)
+                raise AssertionError(f"Export HTML must refuse: {msg}")
+            except ValueError as exc:
+                assert msg in str(exc), exc
+
+        # a cap: 4 incompressible 512² planes (~2 MB) against 1 MB refuse; 0 lifts the cap
+        idx = np.arange(4 * 512 * 512, dtype=np.int64)          # a hash mix: deterministic noise
+        seq = (idx * 2654435761) & 0xFFFFFFFF
+        seq = ((seq ^ (seq >> 13)) * 1103515245) & 0xFFFFFFFF
+        seq = ((seq ^ (seq >> 16)) & 0xFFFF).astype(np.uint16)
+        big = Dataset(axes=AxisSizes(m=1, t=4, z=1, c=1, y=512, x=512), metadata={}).with_image(
+            ArrayProvider(seq.reshape(1, 1, 4, 1, 1, 512, 512)))
+        try:
+            pull({"params": {"path": target + "2", "budget_mb": 1}}, seed=big)
+            raise AssertionError("Export HTML must refuse past its cap")
+        except ValueError as exc:
+            assert "embed more than 1 MB" in str(exc) and not _os.path.exists(target + "2.html"), exc
+        pull({"params": {"path": target + "4", "budget_mb": 0, "max_px": 64}}, seed=big)
+        assert _os.path.exists(target + "4.html"), "0 lifts the cap"
+
+        # ── a figure page, headless ────────────────────────────────────────────
+        from nodelab_v2 import figure_render as FRD
+        from nodelab_v2.workspace import FIGURE_KIND
+        ws, _ds, _env, _ax = _ws_fixture()
+        P1 = ws.pages["pg3"]
+        P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+        P1.doc.add_node("analysis.label", node_id="L")
+        P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+        P1.doc.connect("X", "out", "T", "data")
+        P1.doc.connect("T", "out", "L", "data")
+        P1.doc.connect("L", "out", "O", "data")
+        fp = ws.add_page("Figures", FIGURE_KIND)
+        fp.figure.edit(lambda d: d.update(
+            goal="composite",
+            sources=[{"id": "cells", "source": "pg3:cells", "label": "cells"}],
+            items=[{"id": "img", "kind": "image", "rect_mm": [2, 2, 40, 30], "letter": "A",
+                    "image": {"source": "cells",
+                              "channels": [{"c": 0, "rgb": "#ffffff", "mode": "auto_pct"}],
+                              "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                              "decor": {"scale_bar_um": 5.0}}},
+                   {"id": "ch", "kind": "chart", "rect_mm": [45, 2, 38, 30], "letter": "B",
+                    "chart": {"kind": "distribution", "sub_kind": "histogram", "source": "cells",
+                              "domain": "label", "table": "labels", "value": "area"}}]))
+        jp = _os.path.join(tmp, "job.json")
+        with open(jp, "w", encoding="utf8") as fh:
+            _json.dump(FRD.build_job(ws, "Figures"), fh)
+        fh_out = _os.path.join(tmp, "fig.html")
+        penv = dict(_os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1")
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        p = _sp.run([_sys.executable, "-B", "-m", "nodelab_v2.figure_render", "--job", jp,
+                     "--out", fh_out], capture_output=True, text=True, env=penv, cwd=root,
+                    timeout=600)
+        assert p.returncode == 0, (p.returncode, p.stderr[-2000:])
+        with open(fh_out, encoding="utf8") as fh:
+            fig_page = fh.read()
+        assert "ND2V.mountFigure(" in fig_page and "<svg" in fig_page \
+            and 'src="http' not in fig_page
+        fig = _json.loads(fig_page.split('id="nd2v-fig">', 1)[1].split("</script>", 1)[0])
+        assert list(fig["views"]) == ["img"] and fig["views"]["img"]["letter"] == "A" \
+            and fig["views"]["img"]["rect_mm"] == [2.0, 2.0, 40.0, 30.0] \
+            and "labels" in fig["views"]["img"]["doc"]["overlays"] \
+            and fig["views"]["img"]["doc"]["scalebar"] == {"show": True, "um": 5.0, "color": "white"} \
+            and list(fig["charts"]) == ["ch"] and fig["charts"]["ch"]["geometry"]["marks"] \
+            and fig["page"]["width_mm"] > 0, list(fig["views"])
+    _ok("htmlview: stacked u16 PNG round trip (same bytes twice), exact / affine / hole "
+        "quantisation, the pixel budget as a ceiling, a view document with channels, times, "
+        "positions, points with slots, the label raster per frame, a trajectory and the "
+        "Viewer's look fields, projection / window / frames grammar, the byte budget "
+        "refuses, a self-contained page, io.write_html as a tap with its refusals, and a "
+        "headless figure page with its image live and its chart")
 
 
 if __name__ == "__main__":

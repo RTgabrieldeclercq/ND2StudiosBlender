@@ -66,12 +66,12 @@
     "codemap": "Grep-first index of the same facts: codemap/gen/nodes.jsonl, codemap/gen/sockets.jsonl. Concepts: codemap/concepts.md."
   },
   "counts": {
-    "nodes": 145,
+    "nodes": 146,
     "categories": 17,
     "roles": 24,
     "stages": 5,
-    "inputs": 1049,
-    "outputs": 152,
+    "inputs": 1059,
+    "outputs": 153,
     "gui_ops_included": true
   },
   "stages": {
@@ -90,6 +90,7 @@
         "io.load",
         "io.load_analysis",
         "io.write_figure",
+        "io.write_html",
         "io.write_movie",
         "io.write_table",
         "io.write_tiff",
@@ -290,7 +291,7 @@
       "label": "Input / output",
       "stage": "acquire_and_organize",
       "description": "Sources that bring a file onto the wire, checkpoints that bake and re-serve it, sinks that write it back out as TIFF, movie, image sequence, figure or table (CSV / Parquet, a pixel table to a file of its own), and the loader that reads a saved DIC/DVC/PIV/SerialTrack trial back.",
-      "count": 7,
+      "count": 8,
       "ops": [
         {
           "op": "io.dock",
@@ -311,6 +312,11 @@
           "op": "io.write_figure",
           "label": "Export Figure",
           "summary": "Write the figure a plot node drew to PNG, SVG, PDF or TIFF — drawn again at the export's resolution, vector formats with editable text — and hand the picture on unchanged."
+        },
+        {
+          "op": "io.write_html",
+          "label": "Export HTML",
+          "summary": "Write a standalone interactive HTML page of this Dataset — its frames with the Viewer's strips, channel LUTs, overlays, hover readout and scale bar rebuilt in the browser, no server needed — and hand the Dataset on unchanged."
         },
         {
           "op": "io.write_movie",
@@ -1303,6 +1309,7 @@
       "io.load",
       "io.load_analysis",
       "io.write_figure",
+      "io.write_html",
       "io.write_movie",
       "io.write_table",
       "io.write_tiff",
@@ -16226,6 +16233,203 @@
         "path",
         "plane",
         "position"
+      ]
+    },
+    "io.write_html": {
+      "op": "io.write_html",
+      "label": "Export HTML",
+      "category": "io",
+      "role": "input_output",
+      "stage": "acquire_and_organize",
+      "pages": [
+        "analyze"
+      ],
+      "module": "nodegraph/catalog/io/write_html.py",
+      "gui_only": false,
+      "summary": "Write a standalone interactive HTML page of this Dataset — its frames with the Viewer's strips, channel LUTs, overlays, hover readout and scale bar rebuilt in the browser, no server needed — and hand the Dataset on unchanged.",
+      "overview": "Write a standalone HTML view of the Dataset, and hand the Dataset on unchanged. Resolved spec (2026-11-05, `build-node-v2`): * **Kind** io / side effect, a tap like Export Movie and Export Table: ``Dataset -> the SAME Dataset``, byte-identical, no ``meta_transform``, nothing downstream can tell. ``WHOLE_SERIES`` with no kernel axes, because the page holds every shown frame. * **What the file is** — one ``.html`` that opens in any browser with no server and no network: the frames embedded as packed PNGs and the Viewer's controls rebuilt in JavaScript (:mod:`nodegraph.htmlview`): M / T / Z strips with ▶ and an fps spinner, a toggle and a histogram LUT per channel with lo / hi handles and a gamma dot, Auto / Fit / Split, the overlays popup (points, labels, tracks, a scalar wash, a field raster, vectors, in the Viewer's looks), the hover readout, the scale bar and the timestamp. The Viewer's compositing arithmetic, line for line. * **Size** — every plane is read at ``max_px`` through the pyramid (or strided down, never interpolated) and the embedded bytes are counted as they are made; past ``budget_mb`` the node refuses with the numbers rather than writing a page a browser cannot open. ``frames`` / ``positions`` / ``channels`` narrow what is embedded; ``planes`` can collapse Z to one projection. * ``path`` is required (an empty one is refused, as every export node does); the extension ``.html`` is added when missing; ``existing`` decides about a file already there; written atomically through ``<stem>.part.html``.",
+      "overview_source": "compute",
+      "dimensionality": {
+        "supports_2d": true,
+        "supports_true_3d": true,
+        "three_d_fallback": null
+      },
+      "footprint": {
+        "granularity": "whole_series",
+        "kernel_axes": [],
+        "footprint_mode": "dim"
+      },
+      "domains": {
+        "reads": [],
+        "reads_by_mode": {},
+        "adds": []
+      },
+      "modes": [
+        {
+          "name": "planes",
+          "label": "Z",
+          "choices": [
+            "all",
+            "max",
+            "mean"
+          ],
+          "default": "all",
+          "description": "What the page holds along Z.",
+          "choice_docs": {
+            "all": "Every plane, with a Z strip to scrub them — the Viewer's view of a stack. The file grows with the plane count.",
+            "max": "One maximum-intensity projection per frame: a stack reads as one picture, and the file is one plane's size per frame. Labels of a 3-D raster are not drawn on a projection.",
+            "mean": "One mean projection per frame, for a stack whose signal is diffuse rather than punctate. Same size as max."
+          }
+        },
+        {
+          "name": "overlays",
+          "label": "Overlays",
+          "choices": [
+            "auto",
+            "none"
+          ],
+          "default": "auto",
+          "description": "Whether the Dataset's structure layers travel with the picture.",
+          "choice_docs": {
+            "auto": "Every Point, Label and Track layer, a scalar wash, a measured field's column and its vectors — each a tab in the page's Overlays popup, in the Viewer's looks, switchable by the reader. Mesh cross-sections and correlation grids are not drawn.",
+            "none": "The picture alone. Smaller, and the only choice for a result whose tables you do not want to hand out with it."
+          }
+        },
+        {
+          "name": "existing",
+          "label": "Existing",
+          "choices": [
+            "overwrite",
+            "refuse"
+          ],
+          "default": "overwrite",
+          "description": "What to do when a file is already at the path.",
+          "choice_docs": {
+            "overwrite": "Replace it — the default, since this node only runs again when the data changed. The old file is replaced only once the new one is complete.",
+            "refuse": "Raise instead of touching an existing file — for a destination that must be written exactly once; the graph stops at this node and nothing is written."
+          }
+        }
+      ],
+      "inputs": [
+        {
+          "name": "data",
+          "label": "data",
+          "type": "dataset",
+          "role": "dataset",
+          "description": "The Dataset the page shows — its image at every shown frame, and its Point, Label, Track, scalar and field layers as overlays. It is handed on unchanged."
+        },
+        {
+          "name": "path",
+          "label": "File",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "path_kind": "save_file",
+          "path_filter": "HTML page (*.html);;All files (*)",
+          "path_hint": "Browse… to choose where the page is written",
+          "description": "Where the page is written, on the machine that runs the graph. There is no default and an empty value is refused. `.html` is added when the name has no extension. The file is complete in itself: send it, open it from a USB stick, drop it on a wiki."
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "The heading of the page. Blank takes the source file's name, else the page's file name. Display only; nothing else reads it."
+        },
+        {
+          "name": "channels",
+          "label": "Channels",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Which channels to embed, as indices — `0`, `0,2`, `1-3`. EMPTY (the default) means all of them. Each embedded channel gets its own toggle and LUT on the page; a channel left out is not in the file at all, which is the way to halve its size."
+        },
+        {
+          "name": "frames",
+          "label": "Frames (T)",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Which timepoints to embed — `0-99`, `0-99:3` (every third), `5,9,12`, `last`; EMPTY means every frame. The page's T strip runs over the embedded frames only. The file grows linearly with this count: 200 frames of a 1024 px, 2-channel series are roughly 150 MB."
+        },
+        {
+          "name": "positions",
+          "label": "Positions (M)",
+          "type": "string",
+          "role": "parameter",
+          "is_field": false,
+          "default": "",
+          "description": "Which multipoint positions to embed, the same grammar as Frames; EMPTY means all. A plate of 96 fields at 1024 px is too big for one page — pick the fields the reader needs."
+        },
+        {
+          "name": "max_px",
+          "label": "Max px",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "unit": "px",
+          "default": 1024,
+          "description": "Each plane is read so its longest edge is at most this many pixels — through the pyramid, or strided down (never interpolated, so a label raster's ids survive). 1024 is the Viewer's own display budget and reads crisp on a screen; 2048 doubles the detail and quadruples the file. It never upscales. The hover readout stays in the source's own pixel grid whatever this is."
+        },
+        {
+          "name": "budget_mb",
+          "label": "Max file MB",
+          "type": "int",
+          "role": "parameter",
+          "is_field": false,
+          "default": 250,
+          "description": "The most the page may embed, in megabytes of image data. Past it the node refuses — with the count of planes it had read — instead of writing a page that a browser opens slowly or not at all. Lower it for a file that goes by e-mail; raise it for an archive on disk; 0 removes the cap (as 0 does for Max px on Export Movie). Nothing is written when it refuses."
+        },
+        {
+          "name": "show_scalebar",
+          "label": "Scale bar",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Draw the scale bar, a round 1-2-5 length near a fifth of the frame width, in the corner of the picture. Omitted when the Dataset carries no `pixel_size_um`, as the Viewer and Export Movie do: a bar without a calibration would be a fabrication. The reader can switch it off on the page."
+        },
+        {
+          "name": "show_time",
+          "label": "Elapsed time",
+          "type": "bool",
+          "role": "parameter",
+          "is_field": false,
+          "default": true,
+          "description": "Show the elapsed experiment time of the shown frame, from each frame's own acquisition clock when the source carries one, else from the frame interval. Off, the page starts without a timestamp; the reader can still pick elapsed, clock or frame on the page."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "label": "out",
+          "type": "dataset",
+          "role": "dataset",
+          "description": ""
+        }
+      ],
+      "compute": "_compute_write_html",
+      "meta_transform": null,
+      "extra_layers": null,
+      "adds_columns": false,
+      "trained_params": false,
+      "kernel_doc": "",
+      "params_read": [
+        "__modes__",
+        "budget_mb",
+        "channels",
+        "frames",
+        "max_px",
+        "path",
+        "positions",
+        "show_scalebar",
+        "show_time",
+        "title"
       ]
     },
     "io.write_movie": {

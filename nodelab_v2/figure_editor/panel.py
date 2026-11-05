@@ -21,9 +21,11 @@ wait on that.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import os
+import shutil
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -36,6 +38,7 @@ from nodegraph.figure import bundle as FB
 from nodegraph.figure import layout as FL
 from nodegraph.figure import schema as S
 from nodegraph.figure import tables as FT
+from nodelab_v2 import overlays as OV
 from nodelab_v2 import theme as T
 from nodelab_v2.figure_editor import charts_data as CD
 from nodelab_v2.figure_editor import links as LK
@@ -224,6 +227,9 @@ class FigureEditorPanel(QWidget):
         menu = QMenu(self._export_btn)
         for fmt, text in (("png", "PNG at the page dpi"), ("tiff", "TIFF at the page dpi"),
                           ("svg", "SVG (text stays text)"), ("pdf", "PDF (fonts embedded)"),
+                          ("html", "Interactive HTML — the page with its images live: scrub "
+                                   "T / Z / M, re-window, toggle overlays, read pixels, in "
+                                   "any browser"),
                           ("bundle", "Bundle — PNG + SVG, the data drawn (CSV), the legend "
                                      "text, the provenance record"),
                           ("report", "Report — the bundle plus an HTML page and a PDF with a "
@@ -2220,6 +2226,143 @@ class FigureEditorPanel(QWidget):
         QTimer.singleShot(0, self._restore_display_renders)
         return out
 
+    def export_html(self, path: str, *, budget_mb: float = 400.0, t_frames: Any = None,
+                    max_px: Optional[int] = None) -> str:
+        """Export ▾ → Interactive HTML (2026-11-05): the page as one self-contained HTML
+        file — the editor's own SVG export as the picture, and over every image item a
+        live viewer of its source (:mod:`nodegraph.htmlview`) with the item's channels,
+        windows, colours and layers, so the reader scrubs T / Z / M, re-windows, toggles
+        the overlays and reads pixels in the page's own layout. Charts answer a hover with
+        their data; twins, zoom popouts and cursor followers scrub together. Montages,
+        pictures and everything else stay as drawn. ``t_frames`` narrows the embedded
+        timepoints (the frames grammar); ``budget_mb`` is shared over the image items."""
+        import datetime as _dt
+        import tempfile
+        from nodegraph.htmlview import BudgetExceeded, build_view, figure_html, write_html
+        doc = self._doc
+        page = dict(doc.get("page") or {})
+        self.render_all_now()
+        tmp = tempfile.mkdtemp(prefix="nd2fig_")
+        try:
+            svg_path = self.scene.export(os.path.join(tmp, "page.svg"), "svg",
+                                         int(page.get("dpi", 300)))
+            with open(svg_path, encoding="utf-8") as fh:
+                svg = fh.read()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        k = svg.find("<svg")
+        svg = svg[k:] if k >= 0 else svg
+        page_id = self.bound() or ""
+        try:
+            labels = dict(self._host.source_labels(page_id) or {})
+        except Exception:                      # noqa: BLE001 — a label is cosmetic
+            labels = {}
+        images = [it for it in doc.get("items", []) if it.get("kind") == "image"]
+        views: Dict[str, Any] = {}
+        per_item = float(budget_mb) / max(1, len(images))
+        for spec in images:
+            iid = spec["id"]
+            img = S.effective_image(doc, iid)
+            rid = self._run_ids.get(img.get("source") or "", "")
+            payload = self._payloads.get(rid)
+            if payload is None:
+                continue
+            r = self.render_now(iid)
+            if not isinstance(r, R.Rendered):
+                continue
+            plan = B.read_plan(doc, iid, self._envs, cursor=dict(self._cursor))
+            chans = [int(ch.get("c", 0)) for ch in (img.get("channels") or [])] or [0]
+            chans = [c for c in chans if c in r.clims] or chans[:1]
+            state_ch = {c: {"on": True, "lo": float(r.clims[c][0]), "hi": float(r.clims[c][1]),
+                            "gamma": float(r.gammas.get(c, 1.0)),
+                            "rgb": [int(v) for v in r.colors.get(c, (255, 255, 255))]}
+                        for c in chans if c in r.clims}
+            looks: Dict[str, Any] = {}
+            if r.settings is not None:
+                for tab in OV.TABS:
+                    try:
+                        looks[tab] = dataclasses.asdict(r.settings.group(tab))
+                    except Exception:          # noqa: BLE001
+                        pass
+            z = plan.z
+            zi = 0 if z in ("max", "mean") else int(z)
+            decor = dict(img.get("decor") or {})
+            sb: Any = ({"um": float(decor.get("scale_bar_um") or 0.0)}
+                       if decor.get("scale_bar_um") else False)
+            try:
+                vdoc = build_view(
+                    payload, title=labels.get(str(img.get("source")), str(img.get("source"))),
+                    max_px=int(max_px or R.DISPLAY_MAX_PX), channels=chans, t_frames=t_frames,
+                    m_frames=[int(plan.m)], z=(z if z in ("max", "mean") else "all"),
+                    overlays=bool(img.get("layers")),
+                    state={"channels": state_ch, "overlays": looks,
+                           "coords": (int(plan.m), int(plan.t), zi, chans[0])},
+                    budget_mb=per_item, scalebar=sb, timestamp="off",
+                    own_layers=list(self._host.own_layers(rid) or []), window=plan.window)
+            except BudgetExceeded as exc:
+                raise ValueError(f"{iid}: {exc}") from None
+            views[iid] = {"rect_mm": [float(v) for v in spec["rect_mm"]], "doc": vdoc,
+                          "letter": str(spec.get("letter") or ""),
+                          "flip": [bool(img.get("flip_x")), bool(img.get("flip_y"))]}
+        charts: Dict[str, Any] = {}
+        for spec in doc.get("items", []):
+            if spec.get("kind") != "chart":
+                continue
+            item = self._items.get(spec["id"])
+            if not isinstance(item, ChartItem) or not item.geometry:
+                continue
+            try:
+                geometry = json.loads(json.dumps(item.geometry, default=float))
+            except (TypeError, ValueError):
+                geometry = dict(item.geometry)
+                geometry.pop("stats", None)
+                geometry = json.loads(json.dumps(geometry, default=str))
+            series = item.series if isinstance(item.series, (list, tuple)) else []
+            charts[spec["id"]] = {
+                "rect_mm": [float(v) for v in spec["rect_mm"]], "geometry": geometry,
+                "series": [{"label": str(s.get("label", ""))} if isinstance(s, Mapping)
+                           else {"label": ""} for s in series]}
+        # linked items scrub together: twins, zoom popouts with their parent, cursor followers
+        parent: Dict[str, str] = {}
+
+        def find(a: str) -> str:
+            while parent.get(a, a) != a:
+                a = parent[a]
+            return a
+
+        def union(a: Optional[str], b: Optional[str]) -> None:
+            if a and b and a != "None" and b != "None":
+                parent[find(a)] = find(b)
+
+        for ln in doc.get("links", []):
+            kind = ln.get("kind")
+            if kind == "zoom":
+                union(str(ln.get("parent")), str(ln.get("child")))
+            elif kind == "twin":
+                union(str(ln.get("a")), str(ln.get("b")))
+            elif kind == "cursor":
+                ids = [str(i) for i in (ln.get("items") or [])]
+                for other in ids[1:]:
+                    union(ids[0], other)
+        followers = [it["id"] for it in images
+                     if LK.follows_cursor(S.effective_image(doc, it["id"]))]
+        for other in followers[1:]:
+            union(followers[0], other)
+        groups: Dict[str, List[str]] = {}
+        for iid in views:
+            groups.setdefault(find(iid), []).append(iid)
+        links = [g for g in groups.values() if len(g) > 1]
+        name = self._host.page_name(page_id) if page_id else "figure"
+        fig = {"title": name, "written": _dt.datetime.now().isoformat(timespec="seconds"),
+               "page": {"width_mm": float(page.get("width_mm", 180.0)),
+                        "height_mm": float(page.get("height_mm", 120.0)),
+                        "font_pt": float(page.get("font_pt", 8.0))},
+               "svg": svg, "views": views, "charts": charts, "links": links}
+        out = write_html(path, figure_html(fig, title=name))
+        self._host.status(f"interactive figure written: {out}")
+        QTimer.singleShot(0, self._restore_display_renders)
+        return out
+
     def export_dialog(self, fmt: str) -> None:
         bundle = fmt in ("bundle", "report")
         path = self._host.export_path("png" if bundle else fmt)
@@ -2227,6 +2370,8 @@ class FigureEditorPanel(QWidget):
             try:
                 if fmt == "report":
                     self.export_report(path)
+                elif fmt == "html":
+                    self.export_html(path)
                 elif bundle:
                     self.export_bundle(path, "png")
                 else:
