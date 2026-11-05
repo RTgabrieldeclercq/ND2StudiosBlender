@@ -254,7 +254,19 @@
    "sym:nodegraph.kernels.field_mechanics.gradient": "ec31f4384ffc11db92af3e80b79bf2b1",
    "sym:nodegraph.kernels.field_mechanics.stress": "d3a071acaaf29c71174c5ed9105b6c62"
   },
-  "blessed": "2026-10-09",
+  "blessed": "2026-11-03",
+  "file": "codemap/concepts.md"
+ },
+ "CON-29": {
+  "anchors": {
+   "sym:nodegraph.figure.schema.normalize": "9bf534431350af6e8791393685293456",
+   "sym:nodelab_v2.figure_document.FigureDocument.run_ids": "72ac7dd1cb7207865a695f6132c3a15f",
+   "sym:nodelab_v2.figure_document.FigureDocument.sync_shadow": "da795f48818a2f55b70b30816dcb7290",
+   "sym:nodelab_v2.figure_recipes.bind_recipe": "08d521e125f1f8a0ce36bf0d498b908d",
+   "sym:nodelab_v2.figure_render.build_job": "5b901efc24b36a6f8984cfc6593ba3b4",
+   "sym:nodelab_v2.figure_render.render_job": "94f8472d0c1d24ad2083b513280f0da6"
+  },
+  "blessed": "2026-11-03",
   "file": "codemap/concepts.md"
  },
  "INV-01": {
@@ -386,6 +398,16 @@
   "blessed": "2026-10-07",
   "file": "codemap/invariants.md"
  },
+ "INV-18": {
+  "anchors": {
+   "sym:nodelab_v2.figure_document.FigureDocument.data_id": "0fc51def92249ead57e4f9625f65e411",
+   "sym:nodelab_v2.figure_document.FigureDocument.shadow_id": "8cd00de2395eee4b87c1f576302f9ec4",
+   "sym:nodelab_v2.figure_document.FigureDocument.sync_shadow": "da795f48818a2f55b70b30816dcb7290",
+   "sym:nodelab_v2.workspace.Workspace.seed_input": "fa9ea972d813e8ac985de3add9ace886"
+  },
+  "blessed": "2026-11-03",
+  "file": "codemap/invariants.md"
+ },
  "WF-01": {
   "anchors": {
    "sym:nodegraph.engine.Engine.pull": "31fa493846971ee6627efabd17cb70ad",
@@ -463,6 +485,16 @@
    "sym:nodelab_v2.window.MainWindow.open_node_demo": "42777cef46c2846392318f182fae5d42"
   },
   "blessed": "2026-10-07",
+  "file": "codemap/workflows.md"
+ },
+ "WF-10": {
+  "anchors": {
+   "sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.compute_sources": "a0c1afd0202a5c95fb817acb547ff50e",
+   "sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_bundle": "59a73d66ae1b50089badcb2bb23877e0",
+   "sym:nodelab_v2.figure_render.render_job": "94f8472d0c1d24ad2083b513280f0da6",
+   "sym:nodelab_v2.lablink.worker.Worker._write_figure": "bc7576870cda0b63f4be78bc6ff560b4"
+  },
+  "blessed": "2026-11-03",
   "file": "codemap/workflows.md"
  }
 }

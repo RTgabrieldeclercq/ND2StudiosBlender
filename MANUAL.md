@@ -449,7 +449,13 @@ journal-sized page you place things on. What it can show is whatever the pages b
    Plot, Plot + Overlay (Table and Movie arrive later). Each card says what it needs and
    what the upstream pages carry. Pick one, or press one of the image sources listed under
    it. *Plot* places a histogram of the first table's first measured column (`area` when
-   the table has it) — something drawn at once, to edit from.
+   the table has it) — something drawn at once, to edit from. Under the goals, **figure
+   templates** (V5.00 step 6): *Segment & measure summary*, *Tracking summary*, *Strain /
+   speed field panel*, *Standard curve*, *Plate overview with popout* — each a whole page
+   whose slots are filled from what the upstream pages carry (a template whose need is not
+   upstream is greyed, its tooltip saying what it needs). Your own templates live in
+   `~/.nd2studios/figure_recipes/` (`panel.save_as_recipe`) and shadow a built-in of the
+   same name.
 2. **Sources** (left) lists every Page Output of the pages before this one, grouped by
    page, with what each carries: the image and its channels, the label / point / track
    tables and their columns, the measured fields. **Drag a source onto the page** to place
@@ -519,7 +525,16 @@ journal-sized page you place things on. What it can show is whatever the pages b
    the file it came from with size and mtime, the display windows, the app version, the
    figure digest) and `<stem>.data/` with a CSV of the values every chart, table and heat
    layer drew.
-10. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
+10. **Without a window** (V5.00 step 6): `python -m nodelab_v2.figure_render
+    file.nd2graph.json --out fig.png [--page NAME] [--dpi 300] [--svg] [--bundle]` renders
+    a figure page under the offscreen platform through the same editor and exports the
+    same drawing — a loader with a file path is ingested as the app ingests it, a loader
+    with no path draws the synthetic stack. `--write-job job.json` writes the **figure
+    job** (the composed graph, the figure, its run ids, a seed per loader) and `--job
+    job.json` renders one. A figure page published as a **LabLink** recipe ships its
+    figure; the worker renders it with that command in a subprocess and returns the PNG
+    as the run's `figure` artifact, the bundle beside it.
+11. The figure is saved **in the page** of the `.nd2graph.json` file; the status line lists
    the paper-readiness checks (a missing scale bar, an inset with no box, a red / green
    merge, twins that do not share a display range, an unlabelled colour bar). A V4 file's
    Analysis page that held nodes opens as a Free page named *(graph)*.
@@ -3994,6 +4009,33 @@ fitted into one canvas (the largest), and `canvas.fit = center` keeps small clip
 true size instead of enlarging them.
 
 ---
+
+### J. A figure, from a segmentation to the bundle — the Figure Editor
+
+**Goal: one journal column with the labelled field, a popout, the area distribution, a
+per-frame summary table and the legend text — then the same page from a script.**
+
+1. On the Processing page, wire `analysis.segment ─→ analysis.measure ─→ page.output`
+   and name the Output `cells`. The Analysis page below is the figure page.
+2. Open it. On the start card pick the **Segment & measure summary** template: the field
+   with its outlines, a histogram of `area`, a table of n / mean / SEM per frame and a
+   legend land, each slot bound to `cells`. *Compute sources* pulls what the page reads.
+3. **Alt-drag** a box on the field: a popout appears with its box on the parent and
+   leaders following it. *Twin* the popout and give the twin a `speed` field layer with
+   limits *0–1 of a maximum* and a colour bar.
+4. Hover a marker of the histogram turned into an XY chart (Kind = XY, X = `x`, Y =
+   `area`): the object it stands for is ringed on the field. *Filter / summarise* on the
+   chart keeps `area > 50` and summarises per frame — the data entry compiles into the
+   page's hidden graph and *Compute sources* fetches it like a source.
+5. Page form: *Re-letter panels*, *Style sync* with the preset `paper`; the Checks group
+   names anything a reviewer would flag.
+6. **Export ▾ → Bundle**: the PNG and SVG, `.figure.json`, `.legend.txt` (paste it under
+   the figure), `.provenance.json` (every source's file, run id and lineage) and
+   `.data/*.csv`.
+7. Later, without opening the app:
+   `python -m nodelab_v2.figure_render study.nd2graph.json --page Analysis --out fig.png
+   --bundle` draws the same page from the file; a LabLink hub running the published page
+   returns it as the run's `figure` artifact.
 
 ## 17. Headless / scripted use
 

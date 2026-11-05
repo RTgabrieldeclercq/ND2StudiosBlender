@@ -21017,9 +21017,10 @@ def test_lablink() -> None:
     # A client socket timeout at or below the long-poll ceiling turns every SUCCESSFUL long
     # poll into an apparent dead server.
     assert LC.HubClient("http://x", "t").timeout > LP.LONGPOLL_MAX_S
-    # Every artifact kind we advertise must have something that can write it.
+    # Every artifact kind we advertise must have something that can write it — a Dataset
+    # writer, or the run loop itself (metrics; the figure, rendered in a subprocess).
     for kind in LP.ARTIFACT_KINDS:
-        assert kind in LA.WRITERS or kind == "metrics", \
+        assert kind in LA.WRITERS or kind in ("metrics", "figure"), \
             f"hello advertises artifact kind {kind!r} with no writer for it"
     _ok("LabLink wire constants: graph format tracks nodegraph.serialize, node states are "
         "the engine's observer events, hub-only error codes are unemittable by "
@@ -36778,6 +36779,8 @@ def main() -> int:
     test_figure_core()
     test_figure_page()
     test_figure_paper()
+    test_figure_recipes_builtin()
+    test_figure_headless_render()
     test_figure_data()
     print("\nALL NODEGRAPH SELF-TESTS PASSED")
     return 0
@@ -37500,6 +37503,221 @@ def test_figure_paper() -> None:
         assert FB.write_bundle(stem, {"legend.txt": ""}) == []
     _ok("figure paper: re-letter in reading order (popout unlettered), style sync, every "
         "palette passes ΔE on both pages, summary table per group, the bundle's four files")
+
+
+def test_figure_recipes_builtin() -> None:
+    """Figure templates (V5.00 step 6): every built-in recipe loads and its stubbed figure
+    passes the schema; bound to a synthetic catalog, every slot finds a row carrying what
+    it needs, every placeholder resolves (a Page Output value, a layer name, a measured
+    column) and the result normalizes; a catalog without the need reports the slot and
+    keeps the placeholder; a figure in hand round-trips to a recipe and back; the user
+    folder shadows a built-in by name and can be switched off."""
+    import os as _os
+    import tempfile as _tempfile
+    from nodegraph.figure import schema as S
+    from nodelab_v2 import figure_recipes as FR
+
+    saved = {k: _os.environ.get(k) for k in (FR.ENV_ENABLED, FR.ENV_DIR)}
+    _os.environ[FR.ENV_ENABLED] = "0"
+    try:
+        recipes = FR.list_recipes()
+        assert len(recipes) >= 5 and all(r.builtin for r in recipes), [r.name for r in recipes]
+        slugs = {r.slug for r in recipes}
+        assert {"segment-measure-summary", "tracking-summary", "standard-curve",
+                "plate-overview-with-popout"} <= slugs, slugs
+        cat = [{"value": "pg3:cells", "label": "P1 · cells", "image": True, "channels": 2,
+                "channel_names": ["DAPI", "GFP"],
+                "axes": {"m": 3, "t": 4, "z": 1, "c": 2, "y": 64, "x": 64},
+                "labels": [("labels", ["id", "m", "t", "z", "y", "x", "area", "mean_intensity"])],
+                "points": [], "fields": [("piv", ["id", "y", "x", "disp_y", "disp_x", "speed"])],
+                "tracks": [("tracks", ["id", "track_id", "t", "y", "x", "track_length"])],
+                "mesh": []},
+               {"value": "pg1:raw", "label": "Input · raw", "image": True, "channels": 1,
+                "channel_names": [], "axes": {"m": 3, "t": 4, "z": 1, "c": 1, "y": 64, "x": 64},
+                "labels": [], "points": [], "tracks": [], "fields": [], "mesh": []}]
+        for r in recipes:
+            doc, missing = FR.bind_recipe(r, cat)
+            assert not missing, (r.slug, missing)
+            nd = S.normalize(doc)
+            text = S.canonical_json(nd)
+            assert "slot:" not in text, (r.slug, [l for l in text.split(",") if "slot:" in l][:3])
+            assert nd["sources"] and all(s["source"].startswith("pg") for s in nd["sources"])
+            for it in nd["items"]:
+                if it["kind"] in ("image", "montage"):
+                    assert it["image"]["channels"], (r.slug, it["id"])
+            assert FR.applicable(r, cat)
+        seg = FR.find_recipe("Segment & measure summary")
+        assert seg is not None and seg.slug == "segment-measure-summary"
+        doc, _m = FR.bind_recipe(seg, cat)
+        field = S.item(doc, "field")
+        assert field["image"]["layers"][0]["layer"] == "labels" \
+            and S.item(doc, "areas")["chart"]["value"] == "area" \
+            and S.item(doc, "summary")["table"]["columns"] == ["area"] \
+            and field["image"]["channels"][1]["label"] == "GFP", doc["items"]
+        curve = FR.bind_recipe(FR.find_recipe("standard-curve"), cat)[0]
+        assert S.item(curve, "curve")["chart"]["x"] == "area" \
+            and S.item(curve, "curve")["chart"]["y"] == "mean_intensity"
+        strain = FR.find_recipe("strain-speed-field-panel")
+        doc, _m = FR.bind_recipe(strain, cat)
+        assert S.item(doc, "heat")["image"]["layers"][0]["column"] == "speed"
+        # the plate recipe prefers the row the caller picks; a catalog without the need
+        plate = FR.find_recipe("plate-overview-with-popout")
+        doc, _m = FR.bind_recipe(plate, cat, picks={"plate": "pg1:raw"})
+        assert doc["sources"][0]["source"] == "pg1:raw" \
+            and S.item(doc, "overview")["image"]["channels"][0]["rgb"] == "#ffffff"
+        doc, missing = FR.bind_recipe(seg, cat[1:])
+        assert missing == ["cells"] and doc["sources"][0]["source"] == "slot:cells"
+        assert not FR.applicable(seg, cat[1:]) and FR.applicable(plate, cat[1:])
+        S.normalize(FR._stub(doc, ["cells"]))
+        # a figure → recipe → figure
+        rec = FR.recipe_from_figure(S.normalize(FR.bind_recipe(seg, cat)[0]), cat,
+                                    name="Mine", description="my own")
+        assert rec.slots == [{"id": "cells", "needs": "labels", "label": "P1 · cells"}]
+        back, _m = FR.bind_recipe(rec, cat)
+        assert S.canonical_json(S.normalize(back)) == \
+            S.canonical_json(S.normalize(FR.bind_recipe(seg, cat)[0])), "the round trip drifted"
+        # a bad recipe
+        for bad, why in (({"format": "x"}, "format"),
+                         ({"format": FR.RECIPE_FORMAT, "slots": [], "figure": {}}, "slot"),
+                         ({"format": FR.RECIPE_FORMAT, "slots": [{"id": "a", "needs": "blob"}],
+                           "figure": {}}, "needs")):
+            try:
+                FR.recipe_from_dict(bad)
+            except ValueError as exc:
+                assert why in str(exc), (why, exc)
+            else:
+                raise AssertionError(f"accepted {bad}")
+        # the user folder: a saved recipe shadows the built-in of its name
+        with _tempfile.TemporaryDirectory(prefix="nd2sb_figrec_") as tmp:
+            _os.environ[FR.ENV_ENABLED] = "1"
+            _os.environ[FR.ENV_DIR] = tmp
+            mine = FR.FigureRecipe(seg.name, "shadowed", seg.slots, seg.figure)
+            path = FR.save_recipe(mine)
+            assert _os.path.exists(path)
+            got = FR.find_recipe(seg.name)
+            assert got is not None and not got.builtin and got.description == "shadowed"
+            assert len(FR.list_recipes()) == len(recipes)
+            _os.environ[FR.ENV_ENABLED] = "0"
+            assert FR.find_recipe(seg.name).builtin
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+    _ok("figure recipes: five built-ins load, bind to a catalog with every placeholder "
+        "resolved, report an unfillable slot, round-trip through recipe_from_figure, user "
+        "folder shadows by name")
+
+
+def test_figure_headless_render() -> None:
+    """The headless renderer (V5.00 step 6): a figure job built from a workspace (the
+    composed graph, the figure, its run ids, a seed per loader) renders in a subprocess
+    under the offscreen platform to a PNG of the page's pixel size with the bundle
+    beside it; two renders are identical bytes; the workspace-file route gives the same
+    picture; a LabLink draft of the figure page carries the figure and a ``figure`` output
+    the worker's validator accepts."""
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tempfile
+    from PIL import Image as _Image
+    from nodelab_v2 import figure_render as FRD
+    from nodelab_v2.lablink import protocol as LP
+    from nodelab_v2.lablink import recipe as LR
+    from nodelab_v2.workspace import FIGURE_KIND
+
+    ws, ds, env, ax = _ws_fixture()
+    P1 = ws.pages["pg3"]
+    P1.doc.add_node("analysis.threshold", node_id="T", params={"threshold": 0.5})
+    P1.doc.add_node("analysis.label", node_id="L")
+    P1.doc.add_node("page.output", node_id="O", params={"name": "cells"})
+    P1.doc.connect("X", "out", "T", "data")
+    P1.doc.connect("T", "out", "L", "data")
+    P1.doc.connect("L", "out", "O", "data")
+    fp = ws.add_page("Figures", FIGURE_KIND)
+    fp.figure.edit(lambda d: d.update(
+        goal="composite",
+        sources=[{"id": "cells", "source": "pg3:cells", "label": "cells"}],
+        items=[{"id": "img", "kind": "image", "rect_mm": [2, 2, 40, 30], "letter": "A",
+                "image": {"source": "cells",
+                          "channels": [{"c": 0, "rgb": "#ffffff", "mode": "auto_pct"}],
+                          "layers": [{"domain": "label", "layer": "labels", "kind": "labels"}],
+                          "decor": {"scale_bar_um": 5.0}}},
+               {"id": "ch", "kind": "chart", "rect_mm": [45, 2, 38, 30], "letter": "B",
+                "chart": {"kind": "distribution", "sub_kind": "histogram", "source": "cells",
+                          "domain": "label", "table": "labels", "value": "area"}},
+               {"id": "tb", "kind": "table", "rect_mm": [2, 36, 60, 20], "letter": "C",
+                "table": {"source": "cells", "domain": "label", "table": "labels",
+                          "columns": ["area"], "group_by": "t", "stats": ["n", "mean"]}}]))
+    live = FRD.build_job(ws, "Figures")           # the in-memory seed sizes its stack
+    assert live["format"] == FRD.JOB_FORMAT and live["page"] == fp.id \
+        and live["run_ids"] == {"cells": "pg3/O"} and list(live["seeds"]) == ["pg1/L"] \
+        and live["seeds"]["pg1/L"]["path"] == "" and live["seeds"]["pg1/L"]["axes"]["x"] == 32, live
+    try:
+        FRD.figure_page_id(ws, "P1")
+        raise AssertionError("a graph page is not a figure page")
+    except ValueError:
+        pass
+    with _tempfile.TemporaryDirectory(prefix="nd2sb_headless_") as tmp:
+        wsf = _os.path.join(tmp, "ws.nd2graph.json")
+        ws.save_file(wsf)
+        from nodelab_v2.workspace import Workspace as _WS
+        ws2 = _WS()
+        ws2.load_file(wsf)                        # what the file route sees: no meta seed
+        job = FRD.build_job(ws2, "Figures")
+        assert job["run_ids"] == live["run_ids"] and "axes" not in job["seeds"]["pg1/L"]
+        jp = _os.path.join(tmp, "job.json")
+        with open(jp, "w", encoding="utf8") as fh:
+            _json.dump(job, fh)
+        penv = dict(_os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1")
+        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        pngs = []
+        for k in (1, 2):
+            out = _os.path.join(tmp, f"f{k}.png")
+            cmd = [_sys.executable, "-B", "-m", "nodelab_v2.figure_render", "--job", jp,
+                   "--out", out] + (["--bundle"] if k == 1 else [])
+            p = _sp.run(cmd, capture_output=True, text=True, env=penv, cwd=root, timeout=600)
+            assert p.returncode == 0, (p.returncode, p.stderr[-2000:])
+            with open(out, "rb") as fh:
+                pngs.append(fh.read())
+        assert pngs[0] == pngs[1], "two headless renders of one job differ"
+        page = fp.figure.document["page"]
+        with _Image.open(_os.path.join(tmp, "f1.png")) as a:
+            size = a.size
+        want = (int(round(page["width_mm"] * page["dpi"] / 25.4)),
+                int(round(page["height_mm"] * page["dpi"] / 25.4)))
+        assert size == want, (size, want)
+        names = sorted(_os.listdir(tmp))
+        assert {"f1.svg", "f1.figure.json", "f1.legend.txt", "f1.provenance.json",
+                "f1.data"} <= set(names), names
+        data = sorted(_os.listdir(_os.path.join(tmp, "f1.data")))
+        assert any(n.endswith("_chart.csv") for n in data) \
+            and any(n.endswith("_table.csv") for n in data), data
+        with open(_os.path.join(tmp, "f1.provenance.json"), encoding="utf8") as fh:
+            prov = _json.load(fh)
+        assert prov["sources"][0]["run_id"] == "pg3/O" and prov["sources"][0]["lineage"] \
+            and "img" in prov["lut_windows"], prov["sources"]
+        out3 = _os.path.join(tmp, "f3.png")
+        p = _sp.run([_sys.executable, "-B", "-m", "nodelab_v2.figure_render", wsf,
+                     "--page", "Figures", "--out", out3], capture_output=True, text=True,
+                    env=penv, cwd=root, timeout=600)
+        assert p.returncode == 0, p.stderr[-2000:]
+        with open(out3, "rb") as fh:
+            assert fh.read() == pngs[0], "the workspace-file route drew a different page"
+    # LabLink: a draft of the figure page ships the figure and declares the output
+    draft = LR.draft_from_workspace(ws, fp.id, name="fig-recipe")
+    man = draft.to_manifest()
+    assert man["figure"]["page"] == fp.id and man["figure"]["doc"]["items"] \
+        and f'"{man["figure"]["run_ids"]["cells"]}"' in _json.dumps(draft.graph_doc), \
+        man["figure"]["run_ids"]
+    kinds = [o["kind"] for o in man["outputs"]]
+    assert "figure" in kinds and "figure" in LP.ARTIFACT_KINDS, kinds
+    assert man["targets"]["primary"] == man["figure"]["run_ids"]["cells"], man["targets"]
+    _ok("figure headless render: job from a workspace, subprocess PNG at the page size, "
+        "identical twice, bundle beside it, the file route matches, a LabLink draft ships "
+        "the figure with a figure output")
 
 
 if __name__ == "__main__":

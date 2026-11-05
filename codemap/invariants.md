@@ -304,3 +304,19 @@ A recipe may offer several synthetic worlds (`scenarios`, 2026-10-07 — Registr
 the registration bench's worlds at demo size); the gate runs every one of them, and the
 Frame-domain values a node writes are read back at the viewed frame so the demo can be
 checked against the phantom's stated truth, not merely seen to run.
+
+### INV-18 — a figure reads only Page Outputs, and its shadow nodes belong to the sync
+anchors: sym:nodelab_v2.figure_document.FigureDocument.sync_shadow, sym:nodelab_v2.figure_document.FigureDocument.shadow_id, sym:nodelab_v2.figure_document.FigureDocument.data_id, sym:nodelab_v2.workspace.Workspace.seed_input
+
+A figure document names its sources as Page Output values (`<page>:<name>`) and nothing
+else: no node id, no file. The figure page's graph holds only what `FigureDocument.
+sync_shadow` put there — one hidden `page.input` per source (`__fig_src__<id>`) and the
+stages of each data entry (`__fig_data__<id>__concat|__where|__agg`) — and the sync is the
+only writer of those ids: it adds, re-binds and removes them on every figure edit and never
+touches a node it did not name, so a hand-placed node on a figure page survives but is not
+the figure's. `Workspace.seed_input` never seeds a figure page; a figure page is never
+linked and never a master; a V4 file's Analysis page holding nodes opens as a Free page
+named `<name> (graph)`. Everything downstream — `compose`, the memo, the revision fence,
+LabLink, the headless renderer — therefore sees ordinary nodes and ordinary run ids, and
+the editor's *Compute sources* is a plain pull of those ids. The Viewer's *Capture view →
+page* refuses a node that is not published, rather than publishing it.

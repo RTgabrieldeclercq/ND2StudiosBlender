@@ -1420,6 +1420,8 @@
 {"dst":"nodelab_v2.figure_document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.figure_editor","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.figure_editor.charts_data","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.figure_recipes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodelab_v2.figure_render","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.graph_layout","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodelab_v2.lablink","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1584,6 +1586,7 @@
 {"dst":"nodelab_v2.figure_document","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.charts_data","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodelab_v2.figure_editor.fonts","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.items","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.links","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.properties","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
@@ -1591,6 +1594,7 @@
 {"dst":"nodelab_v2.figure_editor.scene","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.sources","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.start_card","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodelab_v2.figure_recipes","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.overlay_geometry","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.properties"}
@@ -1610,7 +1614,22 @@
 {"dst":"nodelab_v2.figure_editor.scene","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.sources"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.sources"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.start_card"}
+{"dst":"nodelab_v2.figure_recipes","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.start_card"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.start_card"}
+{"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_recipes"}
+{"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_recipes"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodegraph.memo","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodegraph.provider","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodegraph.serialize","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.figure_document","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.figure_editor.fonts","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.figure_editor.panel","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.ops","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.version","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
+{"dst":"nodelab_v2.workspace","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
 {"dst":"nodegraph.sockets","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
 {"dst":"nodelab_v2.multilink","k":"imp","lazy":false,"src":"nodelab_v2.frame_item"}
