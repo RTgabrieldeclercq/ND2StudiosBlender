@@ -33,11 +33,12 @@ from nodegraph.figure import bind as B
 from nodegraph.figure import layout as FL
 from nodegraph.figure import schema as S
 from nodelab_v2 import theme as T
+from nodelab_v2.figure_editor import charts_data as CD
 from nodelab_v2.figure_editor import links as LK
 from nodelab_v2.figure_editor import render as R
-from nodelab_v2.figure_editor.items import (ColorbarItem, FigureItem, HistogramItem, ImageItem,
-                                            LeaderItem, MeasureLineItem, MontageItem,
-                                            ScaleBarItem, make_item)
+from nodelab_v2.figure_editor.items import (ChartItem, ColorbarItem, FigureItem, HistogramItem,
+                                            ImageItem, LeaderItem, MeasureLineItem,
+                                            MontageItem, ScaleBarItem, make_item)
 from nodelab_v2.figure_editor.properties import PropertiesPanel, get_path, set_path
 from nodelab_v2.figure_editor.scene import MM, FigureScene, FigureView, mm, to_mm
 from nodelab_v2.figure_editor.sources import SourcesPanel, describe_envelope
@@ -138,6 +139,8 @@ class FigureEditorPanel(QWidget):
         self._items: Dict[str, FigureItem] = {}
         self._leaders: Dict[Tuple[str, str], LeaderItem] = {}
         self._renders: Dict[str, Tuple[str, Any]] = {}      # item id → (key, Rendered | tiles)
+        self._tables: Dict[str, Tuple[int, Any]] = {}       # run id → (id(payload), tables)
+        self._hover_text = ""
         self._gen = 0
         self._undo: List[str] = []
         self._redo: List[str] = []
@@ -246,6 +249,7 @@ class FigureEditorPanel(QWidget):
         self.view.region_dragged.connect(self._on_region_dragged)
         self.view.source_dropped.connect(self._on_source_dropped)
         self.view.column_dropped.connect(self._on_column_dropped)
+        self.view.hovered.connect(self._on_hover)
         self.sources_panel.source_activated.connect(lambda v: self.add_image(v))
         self.sources_panel.layer_activated.connect(self._on_layer_activated)
         self.restyle()
@@ -262,6 +266,7 @@ class FigureEditorPanel(QWidget):
         self._fig = self._host.figure_state(page_id) if page_id else None
         self._payloads.clear()
         self._renders.clear()
+        self._tables.clear()
         self._undo.clear()
         self._redo.clear()
         self._field_cache.clear()
@@ -306,6 +311,7 @@ class FigureEditorPanel(QWidget):
         if run_id in self._run_ids.values() or run_id in self._payloads:
             self._payloads[run_id] = payload
             self._palettes.pop(id(payload), None)
+            self._tables.pop(run_id, None)
             self._invalidate_renders(run_id)
             self._status.setText(f"{run_id} ready")
 
@@ -546,6 +552,314 @@ class FigureEditorPanel(QWidget):
         self.commit(_mutated(self._doc, mut))
         self.select([iid])
         return iid
+
+    # ── charts and data entries (step 4) ───────────────────────────────────────
+    def _envelope_tables(self, key: str) -> List[Tuple[str, str, List[str]]]:
+        """``[(domain, table, columns)]`` the envelope of source / data id ``key`` lists."""
+        d = describe_envelope(self._envs.get(key))
+        return ([("label", l, c) for l, c in d["labels"]]
+                + [("point", l, c) for l, c in d["points"] + d["fields"]]
+                + [("track", l, c) for l, c in d["tracks"]])
+
+    def add_chart(self, source: Optional[str] = None, *, data: Optional[str] = None,
+                  kind: str = "", domain: str = "", table: str = "",
+                  pos_mm: Optional[Sequence[float]] = None,
+                  size_mm: Optional[Sequence[float]] = None, **chart: Any) -> str:
+        """A chart item reading a source (a Page Output value or a source id) or a data
+        entry (``data=``). Without a kind: a histogram of the table's first measured
+        column (``area`` when the table has it) — something drawn at once, to edit from."""
+        sid = None
+        if data is None:
+            if not source:
+                raise ValueError("add_chart: name a source or a data entry")
+            sid = self.source_id_for(source) or self.add_source(source)
+        key = str(data or sid)
+        tables = self._envelope_tables(key)
+        if data is not None:
+            entry = next((e for e in self._doc.get("data", []) if e["id"] == data), None)
+            if entry is None:
+                raise ValueError(f"add_chart: unknown data entry {data!r}")
+            domain = domain or str(entry.get("domain") or "label")
+            if self._fig is not None:
+                table = table or self._fig.data_table_name(data)
+            if not tables:
+                tables = self._envelope_tables(str((entry.get("from") or [""])[0]))
+        if not table and tables:
+            pick = next((t for t in tables if not domain or t[0] == domain), tables[0])
+            domain, table = pick[0], pick[1]
+        cols = next((c for _dm, l, c in tables if l == table), [])
+        spec_chart: Dict[str, Any] = {"kind": kind or "distribution", "source": sid,
+                                      "data": data, "domain": domain or "label",
+                                      "table": table}
+        if not kind:
+            skip = {"id", "m", "t", "z", "c", "y", "x", "label", "parent", "track_id", "b"}
+            value = "area" if "area" in cols else next(
+                (c for c in cols if c not in skip and not c.startswith("bbox")), "")
+            spec_chart.update(sub_kind="histogram", value=value)
+        spec_chart.update(chart)
+        page = self._doc.get("page", {})
+        w = float(size_mm[0]) if size_mm else min(50.0, float(page.get("width_mm", 85)) * 0.5)
+        h = float(size_mm[1]) if size_mm else w * 0.8
+        pos = list(pos_mm) if pos_mm else self._free_pos(w, h)
+        iid = self._new_item_id("chart")
+        item = {"id": iid, "kind": "chart", "rect_mm": [pos[0], pos[1], w, h],
+                "letter": self._next_letter(), "chart": spec_chart}
+
+        def mut(dd):
+            dd.setdefault("items", []).append(item)
+        self.commit(_mutated(self._doc, mut))
+        self.select([iid])
+        return iid
+
+    def add_data(self, sources: Sequence[str], *, domain: str = "label", table: str = "",
+                 name: str = "", where: Optional[Sequence[Sequence[Any]]] = None,
+                 aggregate: Optional[Mapping[str, Any]] = None) -> str:
+        """A data entry — ``sources`` (Page Output values or source ids) pooled, filtered
+        by ``where`` (``[[column, op, value], …]``) and summarised by ``aggregate``
+        (``{"group_by", "value", "reducers", "name"}``) — compiled into the shadow graph
+        by the document's sync. Returns its id, which a chart's ``data`` names."""
+        sids = [self.source_id_for(s) or self.add_source(s) for s in sources]
+        if not sids:
+            raise ValueError("add_data: at least one source")
+        ids = {d["id"] for d in self._doc.get("data", [])} | {s["id"] for s in self._doc.get("sources", [])}
+        k = 1
+        while f"data{k}" in ids:
+            k += 1
+        did = f"data{k}"
+        entry: Dict[str, Any] = {"id": did, "from": list(sids), "domain": domain,
+                                 "table": table, "name": name or "combined",
+                                 "where": [list(w) for w in (where or [])],
+                                 "aggregate": dict(aggregate) if aggregate else None}
+
+        def mut(dd):
+            dd.setdefault("data", []).append(entry)
+        self.commit(_mutated(self._doc, mut))
+        return did
+
+    def edit_data(self, data_id: str, path: str, value: Any) -> None:
+        def mut(dd):
+            for d in dd.get("data", []):
+                if d["id"] == data_id:
+                    set_path(d, path, value)
+        self.commit(_mutated(self._doc, mut))
+
+    def set_chart_reads(self, item_id: str, what: str, ref: str) -> None:
+        """Point a chart at a source (``what="source"``) or a data entry (``"data"``);
+        the table and the columns are cleared when the domain of what it reads differs."""
+        def mut(dd):
+            ch = S.item(dd, item_id).setdefault("chart", {})
+            if what == "data":
+                ch["data"], ch["table"] = ref, ""
+                entry = next((d for d in dd.get("data", []) if d["id"] == ref), None)
+                if entry is not None:
+                    ch["domain"] = str(entry.get("domain") or "label")
+            else:
+                ch["data"], ch["source"] = None, ref
+        self.commit(_mutated(self._doc, mut))
+
+    def set_chart_table(self, item_id: str, domain: str, table: str) -> None:
+        """One commit for both: a table lives on a domain."""
+        def mut(dd):
+            it = S.item(dd, item_id)
+            it.setdefault("chart", {})["domain"] = domain
+            it["chart"]["table"] = table
+        self.commit(_mutated(self._doc, mut))
+
+    def promote_chart_data(self, item_id: str, *, aggregate: Optional[Mapping[str, Any]] = None,
+                           where: Optional[Sequence[Sequence[Any]]] = None) -> str:
+        """Give a source-reading chart a data entry of its own source and table — the
+        place a filter and a summary are typed — and point it there."""
+        chart = S.item(self._doc, item_id).get("chart") or {}
+        if chart.get("data"):
+            return str(chart["data"])
+        sid = chart.get("source")
+        if not sid:
+            raise ValueError("the chart reads no source")
+        did = self.add_data([sid], domain=str(chart.get("domain") or "label"),
+                            table=str(chart.get("table") or ""), where=where,
+                            aggregate=aggregate)
+
+        def mut(dd):
+            ch = S.item(dd, item_id).setdefault("chart", {})
+            ch["data"] = did
+            ch["table"] = ""                     # the entry's terminal table, resolved live
+        self.commit(_mutated(self._doc, mut))
+        return did
+
+    def _chart_payload(self, chart: Mapping[str, Any]) -> Tuple[str, Any, Any]:
+        """``(run id, payload, envelope)`` of what a chart reads: its data entry when it
+        names one, else its source."""
+        key = str(chart.get("data") or chart.get("source") or "")
+        rid = self._run_ids.get(key, "")
+        return rid, self._payloads.get(rid), self._envs.get(key)
+
+    def _tables_of(self, rid: str, payload: Any) -> Any:
+        have = self._tables.get(rid)
+        if have is not None and have[0] == id(payload):
+            return have[1]
+        tables = CD.chart_tables(payload)
+        self._tables[rid] = (id(payload), tables)
+        return tables
+
+    def _chart_table_name(self, chart: Mapping[str, Any]) -> str:
+        name = str(chart.get("table") or "")
+        if not name and chart.get("data") and self._fig is not None:
+            name = self._fig.data_table_name(str(chart["data"]))
+        return name
+
+    def chart_tables_of(self, spec: Mapping[str, Any]) -> List[Tuple[str, str]]:
+        """``[(domain, table)]`` a chart item may read, from the payload in hand, else the
+        envelope of its source (a data entry's summary, when its envelope is not in yet)."""
+        chart = spec.get("chart") or {}
+        rid, payload, _env = self._chart_payload(chart)
+        if payload is not None:
+            keys = sorted(self._tables_of(rid, payload))
+            if keys:
+                return [(str(d), str(n)) for d, n in keys]
+        key = str(chart.get("data") or chart.get("source") or "")
+        out = [(d, t) for d, t, _c in self._envelope_tables(key)]
+        if not out and chart.get("data"):
+            entry = next((e for e in self._doc.get("data", []) if e["id"] == chart["data"]), None)
+            if entry is not None:
+                name = self._chart_table_name(chart)
+                out = [(str(entry.get("domain") or "label"), name)] if name else []
+                if entry.get("aggregate"):
+                    out = [("label", name)]
+        return out
+
+    def chart_columns(self, spec: Mapping[str, Any]) -> List[str]:
+        """The columns of the table a chart reads: the payload's when in hand, else the
+        envelope's, else (a data entry not computed yet) what its stages will produce."""
+        chart = spec.get("chart") or {}
+        rid, payload, _env = self._chart_payload(chart)
+        name = self._chart_table_name(chart)
+        dom = str(chart.get("domain") or "label")
+        if payload is not None:
+            got = CD.pick_table(self._tables_of(rid, payload), dom, name)
+            if got is not None:
+                return sorted(got[1])
+        key = str(chart.get("data") or chart.get("source") or "")
+        tables = self._envelope_tables(key)
+        entry = None
+        if chart.get("data"):
+            entry = next((e for e in self._doc.get("data", []) if e["id"] == chart["data"]), None)
+            if not tables and entry is not None:
+                tables = self._envelope_tables(str((entry.get("from") or [""])[0]))
+                agg = entry.get("aggregate")
+                if agg:
+                    gb = agg.get("group_by") or ["t"]
+                    gb = [g.strip() for g in gb.split(",")] if isinstance(gb, str) else list(gb)
+                    red = agg.get("reducers") or ["mean", "sem", "count"]
+                    red = [r.strip() for r in red.split(",")] if isinstance(red, str) else list(red)
+                    return sorted(set(["id", "m", "t", "c", "z", "y", "x", "n"] + gb
+                                      + [f"{agg.get('value') or 'area'}_{r}" for r in red]))
+                name = str(entry.get("table") or "")
+                dom = str(entry.get("domain") or dom)
+        for d, l, cols in tables:
+            if d == dom and (not name or l == name):
+                return sorted(cols)
+        for _d, l, cols in tables:
+            if name and l == name:
+                return sorted(cols)
+        return sorted({c for _d, _l, cols in tables for c in cols})
+
+    def _refresh_charts(self) -> None:
+        """Resolve every chart whose inputs changed — synchronously: a chart reads tables
+        already in memory, and the geometry is a few thousand floats."""
+        page = self._doc.get("page") or {}
+        for spec in self._doc.get("items", []):
+            if spec.get("kind") != "chart":
+                continue
+            iid = spec["id"]
+            item = self._items.get(iid)
+            if not isinstance(item, ChartItem):
+                continue
+            chart = dict(spec.get("chart") or {})
+            rid, payload, env = self._chart_payload(chart)
+            if payload is None:
+                what = chart.get("data") or chart.get("source")
+                note = ("pick a source or a data entry" if not what else
+                        f"{what!r} is not bound" if not rid else
+                        "not computed yet — Compute sources")
+                item.set_geometry(None, note=note)
+                self._renders.pop(iid, None)
+                continue
+            key = S.digest({"chart": chart, "rect": spec["rect_mm"], "page": page,
+                            "payload": id(payload), "rid": rid})
+            have = self._renders.get(iid)
+            if have is not None and have[0] == key:
+                continue
+            chart["table"] = self._chart_table_name(chart)
+            md = dict(getattr(env, "metadata", None) or {})
+            if not md and chart.get("source"):
+                md = dict(getattr(self._envs.get(str(chart["source"])), "metadata", None) or {})
+            try:
+                series, units, note = CD.resolve_series(chart, self._tables_of(rid, payload), md)
+                geometry = (CD.chart_geometry(chart, series, spec["rect_mm"], page, units=units)
+                            if not note else None)
+            except Exception as exc:           # noqa: BLE001 — a chart that cannot draw says why
+                series, geometry, note = None, None, f"{type(exc).__name__}: {exc}"
+            item.set_geometry(geometry, series, note)
+            self._renders[iid] = (key, "chart")
+
+    def chart_csv(self, item_id: str) -> str:
+        """The values a chart draws, as CSV (the export bundle's data file)."""
+        item = self._items.get(item_id)
+        if not isinstance(item, ChartItem) or item.series is None:
+            return ""
+        return CD.chart_csv(S.item(self._doc, item_id).get("chart") or {}, item.series)
+
+    def _on_hover(self, item_id: str, pos: Any) -> None:
+        """A chart hover: the data under the pointer in the status line, and the hovered
+        marker's object ringed on every image of the chart's source (or on the targets of a
+        ``highlight`` link naming the chart)."""
+        item = self._items.get(item_id)
+        info = item.hover(pos) if isinstance(item, ChartItem) else {}
+        row = str(info.get("row") or "")
+        targets: set = set()
+        yx = None
+        if row:
+            parts = row.split(",")
+            if len(parts) == 5 and parts[3] and parts[4]:
+                try:
+                    yx = (float(parts[3]), float(parts[4]))
+                except ValueError:
+                    yx = None
+            chart = S.item(self._doc, item_id).get("chart") or {}
+            src = chart.get("source")
+            if chart.get("data"):
+                entry = next((d for d in self._doc.get("data", []) if d["id"] == chart["data"]),
+                             None)
+                frm = (entry or {}).get("from") or []
+                src = frm[0] if len(frm) == 1 else None
+            links = [ln for ln in self._doc.get("links", [])
+                     if ln.get("kind") == "highlight" and ln.get("chart") == item_id]
+            if links:
+                targets = {str(t) for ln in links for t in ln.get("targets", [])}
+            elif src:
+                targets = {it["id"] for it in self._doc.get("items", [])
+                           if it.get("kind") == "image"
+                           and S.effective_image(self._doc, it["id"]).get("source") == src}
+        for iid, it in self._items.items():
+            if isinstance(it, ImageItem) and not isinstance(it, MontageItem):
+                want = yx if (yx is not None and iid in targets) else None
+                if getattr(it, "_highlight", None) != want:
+                    it.set_highlight(want)
+        if info:
+            x, y = info.get("x"), info.get("y")
+            fmt = lambda v: (f"{v:.4g}" if isinstance(v, float) else str(v)) if v is not None else "–"
+            text = f"x = {fmt(x)}   y = {fmt(y)}" if info.get("inside") else ""
+            if info.get("label"):
+                text += f"   {info['label']}"
+            if row:
+                m, t, oid, _y, _x = row.split(",")
+                text += f"   object {oid}" + (f" (m{m} t{t})" if m or t else "")
+            if text != self._hover_text:
+                self._hover_text = text
+                self._status.setText(text)
+        elif self._hover_text:
+            self._hover_text = ""
+            self._sync_status()
 
     def add_popout(self, parent_id: str, window: Sequence[float],
                    pos_mm: Optional[Sequence[float]] = None, *, magnify: float = 2.5) -> str:
@@ -917,14 +1231,23 @@ class FigureEditorPanel(QWidget):
         self.set_goal(goal if goal in S.GOALS else None)
         self.start.hide()
         self._doc["_dismissed"] = True
+        cat = [(c, describe_envelope(c.get("env"))) for c in self.sources_panel.catalog]
+        imgs = [c for c, d in cat if d.get("image")]
+        tabs = [c for c, d in cat if d.get("labels") or d.get("points") or d.get("tracks")]
         if goal == "montage":
-            imgs = [c for c in self.sources_panel.catalog if describe_envelope(c.get("env")).get("image")]
             if imgs:
                 self.add_montage(str(imgs[0]["value"]))
-        elif goal in ("overlay", "composite"):
-            imgs = [c for c in self.sources_panel.catalog if describe_envelope(c.get("env")).get("image")]
+        elif goal == "overlay":
             if imgs:
                 self.add_image(str(imgs[0]["value"]))
+        elif goal == "plot":
+            if tabs:
+                self.add_chart(str(tabs[0]["value"]))
+        elif goal == "composite":
+            if imgs:
+                self.add_image(str(imgs[0]["value"]))
+            if tabs:
+                self.add_chart(str(tabs[0]["value"]))
 
     def _sync_status(self) -> None:
         if self._fig is None:
@@ -1034,6 +1357,7 @@ class FigureEditorPanel(QWidget):
             self._renders[iid] = (key, None)
             fn = self._render_fn(iid, img, payload, rid)
             self._worker.request(iid, gen, fn)
+        self._refresh_charts()
         self._feed_dependents()
         self._update_leaders()
 
@@ -1278,13 +1602,48 @@ class FigureEditorPanel(QWidget):
         self.add_image(value, [to_mm(pos.x()), to_mm(pos.y())])
 
     def _on_column_dropped(self, item_id: str, payload: Mapping[str, Any]) -> None:
-        self._apply_layer_payload(item_id, payload)
+        if S.item(self._doc, item_id).get("kind") == "chart":
+            self._apply_chart_payload(item_id, payload)
+        else:
+            self._apply_layer_payload(item_id, payload)
 
     def _on_layer_activated(self, payload: Mapping[str, Any]) -> None:
         ids = [i for i in self.selected_ids()
-               if S.item(self._doc, i).get("kind") in ("image", "montage")]
-        if ids:
+               if S.item(self._doc, i).get("kind") in ("image", "montage", "chart")]
+        if ids and S.item(self._doc, ids[0]).get("kind") == "chart":
+            self._apply_chart_payload(ids[0], payload)
+        elif ids:
             self._apply_layer_payload(ids[0], payload)
+
+    def _apply_chart_payload(self, item_id: str, payload: Mapping[str, Any]) -> None:
+        """A column (or a table) dropped on a chart: the chart reads that table, and the
+        column becomes its value — its Y for an XY chart, its X when the X is still blank
+        on a chart that has a Y."""
+        sid = self.source_id_for(str(payload.get("source"))) or \
+            self.add_source(str(payload.get("source")))
+        domain = str(payload.get("domain") or "label")
+        table = str(payload.get("layer") or "")
+        column = str(payload.get("column") or "")
+
+        def mut(dd):
+            ch = S.item(dd, item_id).setdefault("chart", {})
+            if ch.get("data") is None:
+                ch["source"] = sid
+            if ch.get("data") is None or not ch.get("table"):
+                ch["domain"], ch["table"] = domain, table
+            if column:
+                kind = str(ch.get("kind") or "xy")
+                if kind in ("xy", "timeseries", "hexbin") and not ch.get("y"):
+                    ch["y"] = column
+                elif kind in ("xy", "hexbin") and not ch.get("x"):
+                    ch["x"] = column
+                elif kind in ("xy", "timeseries", "hexbin"):
+                    ch["y"] = column
+                elif kind == "bar" and not ch.get("x"):
+                    ch["x"] = column
+                else:
+                    ch["value"] = column
+        self.commit(_mutated(self._doc, mut))
 
     def _apply_layer_payload(self, item_id: str, payload: Mapping[str, Any]) -> None:
         img = S.effective_image(self._doc, item_id)

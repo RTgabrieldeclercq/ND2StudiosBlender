@@ -492,7 +492,12 @@ and the LabLink publisher work on it unchanged, and `FigureDocument.run_ids` map
 source to the upstream Output's run id in the composed graph. The figure rides the page
 record as `"figure"`; a V4 file's Analysis page holding nodes opens as a Free page named
 `<name> (graph)`, its linked pages with it. A figure page is never linked or a master;
-`seed_input` never seeds one; `reset` drops the figure of the page it keeps.
+`seed_input` never seeds one; `reset` drops the figure of the page it keeps. The figure's
+**data entries** (step 4) compile into the same shadow graph as real catalog nodes
+(`__fig_data__<id>__concat|__where|__agg`: `table.concat` for pooled sources,
+`analysis.if_else` for the `where` terms, `table.aggregate` for the summary), so a summary
+is a run id like any other — `FigureDocument.data_terminal` names the stage a chart reads
+and `run_ids` carries it beside the sources.
 
 see: WF-08 · CON-18 · [MANUAL §2 Pages, §2b](../MANUAL.md)
 

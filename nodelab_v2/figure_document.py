@@ -24,6 +24,8 @@ from nodelab_v2.ops import PAGE_INPUT_OP, PAGE_ITEM_KEY, PAGE_SOURCE_KEY
 
 #: the prefix of a shadow input's node id; the rest is the figure source's id
 SHADOW_PREFIX = "__fig_src__"
+#: the prefix of a data entry's stage nodes (``__fig_data__<id>__concat`` …)
+DATA_PREFIX = "__fig_data__"
 
 
 class FigureDocument:
@@ -110,14 +112,114 @@ class FigureDocument:
     def source_ids(self) -> List[str]:
         return [str(s["id"]) for s in self.sources]
 
+    @property
+    def data(self) -> List[Dict[str, Any]]:
+        return list(self._doc.get("data") or [])
+
+    @staticmethod
+    def data_id(data_id: str, stage: str = "") -> str:
+        """The shadow node of a data entry's ``stage`` (``concat`` | ``where`` | ``agg``)."""
+        return f"{DATA_PREFIX}{data_id}" + (f"__{stage}" if stage else "")
+
+    @staticmethod
+    def data_stages(entry: Mapping[str, Any]) -> List[str]:
+        """The stages a data entry compiles to, in wiring order."""
+        out = []
+        if len(entry.get("from") or []) > 1 and entry.get("pool", True):
+            out.append("concat")
+        if entry.get("where"):
+            out.append("where")
+        if entry.get("aggregate"):
+            out.append("agg")
+        return out
+
+    def data_terminal(self, data_id: str) -> Optional[str]:
+        """The shadow node whose output IS the data entry: its last stage, or the source's
+        own input when it has no stage (a plain read of one source)."""
+        entry = next((d for d in self.data if d["id"] == data_id), None)
+        if entry is None:
+            return None
+        stages = self.data_stages(entry)
+        if stages:
+            return self.data_id(data_id, stages[-1])
+        frm = entry.get("from") or []
+        return self.shadow_id(str(frm[0])) if frm else None
+
+    def data_table_name(self, data_id: str) -> str:
+        """The table name a chart reads from the data entry."""
+        entry = next((d for d in self.data if d["id"] == data_id), None)
+        if entry is None:
+            return ""
+        stages = self.data_stages(entry)
+        if not stages:
+            return str(entry.get("table") or "")
+        last = stages[-1]
+        if last == "agg":
+            return str((entry.get("aggregate") or {}).get("name") or "summary")
+        if last == "where":
+            return f"{data_id}_pass"
+        return str(entry.get("name") or "combined")
+
     def sync_shadow(self, graph: Any) -> Tuple[List[str], List[str]]:
-        """Bring ``graph`` (the page's :class:`GraphDocument`) in step with the figure's
-        sources: one ``page.input`` per source, bound to it (and to its item, for a
-        several-item Output). Returns ``(added or re-bound ids, removed ids)``."""
+        """Bring ``graph`` (the page's :class:`GraphDocument`) in step with the figure: one
+        ``page.input`` per source, bound to it (and to its item, for a several-item
+        Output), and the stages of every data entry (step 4: ``table.concat`` to pool
+        several sources, ``analysis.if_else`` for a filter, ``table.aggregate`` for a
+        summary), wired in order. Returns ``(added or re-bound ids, removed ids)``."""
         want: Dict[str, Dict[str, Any]] = {self.shadow_id(s["id"]): s for s in self.sources}
+        # the data stages and their wires
+        stage_nodes: Dict[str, Tuple[str, Dict[str, Any], Dict[str, str], List[Tuple[str, str]]]] = {}
+        for entry in self.data:
+            did = str(entry["id"])
+            frm = [self.shadow_id(str(s)) for s in (entry.get("from") or [])]
+            domain = str(entry.get("domain") or "label")
+            table = str(entry.get("table") or "")
+            prev: List[str] = frm
+            prev_table = table
+            for stage in self.data_stages(entry):
+                nid = self.data_id(did, stage)
+                if stage == "concat":
+                    op = "table.concat"
+                    params = {"table": table, "name": str(entry.get("name") or "combined")}
+                    modes = {"domain": domain}
+                    wires = [(p, "out") for p in prev]
+                    prev_table = params["name"]
+                elif stage == "where":
+                    op = "analysis.if_else"
+                    conds = list(entry.get("where") or [])[:4]
+                    params = {"pass_name": f"{did}_pass", "fail_name": f"{did}_fail",
+                              "labels" if domain == "label" else "points": prev_table}
+                    for k, (col, oper, val) in enumerate(conds, start=1):
+                        params[f"column{k}"] = str(col)
+                        params[f"op{k}"] = str(oper)
+                        try:
+                            params[f"value{k}"] = float(val)
+                        except (TypeError, ValueError):
+                            params[f"value{k}"] = 0.0
+                    modes = {"target": "point" if domain == "point" else "label",
+                             "terms": str(max(1, len(conds))),
+                             "match": str(entry.get("match") or "all")}
+                    wires = [(prev[0], "out")] if prev else []
+                    prev_table = f"{did}_pass"
+                else:
+                    op = "table.aggregate"
+                    agg = dict(entry.get("aggregate") or {})
+                    gb = agg.get("group_by") or ["t"]
+                    reducers = agg.get("reducers") or ["mean", "sem", "count"]
+                    params = {"table": prev_table,
+                              "group_by": ",".join(str(g) for g in gb),
+                              "value": str(agg.get("value") or "area"),
+                              "reducers": ",".join(str(r) for r in reducers),
+                              "name": str(agg.get("name") or "summary")}
+                    modes = {"domain": domain}
+                    wires = [(prev[0], "out")] if prev else []
+                    prev_table = params["name"]
+                stage_nodes[nid] = (op, params, modes, wires)
+                prev = [nid]
         removed: List[str] = []
         for nid in list(graph.nodes):
-            if self.is_shadow(nid) and nid not in want:
+            if (self.is_shadow(nid) and nid not in want) or \
+                    (nid.startswith(DATA_PREFIX) and nid not in stage_nodes):
                 graph.remove_node(nid)
                 removed.append(nid)
         changed: List[str] = []
@@ -140,6 +242,32 @@ class FigureDocument:
                     rec.params.pop(PAGE_ITEM_KEY, None)
                 graph.touch(nid)
                 changed.append(nid)
+        for k, (nid, (op, params, modes, wires)) in enumerate(stage_nodes.items()):
+            rec = graph.nodes.get(nid)
+            if rec is not None and rec.op_key != op:
+                graph.remove_node(nid)
+                rec = None
+            if rec is None:
+                graph.add_node(op, node_id=nid, params=dict(params), modes=dict(modes),
+                               x=340.0 + 300.0 * k, y=120.0)
+                changed.append(nid)
+            else:
+                dirty = False
+                for key, val in params.items():
+                    if rec.params.get(key) != val:
+                        rec.params[key] = val
+                        dirty = True
+                for key, val in modes.items():
+                    if rec.modes.get(key) != val:
+                        rec.modes[key] = val
+                        dirty = True
+                if dirty:
+                    graph.touch(nid)
+                    changed.append(nid)
+            have = {(e[0], e[1]) for e in graph.edges if e[2] == nid and e[3] == "data"}
+            for src, sock in wires:
+                if (src, sock) not in have and src in graph.nodes:
+                    graph.connect(src, sock, nid, "data")
         return changed, removed
 
     def envelopes(self, ws: Any, page_id: str) -> Dict[str, Any]:
@@ -161,12 +289,28 @@ class FigureDocument:
         return out
 
     def run_ids(self, composed: Any, page_id: str) -> Dict[str, str]:
-        """``{source id: run id}`` in a :class:`ComposedGraph` of ``page_id`` — the upstream
-        Output's run id for a resolved source, the shadow input's own for an unbound one."""
+        """``{source id | data id: run id}`` in a :class:`ComposedGraph` of ``page_id`` —
+        the upstream Output's run id for a resolved source (the shadow input's own for an
+        unbound one), a data entry's terminal stage for a data entry."""
         out: Dict[str, str] = {}
         for s in self.sources:
             nid = self.shadow_id(s["id"])
             out[str(s["id"])] = composed.id_map.get((page_id, nid), f"{page_id}/{nid}")
+        for d in self.data:
+            nid = self.data_terminal(str(d["id"]))
+            if nid:
+                out[str(d["id"])] = composed.id_map.get((page_id, nid), f"{page_id}/{nid}")
+        return out
+
+    def data_envelopes(self, page: Any) -> Dict[str, Any]:
+        """``{data id: MetaEnvelope}`` of each data entry's terminal node on the figure
+        page's own graph (its columns are what a chart's pickers offer)."""
+        out: Dict[str, Any] = {}
+        for d in self.data:
+            nid = self.data_terminal(str(d["id"]))
+            env = page.doc.envs.get(nid) if nid else None
+            if env is not None:
+                out[str(d["id"])] = env
         return out
 
     def source_labels(self, ws: Any, page_id: str) -> Dict[str, str]:
@@ -177,4 +321,4 @@ class FigureDocument:
                 for s in self.sources}
 
 
-__all__ = ["FigureDocument", "SHADOW_PREFIX"]
+__all__ = ["FigureDocument", "SHADOW_PREFIX", "DATA_PREFIX"]

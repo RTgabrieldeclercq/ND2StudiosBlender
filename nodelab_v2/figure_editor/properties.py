@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDoubleSpinBo
 
 from nodegraph.figure import layout as FL
 from nodegraph.figure import schema as S
+from nodegraph.figure import stats as ST
 from nodelab_v2 import theme as T
 
 
@@ -165,6 +166,84 @@ KIND_FIELDS: Dict[str, List[Field]] = {
                      ("color", "color", "Colour", {}),
                      ("width_pt", "float", "Line (pt)", {"lo": 0.1, "hi": 20, "step": 0.25,
                                                          "dec": 2})],
+}
+
+CHART_KIND_LABELS = [("xy", "XY — scatter / line"), ("timeseries", "time series"),
+                     ("bar", "bars"), ("distribution", "distribution"),
+                     ("heatmap", "heat map"), ("hexbin", "hexbin density"),
+                     ("msd", "MSD (tracks)"), ("survival", "survival (tracks)"),
+                     ("rose", "rose (angles)")]
+
+CMAP_CHOICES = [("viridis", "viridis"), ("magma", "magma"), ("turbo", "turbo"),
+                ("coolwarm", "coolwarm"), ("grey", "grey")]
+
+#: the chart form (step 4): the data it reads, then how it is drawn. ``column`` controls
+#: list the columns of the table the chart reads (``panel.chart_columns``); ``chart_source``
+#: lists the sources and the data entries; ``chart_table`` the tables of what it reads.
+CHART_FIELDS: List[Field] = [
+    ("chart.kind", "choice", "Kind", {"choices": CHART_KIND_LABELS}),
+    ("chart.source", "chart_source", "Reads", {}),
+    ("chart.table", "chart_table", "Table", {}),
+    ("chart.x", "column", "X", {}),
+    ("chart.y", "column", "Y", {}),
+    ("chart.value", "column", "Value", {}),
+    ("chart.group_by", "column", "Group by", {}),
+    ("chart.color_by", "column", "Colour / series by", {}),
+    ("chart.facet_by", "column", "Replicate (SuperPlot)", {}),
+    ("chart.sub_kind", "choice", "Distribution as", {"choices": [(k, k) for k in
+                                                                 S.DISTRIBUTION_KINDS]}),
+    ("chart.bins", "int", "Bins / lags / grid", {"lo": 1, "hi": 10000}),
+    ("chart.draw.mode", "choice", "Draw", {"choices": [("scatter", "markers"), ("line", "line"),
+                                                       ("line_markers", "line + markers")]}),
+    ("chart.draw.error", "choice", "Error", {"choices": [("none", "none"), ("sem", "SEM"),
+                                                         ("sd", "SD"), ("ci95", "95 % CI"),
+                                                         ("column", "a column")]}),
+    ("chart.error_column", "column", "Error column", {}),
+    ("chart.draw.error_style", "choice", "Error as", {"choices": [("bars", "bars"),
+                                                                  ("band", "band")]}),
+    ("chart.draw.step", "bool", "Step", {}),
+    ("chart.draw.stacked", "bool", "Stacked bars", {}),
+    ("chart.draw.reducer", "choice", "Cell reducer (heat map)", {"choices": [
+        ("mean", "mean"), ("median", "median"), ("sum", "sum"), ("count", "count"),
+        ("min", "min"), ("max", "max")]}),
+    ("chart.fit.model", "choice", "Fit", {"choices": [("none", "none"), ("linear", "linear"),
+                                                      ("power", "power law"),
+                                                      ("exponential", "exponential"),
+                                                      ("langmuir", "Langmuir")]}),
+    ("chart.stats.test", "choice", "Test", {"choices": [("none", "none")]
+                                            + [(t, t) for t in ST.TESTS]}),
+    ("chart.axes.title", "text", "Title", {}),
+    ("chart.axes.x_label", "text", "X label", {}),
+    ("chart.axes.y_label", "text", "Y label", {}),
+    ("chart.axes.log_x", "bool", "Log X", {}),
+    ("chart.axes.log_y", "bool", "Log Y", {}),
+    ("chart.axes.x_range", "range", "X range", {}),
+    ("chart.axes.y_range", "range", "Y range", {}),
+    ("chart.legend.show", "bool", "Legend", {}),
+    ("chart.legend.loc", "choice", "Legend at", {"choices": [("inside", "inside"),
+                                                             ("right", "right"),
+                                                             ("bottom", "bottom")]}),
+    ("chart.cmap", "choice", "Colour map", {"choices": CMAP_CHOICES}),
+]
+
+#: which chart fields each kind reads (the others are hidden)
+CHART_FIELDS_OF: Dict[str, Tuple[str, ...]] = {
+    "xy": ("x", "y", "group_by", "draw.mode", "draw.error", "error_column", "draw.error_style",
+           "draw.step", "fit.model", "axes.log_x", "axes.log_y", "axes.x_range", "axes.y_range",
+           "legend.show", "legend.loc"),
+    "timeseries": ("y", "group_by", "draw.mode", "draw.error", "error_column",
+                   "draw.error_style", "draw.step", "fit.model", "axes.log_y", "axes.y_range",
+                   "legend.show", "legend.loc"),
+    "bar": ("x", "y", "color_by", "draw.error", "draw.stacked", "axes.log_y", "axes.y_range",
+            "legend.show", "legend.loc"),
+    "distribution": ("value", "group_by", "facet_by", "sub_kind", "bins", "stats.test",
+                     "axes.log_x", "axes.log_y", "axes.x_range", "axes.y_range", "legend.show",
+                     "legend.loc"),
+    "heatmap": ("x", "group_by", "value", "draw.reducer", "cmap"),
+    "hexbin": ("x", "y", "bins", "axes.log_x", "axes.log_y", "cmap"),
+    "msd": ("group_by", "bins", "axes.log_x", "axes.log_y", "legend.show", "legend.loc"),
+    "survival": ("group_by", "legend.show", "legend.loc"),
+    "rose": ("value", "group_by", "bins", "legend.show", "legend.loc"),
 }
 
 CHANNEL_MODES = [("auto_pct", "auto (percentiles)"), ("viewer", "the Viewer's window"),
@@ -400,6 +479,9 @@ class PropertiesPanel(QScrollArea):
             if not (twin and "layers" in twin[1]):
                 self._build_layers(it, img)
             self._build_links(doc, it)
+        elif kind == "chart":
+            self._build_chart(doc, it)
+            self._build_links(doc, it)
         else:
             for path, fkind, label, opt in KIND_FIELDS.get(kind, []):
                 w = self._control(fkind, get_path(it, path), opt,
@@ -417,6 +499,13 @@ class PropertiesPanel(QScrollArea):
             row.addWidget(b)
             b = QPushButton("Histogram")
             b.clicked.connect(lambda _=False: self._panel.add_histogram_for(iid))
+            row.addWidget(b)
+        if kind == "chart" and not (it.get("chart") or {}).get("data"):
+            b = QPushButton("Filter / summarise")
+            b.setToolTip("Give the chart a data entry of its source and table — where a "
+                         "filter and a per-group summary are typed; it compiles into the "
+                         "page's hidden graph")
+            b.clicked.connect(lambda _=False: self._panel.promote_chart_data(iid))
             row.addWidget(b)
         b = QPushButton("Delete")
         b.clicked.connect(lambda _=False: self._panel.delete_items([iid]))
@@ -529,6 +618,104 @@ class PropertiesPanel(QScrollArea):
             lay.addWidget(lab)
         self._lay.addWidget(box)
 
+    def _build_chart(self, doc: Mapping[str, Any], it: Mapping[str, Any]) -> None:
+        iid = str(it["id"])
+        chart = it.get("chart") or {}
+        kind = str(chart.get("kind") or "xy")
+        shown = set(CHART_FIELDS_OF.get(kind, ())) | {"kind", "source", "table", "axes.title",
+                                                     "axes.x_label", "axes.y_label"}
+        form = self._form("Chart")
+        for path, fkind, label, opt in CHART_FIELDS:
+            if path[len("chart."):] not in shown:
+                continue
+            w = self._control(fkind, get_path(it, path), opt,
+                              lambda v, p=path: self._panel.edit_item(iid, p, v), ctx=it)
+            form.addRow(label, w)
+        did = chart.get("data")
+        if did:
+            entry = next((d for d in doc.get("data", []) if d["id"] == did), None)
+            if entry is not None:
+                self._build_data(doc, entry)
+        note = getattr(self._panel._items.get(iid), "note", "") if hasattr(self._panel, "_items") else ""
+        if note:
+            lab = QLabel(note)
+            lab.setWordWrap(True)
+            lab.setProperty("role", "muted")
+            self._lay.addWidget(lab)
+
+    def _build_data(self, doc: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
+        """The data entry a chart reads: its sources, filter and summary. Every control
+        commits one edit through ``panel.edit_data``."""
+        did = str(entry["id"])
+        box = QGroupBox(f"Data entry {did}")
+        form = QFormLayout(box)
+        form.setContentsMargins(6, 6, 6, 6)
+        form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignRight)
+        labels = {s["id"]: (s.get("label") or s["source"]) for s in doc.get("sources", [])}
+        form.addRow("Pools", QLabel(", ".join(str(labels.get(s, s)) for s in entry.get("from", []))))
+        dom = _NoWheelCombo()
+        for k in ("label", "point", "track"):
+            dom.addItem(k, k)
+        dom.setCurrentIndex(max(0, ["label", "point", "track"].index(str(entry.get("domain") or "label"))))
+        dom.currentIndexChanged.connect(lambda i, c=dom: self._panel.edit_data(did, "domain", c.itemData(i)))
+        form.addRow("Domain", dom)
+        tab = QLineEdit(str(entry.get("table") or ""))
+        tab.setPlaceholderText("the only table on the domain")
+        tab.editingFinished.connect(lambda e=tab: self._panel.edit_data(did, "table", e.text()))
+        form.addRow("Table", tab)
+        where = QLineEdit("; ".join(f"{c} {o} {v:g}" for c, o, v in entry.get("where", [])))
+        where.setPlaceholderText("area > 50; circularity >= 0.8   (up to four)")
+        where.setToolTip("Rows kept: `column op value` terms separated by `;` — ops " +
+                         ", ".join(S.WHERE_OPS))
+        where.editingFinished.connect(lambda e=where: self._panel.edit_data(did, "where", _parse_where(e.text())))
+        form.addRow("Keep rows where", where)
+        match = _NoWheelCombo()
+        match.addItem("all terms", "all")
+        match.addItem("any term", "any")
+        match.setCurrentIndex(0 if str(entry.get("match") or "all") == "all" else 1)
+        match.currentIndexChanged.connect(lambda i, c=match: self._panel.edit_data(did, "match", c.itemData(i)))
+        form.addRow("Match", match)
+        agg = entry.get("aggregate")
+        on = QCheckBox("one row per group")
+        on.setChecked(agg is not None)
+        on.toggled.connect(lambda v: self._panel.edit_data(
+            did, "aggregate", {"group_by": ["t"], "value": "area",
+                               "reducers": ["mean", "sem", "count"], "name": "summary"}
+            if v else None))
+        form.addRow("Summarise", on)
+        if agg is not None:
+            gb = agg.get("group_by") or []
+            gb_e = QLineEdit(", ".join(gb) if isinstance(gb, list) else str(gb))
+            gb_e.setPlaceholderText("t   or   condition, t   (blank = one row)")
+            gb_e.editingFinished.connect(lambda e=gb_e: self._panel.edit_data(
+                did, "aggregate.group_by", [g.strip() for g in e.text().split(",") if g.strip()]))
+            form.addRow("Group by", gb_e)
+            cols = self._panel.chart_columns({"chart": {"source": (entry.get("from") or [""])[0],
+                                                        "domain": entry.get("domain"),
+                                                        "table": entry.get("table")}})
+            val = _NoWheelCombo()
+            for c in cols:
+                val.addItem(c, c)
+            idx = next((i for i in range(val.count()) if val.itemData(i) == agg.get("value")), -1)
+            if idx < 0 and agg.get("value"):
+                val.addItem(str(agg["value"]), str(agg["value"]))
+                idx = val.count() - 1
+            val.setCurrentIndex(max(0, idx))
+            val.currentIndexChanged.connect(lambda i, c=val: self._panel.edit_data(
+                did, "aggregate.value", c.itemData(i)))
+            form.addRow("Value", val)
+            red = agg.get("reducers") or []
+            red_e = QLineEdit(", ".join(red) if isinstance(red, list) else str(red))
+            red_e.setToolTip("of " + ", ".join(S.AGG_REDUCERS))
+            red_e.editingFinished.connect(lambda e=red_e: self._panel.edit_data(
+                did, "aggregate.reducers", [r.strip() for r in e.text().split(",") if r.strip()]))
+            form.addRow("Reducers", red_e)
+            nm = QLineEdit(str(agg.get("name") or "summary"))
+            nm.editingFinished.connect(lambda e=nm: self._panel.edit_data(did, "aggregate.name", e.text()))
+            form.addRow("Summary table", nm)
+        self._lay.addWidget(box)
+
     def _build_links(self, doc: Mapping[str, Any], it: Mapping[str, Any]) -> None:
         iid = str(it["id"])
         rows = []
@@ -614,6 +801,55 @@ class PropertiesPanel(QScrollArea):
             w.setCurrentIndex(max(0, idx))
             w.currentIndexChanged.connect(lambda i, c=w: on_set(c.itemData(i)))
             return w
+        if kind == "column":
+            w = _NoWheelCombo()
+            w.addItem("—", "")
+            for c in (self._panel.chart_columns(ctx) if ctx is not None else []):
+                w.addItem(str(c), str(c))
+            idx = next((i for i in range(w.count()) if w.itemData(i) == (value or "")), -1)
+            if idx < 0 and value:
+                w.addItem(str(value), str(value))
+                idx = w.count() - 1
+            w.setCurrentIndex(max(0, idx))
+            w.currentIndexChanged.connect(lambda i, c=w: on_set(c.itemData(i)))
+            return w
+        if kind == "chart_source":
+            w = _NoWheelCombo()
+            doc = self._panel.document
+            for s in doc.get("sources", []):
+                w.addItem(f"{s.get('label') or s['source']}", ("source", s["id"]))
+            for d in doc.get("data", []):
+                w.addItem(f"data: {d['id']}", ("data", d["id"]))
+            chart = (ctx or {}).get("chart") or {}
+            cur = ("data", chart["data"]) if chart.get("data") else ("source", chart.get("source"))
+            idx = next((i for i in range(w.count()) if w.itemData(i) == cur), -1)
+            w.setCurrentIndex(max(0, idx))
+            iid = str((ctx or {}).get("id") or "")
+            w.currentIndexChanged.connect(
+                lambda i, c=w: self._panel.set_chart_reads(iid, *c.itemData(i)))
+            return w
+        if kind == "chart_table":
+            w = _NoWheelCombo()
+            chart = (ctx or {}).get("chart") or {}
+            w.addItem("the only table on the domain", (str(chart.get("domain") or "label"), ""))
+            for dom, name in (self._panel.chart_tables_of(ctx) if ctx is not None else []):
+                w.addItem(f"{dom}: {name}", (dom, name))
+            cur = (str(chart.get("domain") or "label"), str(chart.get("table") or ""))
+            idx = next((i for i in range(w.count()) if w.itemData(i) == cur), -1)
+            if idx < 0 and cur[1]:
+                w.addItem(f"{cur[0]}: {cur[1]}", cur)
+                idx = w.count() - 1
+            w.setCurrentIndex(max(0, idx))
+            iid = str((ctx or {}).get("id") or "")
+            w.currentIndexChanged.connect(
+                lambda i, c=w: self._panel.set_chart_table(iid, *c.itemData(i)))
+            return w
+        if kind == "range":
+            lo, hi = (value or [None, None])[:2] if isinstance(value, (list, tuple)) else (None, None)
+            w = QLineEdit(", ".join("" if v is None else f"{v:g}" for v in (lo, hi)).strip(", "))
+            w.setPlaceholderText("low, high   (blank = auto)")
+            w.editingFinished.connect(lambda e=w: on_set(_parse_range(e.text())))
+            return w
         if kind == "frame":
             axis = str(opt.get("axis"))
             w = _NoWheelCombo()
@@ -654,4 +890,43 @@ class PropertiesPanel(QScrollArea):
         """)
 
 
-__all__ = ["PropertiesPanel", "get_path", "set_path", "ColorButton"]
+def _parse_range(text: str) -> List[Optional[float]]:
+    """``"0, 100"`` → ``[0.0, 100.0]``; a blank side is ``None``."""
+    parts = [p.strip() for p in str(text or "").replace(";", ",").split(",")]
+    parts = (parts + ["", ""])[:2]
+    out: List[Optional[float]] = []
+    for p in parts:
+        try:
+            out.append(float(p) if p else None)
+        except ValueError:
+            out.append(None)
+    if out[0] is not None and out[1] is not None and out[1] <= out[0]:
+        out[1] = None
+    return out
+
+
+def _parse_where(text: str) -> List[List[Any]]:
+    """``"area > 50; circ >= 0.8"`` → ``[["area", ">", 50.0], ["circ", ">=", 0.8]]``; a
+    term that does not parse is dropped, at most four are kept."""
+    ops = sorted(S.WHERE_OPS, key=len, reverse=True)
+    out: List[List[Any]] = []
+    for term in str(text or "").split(";"):
+        term = term.strip()
+        if not term:
+            continue
+        toks = term.split()
+        if len(toks) == 2 and toks[1] in ("is_finite", "is_nan"):
+            out.append([toks[0], toks[1], 0.0])
+            continue
+        for op in ops:
+            if f" {op} " in f" {term} ":
+                col, _o, val = term.partition(op)
+                try:
+                    out.append([col.strip(), op, float(val.strip())])
+                except ValueError:
+                    pass
+                break
+    return out[:4]
+
+
+__all__ = ["PropertiesPanel", "get_path", "set_path", "ColorButton", "CHART_FIELDS"]

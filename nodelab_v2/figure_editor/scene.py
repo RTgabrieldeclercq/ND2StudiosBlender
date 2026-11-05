@@ -214,9 +214,12 @@ class FigureView(QGraphicsView):
     source_dropped = Signal(str, object)
     #: a column was dropped on an item: ``(item id, payload dict)``
     column_dropped = Signal(str, object)
+    #: the pointer moved over an item: ``(item id or "", QPointF in the item's coords)``
+    hovered = Signal(str, object)
 
     def __init__(self, scene: FigureScene) -> None:
         super().__init__(scene)
+        self.setMouseTracking(True)
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform
                             | QPainter.TextAntialiasing)
         self.setDragMode(QGraphicsView.RubberBandDrag)
@@ -286,6 +289,15 @@ class FigureView(QGraphicsView):
             item.set_drag_box(self._alt_rect)
             e.accept()
             return
+        if not e.buttons():
+            item = self.itemAt(e.position().toPoint())
+            while item is not None and not hasattr(item, "item_id"):
+                item = item.parentItem()
+            if item is not None:
+                self.hovered.emit(item.item_id,
+                                  item.mapFromScene(self.mapToScene(e.position().toPoint())))
+            else:
+                self.hovered.emit("", QPointF())
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e) -> None:                               # noqa: N802

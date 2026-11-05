@@ -437,6 +437,66 @@ def _probe_figure_editor(win, app) -> None:
     app.processEvents()
     assert isinstance(ed._items[hb], _HistogramItem) and ed._items[hb].counts is not None
 
+    # ── charts (V5.00 step 4) ─────────────────────────────────────────────────
+    from PySide6.QtCore import QPointF as _QPointF
+    from nodelab_v2.figure_editor.items import ChartItem as _ChartItem
+    from nodelab_v2.figure_editor.scene import mm as _mm
+    cid = ed.add_chart(f"{pids['process']}:cells")          # a histogram of area, by default
+    app.processEvents()
+    ch = _FS.item(ed.document, cid)["chart"]
+    assert ch["source"] == sid and ch["kind"] == "distribution" and ch["value"] == "area" \
+        and ch["table"] == lab_layer, ch
+    ci = ed._items[cid]
+    assert isinstance(ci, _ChartItem) and ci.geometry is not None, ci.note
+    assert any(mk["kind"] == "rects" and mk["rects_mm"] for mk in ci.geometry["marks"]), \
+        "the histogram drew no bars"
+    assert "area" in ed.chart_columns(_FS.item(ed.document, cid)) \
+        and ("label", lab_layer) in ed.chart_tables_of(_FS.item(ed.document, cid))
+    # an XY chart over the objects: every marker carries its row, a hover rings the object
+    ed.edit(lambda d: _FS.item(d, cid)["chart"].update(kind="xy", x="x", y="y"))
+    app.processEvents()
+    ci = ed._items[cid]
+    mk = next(m for m in ci.geometry["marks"] if m["kind"] == "markers" and m["role"] == "series")
+    assert mk["pts_mm"] and ci.series[0].get("rows"), "the XY series lost its row ride-along"
+    at = _QPointF(_mm(mk["pts_mm"][0][0]) - ci.pos().x(), _mm(mk["pts_mm"][0][1]) - ci.pos().y())
+    info = ci.hover(at)
+    assert info.get("row") and info["hit"]["index"] == 0 and info["inside"], info
+    ed._on_hover(cid, at)
+    assert ed._items[iid]._highlight is not None, "the hovered object is not ringed on its image"
+    assert "object" in ed._status.text(), ed._status.text()
+    ed._on_hover("", _QPointF())
+    assert ed._items[iid]._highlight is None
+    # a column dropped on the chart becomes its Y; the chart form lists its columns
+    ed._on_column_dropped(cid, {"source": f"{pids['process']}:cells", "domain": "label",
+                                "layer": lab_layer, "kind": "labels", "column": "area"})
+    assert _FS.item(ed.document, cid)["chart"]["y"] == "area"
+    ed.select([cid])
+    app.processEvents()
+    # a data entry: the chart's source filtered and summarised per frame, compiled into the
+    # page's hidden graph, fetched like a source, drawn as bars of the summary
+    did = ed.promote_chart_data(cid, where=[["area", ">", 1]],
+                                aggregate={"group_by": ["t"], "value": "area",
+                                           "reducers": ["mean", "count"], "name": "summary"})
+    ed.edit(lambda d: _FS.item(d, cid)["chart"].update(kind="bar", x="t", y="area_mean"))
+    app.processEvents()
+    assert {f"__fig_data__{did}__where", f"__fig_data__{did}__agg"} <= set(an.doc.nodes), \
+        set(an.doc.nodes)
+    assert ed._items[cid].geometry is None and "not computed" in ed._items[cid].note, \
+        ed._items[cid].note
+    assert "area_mean" in ed.chart_columns(_FS.item(ed.document, cid)), \
+        ed.chart_columns(_FS.item(ed.document, cid))
+    assert ed.compute_sources() == 1
+    assert wait(lambda: ed._items[cid].geometry is not None, 120), ed._items[cid].note
+    g = ed._items[cid].geometry
+    assert any(mk["kind"] == "rects" and mk["rects_mm"] for mk in g["marks"]), \
+        "no bars from the summary"
+    assert len(g["x"]["categories"]) == 3, g["x"]      # one bar per frame (t = 3)
+    assert ed.chart_csv(cid).startswith("series,category,mean,err,n"), ed.chart_csv(cid)
+    assert ("label", "summary") in ed.chart_tables_of(_FS.item(ed.document, cid))
+    ed.select([cid])
+    app.processEvents()                                    # the chart + data forms build
+    ed.select([])
+
     tmp = _tempfile.mkdtemp(prefix="nd2sb_figure_")
     png = ed.export(_os.path.join(tmp, "f.png"), "png")
     png2 = ed.export(_os.path.join(tmp, "g.png"), "png")
@@ -458,10 +518,12 @@ def _probe_figure_editor(win, app) -> None:
     if _stop(4):
         return
     n_items = len(ed.document["items"])
+    ed.add_item("text", text="undo me")
     ed.undo()
-    assert len(ed.document["items"]) == n_items - 1
-    ed.redo()
     assert len(ed.document["items"]) == n_items
+    ed.redo()
+    assert len(ed.document["items"]) == n_items + 1
+    n_items += 1
     dd = ws.to_dict()
     rec = next(r for r in dd["workspace"]["pages"] if r["id"] == pids["analyze"])
     assert rec["figure"]["items"] and shadow in str(rec["graph"]), "the file lacks the figure"
@@ -484,15 +546,17 @@ def _probe_figure_editor(win, app) -> None:
     win._show_page(c, pids["input"])
     app.processEvents()
     _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
-    _ok("Figure Editor (V5.00 step 3): the Analysis page shows the editor bound to it with "
+    _ok("Figure Editor (V5.00 steps 3–4): the Analysis page shows the editor bound to it with "
         "the start card; the Sources panel lists the feeder outputs from envelopes; an image "
         "compiles one hidden Page Input; Compute sources fetches without touching the "
         "Viewer; the image renders with a window per channel and draws a labels layer; a "
         "popout gets a zoom box and a leader that follows it; a twin shares the region and a "
-        "LUT share its windows; colour bar, histogram and text land; PNG at the page's size "
-        "and identical twice, SVG with paths and text, a PDF; undo/redo; the file carries the "
-        "figure; checks name the bar-less twin; edits commit; a graph page unbinds, coming "
-        "back rebinds")
+        "LUT share its windows; colour bar, histogram and text land; a chart draws a "
+        "histogram of the label table, an XY hover rings the object on the image, a column "
+        "drop sets Y, a data entry (filter → summary) compiles, fetches and draws bars per "
+        "frame; PNG at the page's size and identical twice, SVG with paths and text, a PDF; "
+        "undo/redo; the file carries the figure; checks name the bar-less twin; edits commit; "
+        "a graph page unbinds, coming back rebinds")
 
 
 def main(argv) -> int:
