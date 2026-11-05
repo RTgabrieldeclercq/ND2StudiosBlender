@@ -269,6 +269,18 @@
   "blessed": "2026-11-03",
   "file": "codemap/concepts.md"
  },
+ "CON-30": {
+  "anchors": {
+   "sym:nodegraph.catalog._shared.identity_palette.build_palette": "172de48c568e8042d8333e2b51c5a857",
+   "sym:nodegraph.htmlview.document.build_view": "6518c158d9724eb46c22ed3100769b03",
+   "sym:nodegraph.htmlview.page.figure_html": "0e0427f3fe4c278311d3a62fb8169ad8",
+   "sym:nodegraph.htmlview.page.view_html": "fc8ec5f47b6766c1497eb9b10b65d89e",
+   "sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_html": "13f071aa561fee52fafeed45860d635f",
+   "sym:nodelab_v2.html_export.export_viewer_html": "a280272c159158e1e6a688ed878a5986"
+  },
+  "blessed": "2026-11-05",
+  "file": "codemap/concepts.md"
+ },
  "INV-01": {
   "anchors": {
    "sym:nodegraph.memo.node_recipe_hash": "2507e4c30375c63c238f4dc4ebef9258",
@@ -495,6 +507,16 @@
    "sym:nodelab_v2.lablink.worker.Worker._write_figure": "bc7576870cda0b63f4be78bc6ff560b4"
   },
   "blessed": "2026-11-03",
+  "file": "codemap/workflows.md"
+ },
+ "WF-11": {
+  "anchors": {
+   "sym:nodegraph.htmlview.document.build_view": "6518c158d9724eb46c22ed3100769b03",
+   "sym:nodegraph.htmlview.page.write_html": "753279589bcab0d8dfe008acaf2dbda9",
+   "sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_html": "13f071aa561fee52fafeed45860d635f",
+   "sym:nodelab_v2.html_export.viewer_state": "9828e5e434898908d7d167ac8bf08636"
+  },
+  "blessed": "2026-11-05",
   "file": "codemap/workflows.md"
  }
 }

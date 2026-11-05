@@ -68,6 +68,10 @@
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.full_scale"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.global_scalar"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.global_scalar"}
+{"dst":"nodegraph.catalog._shared.label_paint","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.identity_palette"}
+{"dst":"nodegraph.catalog._shared.table_ops","k":"imp","lazy":true,"src":"nodegraph.catalog._shared.identity_palette"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.identity_palette"}
+{"dst":"nodegraph.tables","k":"imp","lazy":true,"src":"nodegraph.catalog._shared.identity_palette"}
 {"dst":"nodegraph.catalog._shared.units","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.kernel_radius"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.kernel_radius"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog._shared.kernel_radius"}
@@ -736,6 +740,11 @@
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_figure"}
 {"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_figure"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_figure"}
+{"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_html"}
+{"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_html"}
+{"dst":"nodegraph.engine","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_html"}
+{"dst":"nodegraph.htmlview","k":"imp","lazy":true,"src":"nodegraph.catalog.io.write_html"}
+{"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_html"}
 {"dst":"nodegraph.catalog._base","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_movie"}
 {"dst":"nodegraph.catalog._shared.movie_draw","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_movie"}
 {"dst":"nodegraph.catalog._shared.movie_timeline","k":"imp","lazy":false,"src":"nodegraph.catalog.io.write_movie"}
@@ -1265,6 +1274,20 @@
 {"dst":"nodegraph.parallel","k":"imp","lazy":true,"src":"nodegraph.hotreload"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.hotreload"}
 {"dst":"nodegraph.revision","k":"imp","lazy":false,"src":"nodegraph.hotreload"}
+{"dst":"nodegraph.htmlview.document","k":"imp","lazy":false,"src":"nodegraph.htmlview"}
+{"dst":"nodegraph.htmlview.page","k":"imp","lazy":false,"src":"nodegraph.htmlview"}
+{"dst":"nodegraph","k":"imp","lazy":true,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.catalog._shared","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.catalog._shared.identity_palette","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.catalog._shared.label_paint","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.catalog._shared.movie_draw","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.catalog._shared.overlay_math","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.fieldmap","k":"imp","lazy":true,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.htmlview.planes","k":"imp","lazy":false,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.placement","k":"imp","lazy":true,"src":"nodegraph.htmlview.document"}
+{"dst":"nodegraph.htmlview.png","k":"imp","lazy":false,"src":"nodegraph.htmlview.planes"}
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodegraph.iterate"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":true,"src":"nodegraph.iterate"}
 {"dst":"nodegraph.registry","k":"imp","lazy":false,"src":"nodegraph.iterate"}
@@ -1377,6 +1400,10 @@
 {"dst":"nodegraph.graph","k":"imp","lazy":false,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.groups","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.hotreload","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.htmlview","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.htmlview.document","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.htmlview.planes","k":"imp","lazy":true,"src":"nodegraph.selftest"}
+{"dst":"nodegraph.htmlview.png","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.iterate","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels","k":"imp","lazy":true,"src":"nodegraph.selftest"}
 {"dst":"nodegraph.kernels.aldvc_field","k":"imp","lazy":true,"src":"nodegraph.selftest"}
@@ -1588,6 +1615,7 @@
 {"dst":"nodegraph.figure.report","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure.tables","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodegraph.htmlview","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_document","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
@@ -1602,6 +1630,7 @@
 {"dst":"nodelab_v2.figure_editor.start_card","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_recipes","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.overlay_geometry","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.properties"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.properties"}
@@ -1644,6 +1673,9 @@
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.framestrip"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.framestrip"}
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.glview"}
+{"dst":"nodegraph.htmlview","k":"imp","lazy":true,"src":"nodelab_v2.html_export"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.html_export"}
+{"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.html_export"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":false,"src":"nodelab_v2.ingest"}
 {"dst":"nodegraph.metadata","k":"imp","lazy":false,"src":"nodelab_v2.ingest"}
 {"dst":"nodegraph.provider","k":"imp","lazy":false,"src":"nodelab_v2.ingest"}
@@ -1789,7 +1821,7 @@
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.overlay_dialog"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.overlay_dialog"}
 {"dst":"nodegraph","k":"imp","lazy":false,"src":"nodelab_v2.overlay_geometry"}
-{"dst":"nodegraph.catalog._shared.table_ops","k":"imp","lazy":true,"src":"nodelab_v2.overlay_geometry"}
+{"dst":"nodegraph.catalog._shared.identity_palette","k":"imp","lazy":false,"src":"nodelab_v2.overlay_geometry"}
 {"dst":"nodegraph.domains","k":"imp","lazy":false,"src":"nodelab_v2.overlay_geometry"}
 {"dst":"nodegraph.fieldmap","k":"imp","lazy":false,"src":"nodelab_v2.overlay_geometry"}
 {"dst":"nodegraph.mesh","k":"imp","lazy":false,"src":"nodelab_v2.overlay_geometry"}
@@ -1940,6 +1972,7 @@
 {"dst":"nodelab_v2.frame_item","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.framestrip","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.graph_layout","k":"imp","lazy":false,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.html_export","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.ingest","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.inspector","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.lablink.authoring","k":"imp","lazy":true,"src":"nodelab_v2.window"}

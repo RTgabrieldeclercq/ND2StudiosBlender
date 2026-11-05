@@ -254,7 +254,9 @@ def render_job(job: Mapping[str, Any], out: str, *, fmt: str = "", dpi: Optional
         app.processEvents()
         panel.render_all_now()
         fmt = (fmt or os.path.splitext(out)[1].lstrip(".") or "png").lower()
-        if bundle:
+        if fmt in ("html", "htm"):
+            written = [panel.export_html(out)]              # the interactive page (2026-11-05)
+        elif bundle:
             written = panel.export_bundle(out, fmt, dpi)
         else:
             written = [panel.export(out, fmt, dpi)]
@@ -282,7 +284,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("workspace", nargs="?", help="a .nd2graph.json workspace file")
     ap.add_argument("--job", help="a figure job (what --write-job writes, or the LabLink worker)")
     ap.add_argument("--page", default="", help="the figure page's id or name (default: the first)")
-    ap.add_argument("--out", help="the picture to write (.png / .tiff / .svg / .pdf)")
+    ap.add_argument("--out", help="the picture to write (.png / .tiff / .svg / .pdf), or the "
+                                  "interactive page (.html)")
     ap.add_argument("--dpi", type=int, default=None)
     ap.add_argument("--svg", action="store_true", help="also write an SVG beside a raster")
     ap.add_argument("--bundle", action="store_true", help="write the export bundle beside it")
