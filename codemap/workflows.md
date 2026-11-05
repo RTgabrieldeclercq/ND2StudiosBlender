@@ -332,3 +332,29 @@ anchors: sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.compute_sources, s
    returns the PNG as the artifact with the bundle listed beside it.
 
 read next: CON-29 (2 min) · INV-18 (1 min) · MANUAL §2c
+
+### WF-11 — an interactive HTML view, from a node, the Viewer or a figure page
+anchors: sym:nodegraph.htmlview.document.build_view, sym:nodegraph.htmlview.page.write_html, sym:nodelab_v2.html_export.viewer_state, sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_html
+
+1. The Dataset is in hand: the node's input (`io.write_html`), the Viewer's `_dataset`
+   (→ HTML), or a figure item's payload (Export ▾ → Interactive HTML). The caller gathers
+   the state the page starts in — the node from its sockets, the Viewer from its channel
+   windows, colours and `OverlaySettings` (`html_export.viewer_state`), the figure from the
+   item's `Rendered` (windows, colours, gammas) and its layers' looks — plus the frames to
+   embed (the frames grammar: blank, `0-99:3`, `last`) and the pixel / byte budgets.
+2. `build_view` reads every shown plane at the budget (`planes.read_plane`: the pyramid
+   level with a side ≥ the budget, strided past twice it, a window cropped for a popout),
+   quantises and packs it (`planes.plane_record` → `png.encode_png`), counts the bytes and
+   refuses past the budget; builds the channels (emission colours, Auto or the given
+   window), the times (`metadata.frame_times_s`), the positions; then the overlays from
+   `identity_palette` (palette, label source and plane, scalar plane) and `fieldmap`
+   (raster, vectors), each as data keyed by frame.
+3. `page.view_html` (or `page.figure_html`, which first takes the editor's own SVG export
+   of the page and a view per image item) serialises the document into a `<script
+   type="application/json">`, inlines `viewer.css` and `viewer.js`, and `write_html`
+   writes `<stem>.part.html` and moves it into place.
+4. In the browser `ND2V.mount` (or `mountFigure`) builds the DOM, decodes planes on demand
+   through a bounded cache (`PlaneStore`), composites with the Viewer's arithmetic, draws
+   the overlays per frame, and answers the strips, the LUTs, the keyboard and the hover.
+
+read next: CON-30 (2 min) · WF-10 (2 min) · MANUAL §11

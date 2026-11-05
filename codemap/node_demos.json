@@ -75,6 +75,14 @@
         "Format auto with no extension: the shared table as CSV, a pixel table as Parquet."
       ]
     },
+    "io.write_html": {
+      "kind": "guide",
+      "features": [
+        "Writes the Dataset as ONE standalone .html any browser opens with no server: the frames embedded, the Viewer's strips, channel LUTs, overlays, hover readout and scale bar rebuilt in the page — and passes the Dataset on.",
+        "Frames / Positions / Channels (`0-99:3`, `5,9,12`, `last`), Z (every plane or one projection) and Max px decide the file; Max file MB is the cap past which the node refuses with the numbers instead of writing a page a browser cannot open.",
+        "The same page comes from the Viewer's → HTML button and from a figure page's Export ▾ → Interactive HTML, where every image item is live."
+      ]
+    },
     "io.write_figure": {
       "kind": "guide",
       "features": [

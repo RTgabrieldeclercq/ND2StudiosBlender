@@ -915,6 +915,8 @@ class MainWindow(QMainWindow):
             "request_changed": part(self._on_view_request, viewer=v),
             # Capture view → page (V5.00 step 5): what this viewer shows, as a figure item
             "capture_page": part(self.capture_view_to_page, viewer=v),
+            # → HTML (2026-11-05): what this viewer shows, as a standalone interactive page
+            "export_html": part(self.export_viewer_html, viewer=v),
             "selection_changed": part(self._on_frame_selection, viewer=v),
             "region_changed": part(self._on_region_changed, viewer=v),
             "iteration_changed": part(self._on_iteration_changed, viewer=v),
@@ -1859,6 +1861,45 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"captured the view as {iid} on {ws.pages[fig_pid].name}",
                                      6000)
         return iid
+
+    def export_viewer_html(self, viewer: Optional[ViewerPanel] = None,
+                           options: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """*→ HTML* (2026-11-05): write what ``viewer`` (default: the active one) shows as
+        a standalone interactive page — its channels, windows, colours, overlays and frame
+        — after a dialog for the file, the pixel budget, the frames and the planes.
+        ``options`` (the probe's) skips the dialog. Returns the path written, or ``None``
+        with a status message saying why."""
+        from nodelab_v2 import html_export as HX
+        v = viewer if viewer is not None else self._active_viewer()
+        full = self._binding_full(v) if v is not None else None
+        if v is None or full is None or getattr(v, "_dataset", None) is None:
+            self.statusBar().showMessage("→ HTML: the Viewer shows nothing yet")
+            return None
+        m, t, z, _c = v.coords()
+        ax = v._dataset.axes
+        if options is None:
+            dlg = HX.HtmlExportDialog(self, n_t=int(ax.t), n_z=int(ax.z), cur_t=int(t),
+                                      cur_z=int(z), suggested=HX.default_name(full))
+            if dlg.exec() != QDialog.Accepted:
+                return None
+            options = dlg.options()
+        path = str(options.get("path") or "").strip()
+        if not path:
+            self.statusBar().showMessage("→ HTML: no file chosen")
+            return None
+        prov = {"node": full, "app": f"{PRODUCT} {APP_VERSION}",
+                "workspace": str(getattr(self.workspace, "path", "") or "")}
+        try:
+            out = HX.export_viewer_html(
+                v, path, title=full, node_id=full, max_px=int(options.get("max_px", 1024)),
+                t_frames=options.get("t_frames"), z=options.get("z", "all"),
+                overlays=bool(options.get("overlays", True)),
+                budget_mb=float(options.get("budget_mb", 250.0)), provenance=prov)
+        except Exception as exc:               # noqa: BLE001 — told, never raised into Qt
+            self.statusBar().showMessage(f"→ HTML failed: {exc}", 12000)
+            return None
+        self.statusBar().showMessage(f"interactive view written: {out}", 8000)
+        return out
 
     def _figure_editors(self) -> List[FigureEditorPanel]:
         return [c.figure for c in self.canvases() if getattr(c, "figure", None) is not None]

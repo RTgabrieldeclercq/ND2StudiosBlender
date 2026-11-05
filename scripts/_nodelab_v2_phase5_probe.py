@@ -675,9 +675,29 @@ def _probe_figure_editor(win, app) -> None:
         and panel0["display"], panel0
     assert win.movie_editor.bound() == mid and ws.active == mpage.id
     assert len(an.figure.items) == n_before + 1
+    # → HTML (2026-11-05): the Viewer's view as a standalone page (no dialog: options given),
+    # then the figure page as an interactive page — its image live, its chart hoverable
+    win._show_page(c, pids["process"])
+    app.processEvents()
+    assert win.viewer.has_image()
+    hv = win.export_viewer_html(options={"path": _os.path.join(tmp, "view.html"), "max_px": 256,
+                                         "t_frames": None, "z": "all", "overlays": True,
+                                         "budget_mb": 50})
+    assert hv and _os.path.exists(hv), hv
+    with open(hv, encoding="utf8") as f:
+        vh = f.read()
+    assert "ND2V.mount(" in vh and '"format":"nd2studios-htmlview/1"' in vh \
+        and '"labels":{' in vh and 'src="http' not in vh and 'href="http' not in vh, len(vh)
     win._show_page(c, pids["analyze"])
     app.processEvents()
     assert ed.bound() == pids["analyze"]
+    assert wait(lambda: not ed.busy(), 60)
+    fh = ed.export_html(_os.path.join(tmp, "fig.html"), budget_mb=50)
+    with open(fh, encoding="utf8") as f:
+        vf = f.read()
+    assert "ND2V.mountFigure(" in vf and "<svg" in vf and '"views":{' in vf \
+        and f'"{iid}":{{"rect_mm"' in vf and '"charts":{' in vf and '"links":' in vf, len(vf)
+    assert wait(lambda: not ed.busy(), 60)
     win._show_page(c, pids["input"])
     app.processEvents()
     _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback

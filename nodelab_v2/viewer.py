@@ -1074,6 +1074,8 @@ class ViewerPanel(QWidget):
     #: *Capture view → page* (V5.00 step 5): the window places what this Viewer shows on
     #: the figure page.
     capture_page = Signal()
+    #: → HTML (2026-11-05): write what this Viewer shows as a standalone interactive page
+    export_html = Signal()
     #: the M/T/Z picks changed — the window re-scopes the runner and re-pulls.
     selection_changed = Signal()
     #: the troubleshooting REGION box was dragged (or cleared): what a scoped pull runs
@@ -1397,6 +1399,13 @@ class ViewerPanel(QWidget):
                                   "— as an image on the figure page")
         self._page_btn.clicked.connect(lambda _=False: self.capture_page.emit())
         tools.addWidget(self._page_btn)
+        self._html_btn = QPushButton("→ HTML")
+        self._html_btn.setCursor(Qt.PointingHandCursor)
+        self._html_btn.setToolTip("Export an interactive HTML view (2026-11-05): one file "
+                                  "that opens in any browser with these channels, windows "
+                                  "and overlays, and its own strips, LUTs and hover readout")
+        self._html_btn.clicked.connect(lambda _=False: self.export_html.emit())
+        tools.addWidget(self._html_btn)
         tools.addWidget(self._split_btn)
         # ONE overlay control: the popup owns every domain's look (and its on/off), so the
         # strip no longer grows a checkbox per domain as domains are added.
