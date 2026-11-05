@@ -54,6 +54,7 @@ user's task first and "sync later" — the later merge is exactly the thing this
 | PR #N open | Tell the user. If the user's task overlaps the PR's files (`git fetch origin pull/N/head:pr-N && git diff --stat origin/Blender...pr-N`), stop and ask whether to build on the PR branch or wait for the merge. If it does not overlap, continue and say so. |
 | commits lack a worklog entry | Phase 3 below, before anything new. |
 | identity is the lab default | Ask the user for their name once and run `git config user.name "<Name>"`. Do not guess it. |
+| fetch FAILED with `SSL peer certificate or SSH remote key was not OK` | An antivirus that scans TLS (Norton Web/Mail Shield on Gabriel's machine) re-signs every HTTPS connection with its own root. Windows trusts that root; git's bundled OpenSSL CA file does not. The tell: `curl.exe -I https://github.com` succeeds while `git fetch` fails. Fix once per machine: `git config --global http.sslBackend schannel`, which makes git use the Windows certificate store. Never `http.sslVerify false`. |
 
 After a rebase that pulled in code, **run the gates** (Phase 3 list) before editing. A
 green gate after integration is the only proof the merge did not silently break something.
@@ -121,10 +122,16 @@ Never use git's `union` merge driver on Python. Never `--force` push `Blender`.
 4. **Rebase and push.** `git fetch origin && git rebase origin/Blender`, re-run the gates
    if anything came in, then `git push -u origin <topic>`.
 
-5. **Open the PR.** There is no `gh` on these machines. Give the user the compare URL:
+5. **Open the PR.** With `gh` installed and `gh auth status` green (true on Gabriel's
+   machine since 2026-11-05), create it from the worklog entry:
+   `gh pr create -R RTgabrieldeclercq/ND2StudiosBlender --base Blender --head <topic> --title "<commit subject>" --body-file <What+Why>`.
+   A branch stacked on another branch takes that branch as `--base`, so each PR shows only
+   its own commits; GitHub retargets it to `Blender` when the one below merges. Without
+   `gh`, give the user the compare URL:
    `https://github.com/RTgabrieldeclercq/ND2StudiosBlender/compare/Blender...<topic>?expand=1`
    PR body = the worklog entry's What and Why, pasted. The other person's next sync check
-   will list it as `PR #N OPEN`.
+   lists it as open. PRs for the branch you are on, or for branches below it in your own
+   stack, are listed but are not an action.
 
 ## Phase 4 — the reply
 

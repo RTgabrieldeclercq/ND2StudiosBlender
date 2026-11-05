@@ -12,8 +12,8 @@
 | first-party import edges | 2196 |
 | LOC — `nodegraph/` | 139,011 |
 | LOC — `nodelab_v2/` | 71,407 |
-| LOC — `scripts/` | 23,300 |
-| map fingerprint | `47a3a9a5376654987ed08c6f62fae00e` |
+| LOC — `scripts/` | 23,378 |
+| map fingerprint | `1052daa9d52ccf91f946828942a48e3e` |
 | gates last verified green | **2026-10-07** |
 
 `gates last verified green` moves only when a human or agent passes

@@ -12,7 +12,9 @@ What it reports, in order:
   2. whether the branch is the shared integration branch (editing it directly is the
      thing this repo's team-sync skill forbids)
   3. the fetch result, and ahead/behind against origin/<integration> and origin/<branch>
-  4. open pull-request heads on origin and whether each is already merged
+  4. the pull requests that are OPEN on GitHub (asked through `gh` or the REST API; when
+     neither answers, the refs/pull/*/head listing, which cannot tell a closed PR from an
+     open one — it says so)
   5. incoming commits and whether they touch the files that always conflict
   6. the dirty working tree
   7. commits on this branch with no worklog entry under CodeLog/Updates/worklog/
@@ -20,10 +22,13 @@ What it reports, in order:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import urllib.request
 
 INTEGRATION_BRANCH = "Blender"
 WORKLOG_DIR = "CodeLog/Updates/worklog"
@@ -70,6 +75,56 @@ def is_ancestor(a: str, b: str) -> bool:
     return subprocess.run(
         ["git", "merge-base", "--is-ancestor", a, b], cwd=ROOT, capture_output=True
     ).returncode == 0
+
+
+def github_slug(remote_url: str) -> tuple[str, str] | None:
+    """``("owner", "repo")`` from an https or ssh GitHub remote URL, else None."""
+    m = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", remote_url.strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def open_prs(remote_url: str, timeout: int = 15) -> list[tuple[int, str, str, str]] | None:
+    """The pull requests that are OPEN on GitHub: ``(number, head sha, head branch, title)``.
+
+    GitHub keeps ``refs/pull/N/head`` for closed and merged PRs too, so a ref listing cannot
+    tell an open PR from a closed one (PR #1, closed unmerged, read as OPEN that way and
+    put an action in every session's verdict). Ask GitHub instead: ``gh pr list`` when the
+    CLI is installed and logged in (sees a private repo), else the REST API (a public repo,
+    or a ``GH_TOKEN`` / ``GITHUB_TOKEN`` in the environment). ``None`` when neither
+    answered, so the caller falls back to the refs and says so."""
+    slug = github_slug(remote_url)
+    if not slug:
+        return None
+    owner, repo = slug
+    gh = shutil.which("gh")
+    if gh:
+        try:
+            r = subprocess.run(
+                [gh, "pr", "list", "-R", f"{owner}/{repo}", "--state", "open", "--limit", "100",
+                 "--json", "number,headRefOid,headRefName,title"],
+                cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout,
+                env={**os.environ, "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"},
+            )
+            if r.returncode == 0:
+                return [(int(p["number"]), p["headRefOid"], p["headRefName"], p.get("title") or "")
+                        for p in json.loads(r.stdout or "[]")]
+        except Exception:  # noqa: BLE001
+            pass
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=100",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "nd2studios-sync-check"},
+    )
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+        return [(int(p["number"]), p["head"]["sha"], p["head"]["ref"], p.get("title") or "")
+                for p in data]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def main(argv: list[str]) -> int:
@@ -155,27 +210,50 @@ def main(argv: list[str]) -> int:
 
     # 5. open pull requests -------------------------------------------------------------
     say("")
-    say("pull requests on origin:")
-    try:
-        prs = git("ls-remote", "origin", "refs/pull/*/head", timeout=45)
-    except Exception:  # noqa: BLE001
-        prs = ""
-    pr_rows = []
-    for row in prs.splitlines():
-        m = re.match(r"^([0-9a-f]+)\s+refs/pull/(\d+)/head$", row.strip())
-        if m:
-            pr_rows.append((int(m.group(2)), m.group(1)))
-    if not pr_rows:
-        say("  none visible" if fetched else "  unknown (fetch failed)")
-    for num, sha in sorted(pr_rows):
-        merged = ref_exists(integ_remote) and is_ancestor(sha, integ_remote)
-        state = "merged into " + INTEGRATION_BRANCH if merged else "OPEN / not yet merged"
-        say(f"  PR #{num}  {sha[:8]}  {state}")
-        if not merged:
-            actions.append(
-                f"PR #{num} is open: review/merge it on GitHub before starting work that "
-                f"may overlap, or pull its head to look: git fetch origin pull/{num}/head:pr-{num}"
-            )
+    live = open_prs(git("remote", "get-url", "origin"))
+    open_rows: list[tuple[int, str, str, str]] = []      # (number, sha, head branch, title)
+    if live is not None:
+        say("pull requests OPEN on GitHub:")
+        open_rows = sorted(live)
+        if not open_rows:
+            say("  none")
+    else:
+        say("pull requests on origin (refs/pull/*/head — GitHub did not answer, and a CLOSED "
+            "but unmerged PR looks open here):")
+        try:
+            prs = git("ls-remote", "origin", "refs/pull/*/head", timeout=45)
+        except Exception:  # noqa: BLE001
+            prs = ""
+        pr_rows = []
+        for row in prs.splitlines():
+            m = re.match(r"^([0-9a-f]+)\s+refs/pull/(\d+)/head$", row.strip())
+            if m:
+                pr_rows.append((int(m.group(2)), m.group(1)))
+        if not pr_rows:
+            say("  none visible" if fetched else "  unknown (fetch failed)")
+        for num, sha in sorted(pr_rows):
+            if ref_exists(integ_remote) and is_ancestor(sha, integ_remote):
+                say(f"  PR #{num}  {sha[:8]}  merged into {INTEGRATION_BRANCH}")
+            else:
+                open_rows.append((num, sha, "", ""))
+    others: list[int] = []
+    for num, sha, head, title in open_rows:
+        # a PR for the branch you are on, or for a branch below it in your own stack, is
+        # yours to merge in order — it is listed, but it is not an action before you edit
+        where = ("this branch" if head == branch
+                 else "in your stack" if is_ancestor(sha, "HEAD")
+                 else "OPEN / not yet merged")
+        label = "  ".join(x for x in (head, title) if x)
+        say(f"  PR #{num}  {sha[:8]}  {label}  [{where}]" if label
+            else f"  PR #{num}  {sha[:8]}  [{where}]")
+        if where == "OPEN / not yet merged":
+            others.append(num)
+    if others:
+        nums = ", ".join(f"#{n}" for n in others)
+        actions.append(
+            f"PR {nums} open: review/merge on GitHub before starting work that may overlap, "
+            f"or pull a head to look: git fetch origin pull/<N>/head:pr-<N>"
+        )
 
     # 6. incoming commits + hotspot touches ----------------------------------------------
     if ref_exists(integ_remote):

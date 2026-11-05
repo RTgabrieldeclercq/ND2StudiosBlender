@@ -44,3 +44,5 @@ GitHub reports no conflicts with `Blender`.
 - [x] `python scripts/_catalog_snapshot.py` -> CATALOG IDENTICAL — 145 ops
 - [x] `python scripts/_codemap.py` -> CODEMAP CURRENT
 - [x] `python scripts/_sync_check.py` -> IN SYNC (ahead of origin/Blender, behind 0)
+
+The second merge regenerated the codemap on the merged tree (fingerprint in `codemap/STATE.md`).
