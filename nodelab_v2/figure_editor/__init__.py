@@ -17,4 +17,4 @@ export is vector where the source is vector.
 from __future__ import annotations
 
 __all__ = ["scene", "items", "render", "links", "panel", "sources", "properties",
-           "start_card"]
+           "start_card", "widgets", "docks", "preview"]

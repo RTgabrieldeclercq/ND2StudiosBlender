@@ -337,7 +337,10 @@ read next: CON-29 (2 min) · INV-18 (1 min) · MANUAL §2c
 anchors: sym:nodegraph.htmlview.document.build_view, sym:nodegraph.htmlview.page.write_html, sym:nodelab_v2.html_export.viewer_state, sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_html
 
 1. The Dataset is in hand: the node's input (`io.write_html`), the Viewer's `_dataset`
-   (→ HTML), or a figure item's payload (Export ▾ → Interactive HTML). The caller gathers
+   (→ HTML), or a figure item's payload (the figure toolbar's Interactive HTML, also
+   Export ▾; **Preview** is the same `export_html` into a temporary file at `PREVIEW_PX` /
+   `PREVIEW_MB`, shown in the page's place by `figure_editor.preview.HtmlPreview`, a
+   QtWebEngine view, or opened in the browser without one). The caller gathers
    the state the page starts in — the node from its sockets, the Viewer from its channel
    windows, colours and `OverlaySettings` (`html_export.viewer_state`), the figure from the
    item's `Rendered` (windows, colours, gammas) and its layers' looks — plus the frames to

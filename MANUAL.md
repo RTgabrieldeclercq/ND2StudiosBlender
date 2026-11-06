@@ -445,6 +445,26 @@ Since V5.00 an **Analysis** page is not a node canvas: it opens the **Figure Edi
 journal-sized page you place things on. What it can show is whatever the pages before it
 *publish* as Page Outputs, read from their metadata before anything is computed.
 
+**The Analysis workspace** (2026-11-05). Showing an Analysis page gives the page the whole
+centre: the docked **Viewer**, **Playback** and **Channels** panels step aside (hidden, not
+closed — a floating one stays where you put it), the **Nodes** panel on the left shows the
+figure's **Sources**, and the **Properties** panel on the right shows the **Figure widgets**
+palette over the selected item's properties — the figure's own versions of the node
+palette and the parameter form. Switch to any graph page and everything comes back at the
+size it had; View ▸ Reset layout does the same. (Ctrl+Space, the maximized canvas, is the
+graph page's version of the same idea.) The **Figure widgets** are one button per thing the
+page can hold — *Images*: Image, Montage, **Zoom-in** (a popout of the selected image's
+centre, magnified beside it, with a dashed box on the parent and leader lines that follow
+it; Alt-drag a box on an image to choose the region yourself), Twin; *Annotate*: Text,
+Letter, Scale bar, Box, Line, Arrow, Measure; *Keys*: Colour bar, Histogram, Legend; *Data*:
+Chart, Table, Data block. A button is enabled when what it needs is there — an image
+selected on the page, an image or a table published upstream — and its tooltip says why
+otherwise; Image, Montage, Chart, Table and Data block open a menu when several sources
+qualify. A widget placed from the palette is exactly the item a drag, the Properties form
+or a template would have made. The toolbar's **Interactive HTML** writes the page as one
+self-contained interactive file and **Preview** shows that file in the page's place — item
+9 below.
+
 1. **Start.** An empty Analysis page asks *What do you want to make?* — Overlay, Montage,
    Plot, Plot + Overlay (Table and Movie arrive later). Each card says what it needs and
    what the upstream pages carry. Pick one, or press one of the image sources listed under
@@ -456,8 +476,9 @@ journal-sized page you place things on. What it can show is whatever the pages b
    upstream is greyed, its tooltip saying what it needs). Your own templates live in
    `~/.nd2studios/figure_recipes/` (`panel.save_as_recipe`) and shadow a built-in of the
    same name.
-2. **Sources** (left) lists every Page Output of the pages before this one, grouped by
-   page, with what each carries: the image and its channels, the label / point / track
+2. **Sources** — in the **Nodes** panel on the left while the Analysis page is shown —
+   lists every Page Output of the pages before this one, grouped by page, with what each
+   carries: the image and its channels, the label / point / track
    tables and their columns, the measured fields. **Drag a source onto the page** to place
    it as an image (double-click does the same); **drag a table or a column onto an image**
    to draw it over that image as a layer.
@@ -471,8 +492,9 @@ journal-sized page you place things on. What it can show is whatever the pages b
    over the same cells). **Share display range** on a multi-selection gives every image one
    window per channel. The page **cursor** (M / T / Z in the toolbar) drives every image
    whose frame reads *page cursor*.
-5. **Properties** (right) edits the page (preset size, dpi, font, type size, palette, dark
-   page, snap grid, letter style) or the selection: an image's source, frame, flips, scale
+5. **Properties** — the **Properties** panel on the right, under the Figure widgets —
+   edits the page (preset size, dpi, font, type size, palette, dark page, snap grid, letter
+   style) or the selection: an image's source, frame, flips, scale
    bar, time stamp, channel labels, its channels (colour, window: auto percentiles / the
    Viewer's window / typed / shared, gamma, label) and its layers (labels outline / fill /
    ids, points, tracks with a tail, a field column as a heat map with series / frame /
@@ -518,10 +540,18 @@ journal-sized page you place things on. What it can show is whatever the pages b
    page black is lifted and a grey ramp re-spaced, so every series stays visible.
 9. **Export ▾** writes PNG / TIFF at the page's dpi, SVG (text stays text, outlines stay
    paths) or PDF (fonts embedded). The preview and the export are one set of lines.
-   **Interactive HTML** (2026-11-05) writes the page as one self-contained file with every
-   image item **live** — the reader scrubs T / Z / M, re-windows, toggles the layers and
-   reads pixels inside the page's layout, a popout with its parent — and every chart
-   answering a hover with its data ([§11](#exporting-an-interactive-html-view--export-html--html-and-export--interactive-html-2026-11-05)).
+   **Interactive HTML** (2026-11-05; the toolbar's own button, also under Export ▾) writes
+   the page as one self-contained file with every image item **live** — the reader scrubs
+   T / Z / M, re-windows, toggles the layers and reads pixels inside the page's layout, a
+   popout with its parent — and every chart answering a hover with its data
+   ([§11](#exporting-an-interactive-html-view--export-html--html-and-export--interactive-html-2026-11-05)).
+   **Preview** beside it builds that export at a preview budget (512 px per image, 150 MB
+   in all — a few seconds) and shows it **in the page's place**, so you scrub and re-window
+   exactly what a reader will get; the bar above it says when it was built and goes amber
+   when the page is edited under it (**↻ Rebuild**), **Open in browser** shows the same
+   file there, **Save as…** writes the export at the page's full resolution, ✕ returns to
+   the page. The preview is a QtWebEngine view; without QtWebEngine (or with
+   `NODELAB_WEBVIEW=0`) the file opens in your browser instead and the page stays.
    **Bundle** writes the PNG and an SVG plus, beside them, `<stem>.figure.json` (the
    document), `<stem>.legend.txt` (the generated legend paragraph — objective, pixel
    size, z step, interval, channels, scale bars, display ranges, what each panel shows),
@@ -2484,13 +2514,16 @@ Three ways in, one implementation (`nodegraph.htmlview`):
 * **The Viewer's → HTML button** ([§7](#channels-and-contrast)) — what you are looking at,
   with the windows, colours and overlay settings you set, after a dialog for the file, the
   budget, the frames and the planes.
-* **Export ▾ → Interactive HTML on a figure page** ([§2c](#2c-figures--the-analysis-page-is-a-figure-v500))
+* **Interactive HTML on a figure page** (the figure toolbar's button, also Export ▾ →
+  Interactive HTML; [§2c](#2c-figures--the-analysis-page-is-a-figure-v500))
   — the page as drawn (the editor's own SVG export) with **every image item live**: each
   scrubs its own T / Z / M, re-windows, toggles its layers and reads pixels inside the page's
   layout; a popout scrubs with its parent, twins and cursor followers scrub together; a
   chart answers a hover with its data; ⚙ on a panel opens its full controls. Montages,
   pictures, tables and the decor stay as drawn. The headless renderer writes the same page
-  from `--out figure.html`.
+  from `--out figure.html`. **Preview** beside the button shows the same export in the
+  page's place inside the app, at a preview budget, with ↻ Rebuild, Open in browser and
+  Save as… ([§2c](#2c-figures--the-analysis-page-is-a-figure-v500) item 9).
 
 **How big.** A plane costs about its 16-bit size after PNG compression — typically a third
 to a half of it for a fluorescence frame. Two 1024 px channels over 200 frames come to
@@ -4587,6 +4620,7 @@ ones; and a generated manifest passing the same tier-1 + tier-2 gate `--check-re
 | **"Page Input is not bound to an upstream Output"** | its Source names no Output a page before it offers — the Output was renamed or deleted, its page was deleted, or the source page comes later in the order. Pick the source again in Properties, or click *Bind to …* in the Ready-to-run block, which lists every unbound Input; the card itself reads `Input · (unbound)` in red |
 | **I loaded an image and the canvas jumped to another page** | By design (V4.00): a loaded image always lands on the **Image Input** page — the canvas switches there — and is published as a Page Output named after the file. Go back to the page you were on: a new downstream page starts with a Page Input reading it, and an existing empty page gets one the first time you open it |
 | **A Refinement page is empty and I cannot get the image into it** | Load the image first (it is published on Image Input), then open the page — it gets a bound Page Input; or place a Page Input from the palette's **Pages** band, which binds to the nearest named Output. Nothing to bind to yet? *Go to Image Input* under its Source menu |
+| **The Viewer disappeared when I opened the Analysis page** | By design (2026-11-05, the Analysis workspace): on a figure page the docked Viewer, Playback and Channels step aside so the page has the whole centre, the Nodes panel shows the figure's Sources and the Properties panel the Figure widgets over the selection's properties. Show any graph page and they come back at their old size. To keep a Viewer beside the figure, pop it out (⇱ on its title bar) before opening the page — a floating Viewer stays |
 | **The start card covers my page / will not go away** | Its **✕** (top right) or *Start empty* hides it for that page; File → New brings the cards back. On a Refinement, Processing or Analysis page it is a banner along the bottom edge, below the page's Page Input |
 | **I lose track of my pages** | Use the **tabs** along the top of the canvas — a row of page kinds, and under it the pages of the kind shown (drag to reorder, ✕ to close a tab you do not need on screen) — and the **Pages** panel (View ▸ Panels ▸ Pages): every page by kind, each with its nodes in data-flow order and its Outputs highlighted by variable name |
 | **A wire is tinted by a channel but its sockets just say `data`** | Fixed (V4.00 step 11g): a stream carrying one (or some) of the file's channels names it on every Dataset socket downstream — `Cy5` on a generic socket, `raw · DAPI` on a named one (§4 *A stream knows where it came from*). A full bundle keeps `data` / `out`; a graph saved by an older build regains the names on its first pull |

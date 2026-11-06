@@ -1596,6 +1596,9 @@
 {"dst":"nodegraph.tables","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.charts_data"}
 {"dst":"nodegraph.units","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.charts_data"}
 {"dst":"nodelab_v2.figure_editor.items","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.charts_data"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.docks"}
+{"dst":"nodelab_v2.figure_editor.widgets","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.docks"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.docks"}
 {"dst":"nodegraph.catalog._shared.overlay_math","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.items"}
 {"dst":"nodegraph.figure","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.items"}
 {"dst":"nodegraph.figure.charts","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.items"}
@@ -1623,6 +1626,7 @@
 {"dst":"nodelab_v2.figure_editor.fonts","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.items","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.links","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodelab_v2.figure_editor.preview","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.properties","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.render","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.figure_editor.scene","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
@@ -1632,6 +1636,8 @@
 {"dst":"nodelab_v2.overlay_geometry","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.overlays","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.panel"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.preview"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.preview"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.properties"}
 {"dst":"nodegraph.figure.layout","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.properties"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.properties"}
@@ -1651,6 +1657,11 @@
 {"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.start_card"}
 {"dst":"nodelab_v2.figure_recipes","k":"imp","lazy":true,"src":"nodelab_v2.figure_editor.start_card"}
 {"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.start_card"}
+{"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.widgets"}
+{"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.widgets"}
+{"dst":"nodelab_v2","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.widgets"}
+{"dst":"nodelab_v2.figure_editor.sources","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.widgets"}
+{"dst":"nodelab_v2.theme","k":"imp","lazy":false,"src":"nodelab_v2.figure_editor.widgets"}
 {"dst":"nodegraph.figure","k":"imp","lazy":false,"src":"nodelab_v2.figure_recipes"}
 {"dst":"nodegraph.figure.schema","k":"imp","lazy":false,"src":"nodelab_v2.figure_recipes"}
 {"dst":"nodegraph.dataset","k":"imp","lazy":true,"src":"nodelab_v2.figure_render"}
@@ -1968,6 +1979,7 @@
 {"dst":"nodelab_v2.demo_window","k":"imp","lazy":true,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.document","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.export","k":"imp","lazy":true,"src":"nodelab_v2.window"}
+{"dst":"nodelab_v2.figure_editor.docks","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.figure_editor.panel","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.frame_item","k":"imp","lazy":false,"src":"nodelab_v2.window"}
 {"dst":"nodelab_v2.framestrip","k":"imp","lazy":false,"src":"nodelab_v2.window"}

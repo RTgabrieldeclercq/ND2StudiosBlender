@@ -33,7 +33,7 @@ import nodegraph.nodes  # noqa: F401 — registers the node catalog into NODES
 from nodegraph import hotreload
 from collections import OrderedDict
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QInputDialog, QLabel, QMainWindow, QMessageBox,
@@ -47,6 +47,7 @@ from nodelab_v2 import theme as T
 from nodelab_v2.console import ConsolePanel
 from nodelab_v2.version import PRODUCT, __version__ as APP_VERSION
 from nodelab_v2.canvas import CanvasPanel, kind_icon
+from nodelab_v2.figure_editor.docks import FigureSidePanel, ModeStack, SourcesHost
 from nodelab_v2.figure_editor.panel import FigureEditorPanel
 from nodelab_v2.workspace import (FREE as FREE_KIND, Workspace, build_example, kind_label,
                                   local_ids, qualify, split_run_id)
@@ -449,6 +450,12 @@ class _FigureHost:
     def app_version(self) -> str:
         return f"{PRODUCT} {APP_VERSION}"
 
+    def open_url(self, path: str) -> None:
+        """A file in the system browser: the preview's *Open in browser*, and the preview
+        itself where QtWebEngine is missing."""
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     def make_movie(self, page_id: str, movie: Mapping[str, Any]) -> Optional[str]:
         """Page → Movie (V5.00 step 7): a Free page ``movie["name"]`` holding a Page Input
         of ``movie["source"]`` wired into an Export Movie whose timeline is the image's
@@ -605,6 +612,19 @@ class MainWindow(QMainWindow):
         self.palette.refresh_requested.connect(self.refresh_node_list)
         self.palette.demo_requested.connect(self.open_node_demo)
         self.inspector = InspectorPanel()
+        # the Analysis workspace (2026-11-05): on a figure page the Nodes dock shows the
+        # figure's Sources and the Properties dock the Figure widgets over the selection's
+        # properties — each dock is a two-faced stack, the palette and the inspector its
+        # first face (so `shell.dock_of(self.palette)` still resolves); the docked Viewer,
+        # Playback and Channels step aside meanwhile (`_set_figure_mode`)
+        self.figure_side = FigureSidePanel()
+        self.figure_sources = SourcesHost()
+        self._props_stack = ModeStack(self.inspector, self.figure_side)
+        self._palette_stack = ModeStack(self.palette, self.figure_sources)
+        self._figure_mode = False
+        #: the docks the Analysis workspace hid, and their heights, for the way back
+        self._fig_hidden: List[Any] = []
+        self._fig_heights: Dict[str, int] = {}
         self.sheet = SpreadsheetPanel()
         # LabLink: whether this machine is serving the lab, and how to send work out to
         # another hub. Tabbed with Properties rather than given its own edge — it is
@@ -652,6 +672,7 @@ class MainWindow(QMainWindow):
         self.shell.changed.connect(self._prune_viewers)
         self.shell.changed.connect(self._prune_canvases)
         self._sync_viewer_controls()
+        self._sync_figure_mode()           # the Analysis workspace, if the active page is one
         self._console_dock = self.shell.docks_of("console")[0]
         self._movie_dock = self.shell.docks_of("movie")[0]
         self._lablink_dock = self.shell.docks_of("lablink")[0]
@@ -865,9 +886,9 @@ class MainWindow(QMainWindow):
             # above the Nodes palette: every page of the workspace (V4.00 step 11)
             PanelSpec("pages", "Pages", lambda: self.pages_panel, glyph="▤",
                       default_area=left),
-            PanelSpec("palette", "Nodes", lambda: self.palette, glyph="◫",
+            PanelSpec("palette", "Nodes", lambda: self._palette_stack, glyph="◫",
                       default_area=left),
-            PanelSpec("inspector", "Properties", lambda: self.inspector, glyph="☰",
+            PanelSpec("inspector", "Properties", lambda: self._props_stack, glyph="☰",
                       default_area=right, raise_default=True),
             PanelSpec("sheet", "Spreadsheet", lambda: self.sheet, glyph="▦",
                       default_area=right, tabify_with="inspector"),
@@ -894,6 +915,9 @@ class MainWindow(QMainWindow):
         """View ▸ Reset layout: every panel docked back where a fresh install has it."""
         if self._maximized:
             self.set_maximized(False)        # the mini-map's viewer goes home first
+        was_figure = self._figure_mode
+        if was_figure:
+            self._set_figure_mode(False)     # the hidden Viewer docks take part in the reset
         self.shell.reset_layout()
         # a fresh install shows ONE Viewer (the first); a further one stays on screen only
         # when it has a picture to show, and every one is re-sized on its next appearance
@@ -901,6 +925,8 @@ class MainWindow(QMainWindow):
             d._sized = False
             d.setVisible(i == 0 or d.panel.has_image())
         self._apply_default_sizes()
+        if was_figure:
+            self._sync_figure_mode()         # …and step aside again for the figure page
         self.statusBar().showMessage("layout reset — every panel is back in its default place")
 
     # ── viewers (V4.00 step 4) ────────────────────────────────────────────────
@@ -1192,6 +1218,8 @@ class MainWindow(QMainWindow):
             self._preview_prev = None
         self._max_hidden = [d for d in self._max_hidden
                             if self.shell.docks.get(d.objectName()) is d]
+        self._fig_hidden = [d for d in self._fig_hidden
+                            if self.shell.docks.get(d.objectName()) is d]
         # a closed Viewer's control sections go with it
         self.playback_panel.prune(alive)
         self.channels_panel.prune(alive)
@@ -1223,6 +1251,10 @@ class MainWindow(QMainWindow):
                 self._max_canvas = None
             self._activate_canvas(self._main_canvas)
         self._sync_canvas_accents()
+        alive = self._figure_editors()         # a closed canvas's figure panels go with it
+        self.figure_side.forget_dead(alive)
+        self.figure_sources.forget_dead(alive)
+        self._sync_figure_mode()
 
     # ── pages and canvases (V4.00 step 5) ─────────────────────────────────────
     #
@@ -1800,7 +1832,7 @@ class MainWindow(QMainWindow):
     # ── the Figure Editor (V5.00 step 3) ──────────────────────────────────────
     def make_figure_editor(self, canvas: CanvasPanel) -> FigureEditorPanel:
         """A canvas's Figure Editor — the factory :class:`CanvasPanel` calls."""
-        ed = FigureEditorPanel(_FigureHost(self))
+        ed = FigureEditorPanel(_FigureHost(self), side_panels=False)
         ed.view.pressed.connect(lambda c=canvas: self._activate_canvas(c))
         ed.selection_changed.connect(lambda: self.inspector.set_node(None))
         return ed
@@ -1808,6 +1840,75 @@ class MainWindow(QMainWindow):
     def page_is_figure(self, page_id: str) -> bool:
         page = self.workspace.pages.get(page_id or "")
         return page is not None and page.figure is not None
+
+    # ── the Analysis workspace (2026-11-05) ───────────────────────────────────
+    def _sync_figure_mode(self) -> None:
+        """The window's shape follows the canvas worked in. On a figure page the
+        **Analysis workspace** is up: the docked Viewer, Playback and Channels panels step
+        aside (hidden, not closed — a floating one stays where the user put it) so the
+        page owns the whole centre, the Nodes dock shows the figure's Sources and the
+        Properties dock the Figure widgets over the selection's properties. On a graph
+        page everything comes back at its old size. Idempotent and cheap: it runs on every
+        page or canvas switch."""
+        if not hasattr(self, "shell") or not hasattr(self, "figure_side"):
+            return
+        c = self._canvas
+        on = c.is_figure()
+        if on:
+            self.figure_side.show_editor(c.figure)
+            self.figure_sources.show_editor(c.figure)
+        self._set_figure_mode(on)
+
+    def _set_figure_mode(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._figure_mode:
+            return
+        if on and self._maximized:
+            self.set_maximized(False)        # the mini-map's viewer goes home first
+        self._figure_mode = on
+        self._props_stack.set_figure(on)
+        self._palette_stack.set_figure(on)
+        for name, text in (("inspector:0", "figure"), ("palette:0", "sources")):
+            d = self.shell.dock(name)
+            if d is not None:
+                d.set_binding_title(text if on else "")
+        if on:
+            docks = [d for d in (*self.shell.docks_of(VIEWER_KIND), *self._control_docks())
+                     if not d.isFloating() and not d.isHidden()]
+            self._fig_hidden = docks
+            # their heights: hiding every dock of an area collapses it, and showing them
+            # again would lay them out from their size hints instead of where they were
+            self._fig_heights = {d.objectName(): d.height() for d in docks}
+            for d in docks:
+                d.hide()
+            msg = ("Analysis workspace — the page has the centre; its sources are in the "
+                   "Nodes panel, the Figure widgets and the selection's properties on the "
+                   "right. The Viewer comes back on a graph page.")
+        else:
+            back = [d for d in self._fig_hidden if self.shell.docks.get(d.objectName()) is d]
+            for d in back:
+                if d.kind == VIEWER_KIND:
+                    self._show_viewer_dock(d)
+                else:
+                    d.show()
+            heights = self._fig_heights
+            sized = [d for d in back if d.objectName() in heights and not d.isFloating()
+                     and self.dockWidgetArea(d) in (Qt.TopDockWidgetArea,
+                                                    Qt.BottomDockWidgetArea)]
+            if sized:
+                hs = [heights[d.objectName()] for d in sized]
+                self.resizeDocks(sized, hs, Qt.Vertical)
+                QTimer.singleShot(0, lambda: self._resize_docks_alive(sized, hs))
+            self._fig_hidden, self._fig_heights = [], {}
+            msg = "graph page — the Viewer is back"
+        self.shell.sync_close_buttons()
+        self._sync_viewer_controls()
+        self.statusBar().showMessage(msg, 8000)
+
+    @property
+    def figure_mode(self) -> bool:
+        """Is the Analysis workspace up (the active canvas shows a figure page)?"""
+        return self._figure_mode
 
     def capture_view_to_page(self, viewer: Optional[ViewerPanel] = None) -> Optional[str]:
         """*Capture view → page* (V5.00 step 5): place what ``viewer`` (default: the active
@@ -2342,6 +2443,8 @@ class MainWindow(QMainWindow):
         if c is self._canvas and self.workspace.active != page_id \
                 and page_id in self.workspace.pages:
             self.workspace.set_active(page_id)
+        if c is self._canvas:
+            self._sync_figure_mode()
 
     def _on_canvas_maximize(self, c: CanvasPanel, on: bool) -> None:
         """A canvas's ⛶: it becomes the active canvas, then the window maximizes it."""
@@ -2435,6 +2538,7 @@ class MainWindow(QMainWindow):
             self.inspector.set_node(sel[0] if sel else None)
             self.scene.set_viewed(self._viewed)
             self._sync_solo()
+        self._sync_figure_mode()
 
     # ── chrome (G10) ─────────────────────────────────────────────────────────
     def _build_menus(self) -> None:
@@ -2870,7 +2974,8 @@ class MainWindow(QMainWindow):
         T.apply(mode)
         QApplication.instance().setPalette(T.palette())   # light mode gets the light palette
         self.setStyleSheet(_window_qss())
-        for panel in (self.palette, self.pages_panel, self.inspector, self.sheet, self.lablink,
+        for panel in (self.palette, self.pages_panel, self.inspector, self.figure_side,
+                      self.figure_sources, self.sheet, self.lablink,
                       self.console, self.movie_editor, self.playback_panel,
                       self.channels_panel, *self.viewers, *self.canvases()):
             panel.restyle()
@@ -3007,6 +3112,10 @@ class MainWindow(QMainWindow):
         if self._maximized and not d.isFloating():
             if d not in self._max_hidden:
                 self._max_hidden.append(d)     # back on screen with the docked layout
+            return
+        if self._figure_mode and not d.isFloating():
+            if d not in self._fig_hidden:
+                self._fig_hidden.append(d)     # back when a graph page returns
             return
         if d.isHidden():
             self._show_viewer_dock(d)
@@ -4573,6 +4682,8 @@ class MainWindow(QMainWindow):
                     # the docked layout is the one to remember: maximized, every viewer dock
                     # is hidden and the mini-map's own is empty
                     self.set_maximized(False)
+                if self._figure_mode:
+                    self._set_figure_mode(False)   # same: the Viewer docks are hidden under it
                 self.shell.save_layout()
             except Exception:                                # noqa: BLE001 — see above
                 pass
