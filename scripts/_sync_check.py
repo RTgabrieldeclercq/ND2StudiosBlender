@@ -277,7 +277,9 @@ def main(argv: list[str]) -> int:
 
     # 7. worklog coverage ----------------------------------------------------------------
     if ref_exists(integ_remote):
-        local_commits = git("log", "--format=%h %s", f"{integ_remote}..HEAD")
+        # --no-merges: GitHub's own merge commits (a PR merged on the site) carry no worklog
+        # and never will; nagging about them taught nobody anything (2026-11-05)
+        local_commits = git("log", "--no-merges", "--format=%h %s", f"{integ_remote}..HEAD")
         missing = []
         for row in local_commits.splitlines():
             sha = row.split()[0]

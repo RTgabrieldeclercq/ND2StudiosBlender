@@ -16,6 +16,10 @@ def run() -> int:
         from PySide6.QtGui import QSurfaceFormat
         from nodelab_v2.glview import default_surface_format
         QSurfaceFormat.setDefaultFormat(default_surface_format())
+    # the Figure Editor's Preview is a QtWebEngine view (nodelab_v2.figure_editor.preview):
+    # Chromium shares the GL context, which Qt must be told before the QApplication exists
+    from PySide6.QtCore import QCoreApplication, Qt
+    QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     app = QApplication.instance() or QApplication(sys.argv)
     win = MainWindow()
     if getattr(win, "_layout_restored", False):

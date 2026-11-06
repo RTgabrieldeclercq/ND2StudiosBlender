@@ -362,6 +362,20 @@ def _probe_figure_editor(win, app) -> None:
     app.processEvents()
     assert c.is_figure() and c.figure.bound() == pids["analyze"], (c.is_figure(), c.figure.bound())
     ed = c.figure
+    # the Analysis workspace (2026-11-05): the page owns the centre — the docked Viewer,
+    # Playback and Channels step aside — the Nodes dock shows the figure's Sources and the
+    # Properties dock the Figure widgets over the selection's properties
+    assert win._figure_mode and win.figure_mode, "figure mode is up on a figure page"
+    assert all(d.isHidden() for d in win.shell.docks_of("viewer") if not d.isFloating()) \
+        and all(d.isHidden() for d in win._control_docks() if not d.isFloating()), \
+        [(d.objectName(), d.isHidden()) for d in win.shell.docks_of("viewer")]
+    assert win._props_stack.currentWidget() is win.figure_side \
+        and win._palette_stack.currentWidget() is win.figure_sources
+    assert win.figure_side.props_stack.currentWidget() is ed.props \
+        and win.figure_sources.current() is ed.sources_panel
+    assert not ed.side_panels and ed.split.count() == 1 and ed.body.currentWidget() is ed.split
+    assert win.shell.dock("inspector:0").binding_text() == "figure" \
+        and win.shell.dock("palette:0").binding_text() == "sources"
     if _stop(1):
         return
     assert ed.start.isVisible(), "the start card shows on an empty figure page"
@@ -415,6 +429,32 @@ def _probe_figure_editor(win, app) -> None:
     assert r.geometry is not None and r.geometry.label_plane is not None \
         and int(r.geometry.label_plane.max()) >= 1, "the labels layer drew no raster"
 
+    # the Figure widgets palette (2026-11-05), in the Properties dock: Zoom-in needs an
+    # image selected, Text needs nothing, Image and Chart need a published source; a
+    # placed widget is the item the Properties form or a drag would have made
+    wdg = win.figure_side.widgets
+    assert wdg.editor() is ed
+    ed.select([])
+    app.processEvents()
+    assert not wdg.buttons["zoom"].isEnabled() and wdg.buttons["text"].isEnabled() \
+        and wdg.buttons["image"].isEnabled() and wdg.buttons["chart"].isEnabled() \
+        and not wdg.buttons["twin"].isEnabled(), \
+        {k: b.isEnabled() for k, b in wdg.buttons.items()}
+    assert "select an image" in wdg.buttons["zoom"].toolTip()
+    ed.select([iid])
+    app.processEvents()
+    assert wdg.buttons["zoom"].isEnabled() and wdg.selected_image() == iid
+    wz = wdg.place("zoom")
+    app.processEvents()
+    assert wz and any(ln.get("kind") == "zoom" and ln.get("child") == wz
+                      for ln in ed.document["links"]), wz
+    wt = wdg.place("text")
+    assert wt and _FS.item(ed.document, wt)["kind"] == "text"
+    ed.delete_items([wz, wt])
+    app.processEvents()
+    assert not any(ln.get("child") == wz for ln in ed.document["links"])
+    ed.select([iid])
+    app.processEvents()
     zid = ed.add_popout(iid, (0.25, 0.75, 0.25, 0.75))
     app.processEvents()
     assert [(cid, w) for cid, w, _b in ed._items[iid].zoom_boxes] == \
@@ -633,9 +673,14 @@ def _probe_figure_editor(win, app) -> None:
     win._show_page(c, pids["process"])
     app.processEvents()
     assert not c.is_figure() and ed.bound() is None, (c.is_figure(), ed.bound())
+    assert not win._figure_mode and not win.shell.docks_of("viewer")[0].isHidden() \
+        and win._props_stack.currentWidget() is win.inspector \
+        and win._palette_stack.currentWidget() is win.palette \
+        and win.shell.dock("inspector:0").binding_text() == ""
     win._show_page(c, pids["analyze"])
     app.processEvents()
     assert ed.bound() == pids["analyze"] and len(ed.document["items"]) == n_items
+    assert win._figure_mode and win.figure_side.props_stack.currentWidget() is ed.props
     assert wait(lambda: not ed.busy(), 60), "the render thread never went idle"
     # Capture view → page (step 5): the Viewer's frame, region and channels as an image
     win._show_page(c, pids["process"])
@@ -675,9 +720,41 @@ def _probe_figure_editor(win, app) -> None:
         and panel0["display"], panel0
     assert win.movie_editor.bound() == mid and ws.active == mpage.id
     assert len(an.figure.items) == n_before + 1
+    # → HTML (2026-11-05): the Viewer's view as a standalone page (no dialog: options given),
+    # then the figure page as an interactive page — its image live, its chart hoverable
+    win._show_page(c, pids["process"])
+    app.processEvents()
+    assert win.viewer.has_image()
+    hv = win.export_viewer_html(options={"path": _os.path.join(tmp, "view.html"), "max_px": 256,
+                                         "t_frames": None, "z": "all", "overlays": True,
+                                         "budget_mb": 50})
+    assert hv and _os.path.exists(hv), hv
+    with open(hv, encoding="utf8") as f:
+        vh = f.read()
+    assert "ND2V.mount(" in vh and '"format":"nd2studios-htmlview/1"' in vh \
+        and '"labels":{' in vh and 'src="http' not in vh and 'href="http' not in vh, len(vh)
     win._show_page(c, pids["analyze"])
     app.processEvents()
     assert ed.bound() == pids["analyze"]
+    assert wait(lambda: not ed.busy(), 60)
+    fh = ed.export_html(_os.path.join(tmp, "fig.html"), budget_mb=50)
+    with open(fh, encoding="utf8") as f:
+        vf = f.read()
+    assert "ND2V.mountFigure(" in vf and "<svg" in vf and '"views":{' in vf \
+        and f'"{iid}":{{"rect_mm"' in vf and '"charts":{' in vf and '"links":' in vf, len(vf)
+    assert wait(lambda: not ed.busy(), 60)
+    # Preview (2026-11-05): the page as its interactive export, built into a temporary
+    # file and shown in the page's place — here without QtWebEngine, so the browser
+    # fallback: the host is asked to open the file and the page stays
+    opened = []
+    ed._host.open_url = lambda p: opened.append(p)
+    _os.environ["NODELAB_WEBVIEW"] = "0"
+    pv = ed.set_preview(True, budget_mb=50)
+    assert pv and _os.path.exists(pv) and opened == [pv] and not ed.preview_active() \
+        and not ed._preview_btn.isChecked() and ed.preview_path == pv, (pv, opened)
+    with open(pv, encoding="utf8") as f:
+        assert "ND2V.mountFigure(" in f.read()
+    assert wait(lambda: not ed.busy(), 60)
     win._show_page(c, pids["input"])
     app.processEvents()
     _RN._SYNTH_AXES = AxisSizes(m=1, t=1, z=5, c=2, y=512, x=512)   # restore the fallback
@@ -698,7 +775,11 @@ def _probe_figure_editor(win, app) -> None:
         "Viewer's frame and channels as an image; a template places its panels bound to the "
         "labelled output; Ctrl+A / Esc / Ctrl+D through the key actions; the report writes "
         "HTML with a caption per panel and a PDF; Movie… puts an Export Movie of the image "
-        "on a new page with the Movie Editor on it")
+        "on a new page with the Movie Editor on it; the Analysis workspace hides the docked "
+        "Viewer and its controls, shows the Sources in the Nodes dock and the Figure widgets "
+        "over the item's properties in the Properties dock, all back on a graph page; the "
+        "widgets place a zoom-in and a text; Preview builds the interactive page in the "
+        "page's place (the browser fallback here)")
 
 
 def main(argv) -> int:

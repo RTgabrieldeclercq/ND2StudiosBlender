@@ -811,6 +811,35 @@ them from the page's catalog. Rules: INV-18. Flows: WF-10.
 
 see: CON-17 · WF-08 · WF-10 · INV-18 · [MANUAL §2c](../MANUAL.md)
 
+### CON-30 — interactive HTML view
+anchors: sym:nodegraph.htmlview.document.build_view, sym:nodegraph.htmlview.page.view_html, sym:nodegraph.htmlview.page.figure_html, sym:nodegraph.catalog._shared.identity_palette.build_palette, sym:nodelab_v2.html_export.export_viewer_html, sym:nodelab_v2.figure_editor.panel.FigureEditorPanel.export_html
+
+An **interactive HTML view** (2026-11-05) is one self-contained `.html` file holding a
+result and the Viewer: the shown planes embedded as packed PNGs and the Viewer's controls
+rebuilt in JavaScript. The **view document** (`htmlview.document.build_view`, format
+`nd2studios-htmlview/1`) is built where the Dataset is and decides everything the page
+shows — the planes of every shown channel at every shown frame, read at a pixel budget
+through the pyramid or strided (`planes.read_plane`, never interpolated) and quantised to
+16 bits with an affine back to data units; the channels with names, emission colours
+(`movie_draw._emission_rgb`), windows, gammas and whether Auto owns the window; the frame
+times, positions and stage log; the overlays as DATA (Point rows with their identity-palette
+slots, the label raster the Labels overlay would draw per frame, trajectories per position,
+a scalar wash, a field raster and the vectors from `fieldmap`) with the looks
+`nodelab_v2.overlays` declares; the decor. The identity palette, the label source and the
+scalar plane moved Qt-free to `catalog._shared.identity_palette` for it (`overlay_geometry`
+re-exports them). The embedded bytes are counted as they are made and the build refuses past
+a budget. `page.view_html` / `page.figure_html` wrap a document — or a figure page: the
+editor's SVG export as the picture plus a view per image item and the chart geometries — in
+HTML with `viewer.css` / `viewer.js` inlined; nothing external is referenced. The JavaScript
+mirrors the Viewer's arithmetic (`composite_with_clim`, `_auto_clim`, `HistogramLUT`,
+`_hover_text`, `_scalebar`, `elapsed_text`), and `ND2V.core` exposes the pure functions so a
+harness can check them against the Python originals. Callers: `io.write_html` (a tap), the
+Viewer's → HTML (`html_export.export_viewer_html`, the panel's display state as the page's
+start), the figure editor's Export ▾ → Interactive HTML (`FigureEditorPanel.export_html`),
+and `figure_render --out x.html`.
+
+see: CON-29 · WF-10 · WF-11 · [MANUAL §11](../MANUAL.md)
+
 ### CON-27 — resource governor
 anchors: sym:nodegraph.governor.Governor, sym:nodegraph.governor.plan_lanes, sym:nodegraph.parallel.adaptive_fold
 

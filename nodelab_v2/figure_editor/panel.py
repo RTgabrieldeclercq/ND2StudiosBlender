@@ -11,8 +11,15 @@ document — the document is the only truth, the scene a view of it.
 ``host`` is the window's adapter (``_FigureHost``): ``figure_state(pid)``, ``catalog(pid)``,
 ``envelopes(pid)``, ``run_ids(pid)``, ``finished(run_id)``, ``fetch(run_id)``,
 ``commit(pid, doc)``, ``viewer_state(run_id, names)``, ``own_layers(run_id)``,
-``export_path(kind)``, ``status(text)``. That list is the panel's whole dependency surface
-and what the GUI probe drives.
+``export_path(kind)``, ``open_url(path)``, ``status(text)``. That list is the panel's whole
+dependency surface and what the GUI probe drives.
+
+In the window the panel is the **Analysis workspace** (2026-11-05): it is built with
+``side_panels=False``, so its Sources and Properties panels are not in its own splitter but
+homed by the window in its Nodes and Properties docks (:mod:`nodelab_v2.figure_editor.docks`)
+and the page owns the whole centre; the toolbar's **Interactive HTML** writes the page's
+standalone interactive export and **Preview** shows that export in the page's place
+(:mod:`nodelab_v2.figure_editor.preview`).
 
 Renders run on a worker thread, latest request per item wins (the Movie Editor's
 pattern): a fetched payload's provider may compute on read, and the GUI thread must never
@@ -21,21 +28,25 @@ wait on that.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import os
+import shutil
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QMenu, QPushButton, QSizePolicy,
-                               QSpinBox, QSplitter, QToolButton, QVBoxLayout, QWidget)
+                               QSpinBox, QSplitter, QStackedWidget, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from nodegraph.figure import bind as B
 from nodegraph.figure import bundle as FB
 from nodegraph.figure import layout as FL
 from nodegraph.figure import schema as S
 from nodegraph.figure import tables as FT
+from nodelab_v2 import overlays as OV
 from nodelab_v2 import theme as T
 from nodelab_v2.figure_editor import charts_data as CD
 from nodelab_v2.figure_editor import links as LK
@@ -43,6 +54,7 @@ from nodelab_v2.figure_editor import render as R
 from nodelab_v2.figure_editor.items import (ChartItem, ColorbarItem, FigureItem, HistogramItem,
                                             ImageItem, LeaderItem, LegendItem, MeasureLineItem,
                                             MontageItem, ScaleBarItem, TableItem, make_item)
+from nodelab_v2.figure_editor.preview import HtmlPreview
 from nodelab_v2.figure_editor.properties import PropertiesPanel, get_path, set_path
 from nodelab_v2.figure_editor.scene import MM, FigureScene, FigureView, mm, to_mm
 from nodelab_v2.figure_editor.sources import SourcesPanel, describe_envelope
@@ -53,6 +65,9 @@ from nodelab_v2.figure_document import FigureDocument
 _STROKE = 25.4 / 72.0 * MM
 #: the most pixels an item is read at for an export (a 180 mm page at 600 dpi is 4252)
 MAX_EXPORT_PX = 4096
+#: the Preview's budget: pixels per image and MB in all — seconds to build, not minutes
+PREVIEW_PX = 512
+PREVIEW_MB = 150.0
 
 
 def _panel_qss() -> str:
@@ -132,9 +147,16 @@ class FigureEditorPanel(QWidget):
     #: the panel's page or selection changed — the window syncs its inspector / status
     selection_changed = Signal()
 
-    def __init__(self, host: Any, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, host: Any, parent: Optional[QWidget] = None, *,
+                 side_panels: bool = True) -> None:
         super().__init__(parent)
         self._host = host
+        #: the Sources and Properties panels sit in this panel's own splitter (headless use,
+        #: the figure render); the window passes False and homes them in its docks — the
+        #: Analysis workspace (2026-11-05), where the page owns the whole centre
+        self.side_panels = bool(side_panels)
+        #: the file the Preview last built (removed at shutdown)
+        self.preview_path = ""
         self._pid: Optional[str] = None
         self._fig: Optional[FigureDocument] = None
         self._doc: Dict[str, Any] = S.new_document()
@@ -165,7 +187,14 @@ class FigureEditorPanel(QWidget):
         root.setSpacing(0)
 
         # ── toolbar ───────────────────────────────────────────────────────────
-        bar = QHBoxLayout()
+        # in a widget whose width the layout may IGNORE: the canvas stack takes the figure
+        # panel's minimum width as the window centre's, so a toolbar that insisted on its
+        # own would squeeze the side docks to their minimums on a laptop screen (measured
+        # 2026-11-05: 1017 px with the Interactive HTML and Preview buttons); the status
+        # label in the middle absorbs the slack, and only a very narrow window clips
+        self._bar = QWidget()
+        self._bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        bar = QHBoxLayout(self._bar)
         bar.setContentsMargins(6, 4, 6, 4)
         bar.setSpacing(6)
         self._title = QLabel("Figure")
@@ -220,10 +249,31 @@ class FigureEditorPanel(QWidget):
         self._status.setProperty("role", "muted")
         self._status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         bar.addWidget(self._status, 1)
+        # the interactive export, first-class (2026-11-05): one click writes it, Preview
+        # shows it in the page's place
+        self._html_btn = QPushButton("Interactive HTML")
+        self._html_btn.setToolTip("Write this page as one self-contained HTML file with every "
+                                  "image live — the reader scrubs T / Z / M, re-windows, "
+                                  "toggles the layers and reads pixels in any browser, no "
+                                  "server, no app")
+        self._html_btn.clicked.connect(lambda: self.export_dialog("html"))
+        bar.addWidget(self._html_btn)
+        self._preview_btn = QToolButton()
+        self._preview_btn.setText("Preview")
+        self._preview_btn.setCheckable(True)
+        self._preview_btn.setToolTip("Show the page as its interactive HTML export, here in "
+                                     f"its place (images at {PREVIEW_PX} px, built in seconds) "
+                                     "— scrub and re-window what a reader will get; press "
+                                     "again or ✕ to come back to the page")
+        self._preview_btn.toggled.connect(self._on_preview_toggled)
+        bar.addWidget(self._preview_btn)
         self._export_btn = QPushButton("Export ▾")
         menu = QMenu(self._export_btn)
         for fmt, text in (("png", "PNG at the page dpi"), ("tiff", "TIFF at the page dpi"),
                           ("svg", "SVG (text stays text)"), ("pdf", "PDF (fonts embedded)"),
+                          ("html", "Interactive HTML — the page with its images live: scrub "
+                                   "T / Z / M, re-window, toggle overlays, read pixels, in "
+                                   "any browser"),
                           ("bundle", "Bundle — PNG + SVG, the data drawn (CSV), the legend "
                                      "text, the provenance record"),
                           ("report", "Report — the bundle plus an HTML page and a PDF with a "
@@ -231,7 +281,7 @@ class FigureEditorPanel(QWidget):
             menu.addAction(text, lambda f=fmt: self.export_dialog(f))
         self._export_btn.setMenu(menu)
         bar.addWidget(self._export_btn)
-        root.addLayout(bar)
+        root.addWidget(self._bar)
 
         # ── body ──────────────────────────────────────────────────────────────
         self.scene = FigureScene(self)
@@ -239,14 +289,26 @@ class FigureEditorPanel(QWidget):
         self.sources_panel = SourcesPanel()
         self.props = PropertiesPanel(self)
         self.split = QSplitter(Qt.Horizontal)
-        self.split.addWidget(self.sources_panel)
-        self.split.addWidget(self.view)
-        self.split.addWidget(self.props)
-        self.split.setStretchFactor(0, 0)
-        self.split.setStretchFactor(1, 1)
-        self.split.setStretchFactor(2, 0)
-        self.split.setSizes([220, 800, 260])
-        root.addWidget(self.split, 1)
+        if self.side_panels:
+            self.split.addWidget(self.sources_panel)
+            self.split.addWidget(self.view)
+            self.split.addWidget(self.props)
+            self.split.setStretchFactor(0, 0)
+            self.split.setStretchFactor(1, 1)
+            self.split.setStretchFactor(2, 0)
+            self.split.setSizes([220, 800, 260])
+        else:
+            self.split.addWidget(self.view)           # the window docks the other two
+        # the page, or its interactive preview in the page's place (2026-11-05)
+        self.preview = HtmlPreview()
+        self.preview.back_requested.connect(lambda: self.set_preview(False))
+        self.preview.rebuild_requested.connect(lambda: self.set_preview(True))
+        self.preview.open_requested.connect(self._open_preview_external)
+        self.preview.save_requested.connect(lambda: self.export_dialog("html"))
+        self.body = QStackedWidget()
+        self.body.addWidget(self.split)
+        self.body.addWidget(self.preview)
+        root.addWidget(self.body, 1)
         self.start = StartCard(self.view)
         self.start.hide()
         self.start.goal_chosen.connect(self._on_goal)
@@ -274,6 +336,8 @@ class FigureEditorPanel(QWidget):
 
     def bind(self, page_id: Optional[str]) -> None:
         """Show ``page_id``'s figure (``None`` unbinds)."""
+        if self.preview_active():
+            self.set_preview(False)          # a preview is of one page
         if self._fig is not None:
             self._fig.off_change(self._on_figure_changed)
         self._pid = page_id
@@ -289,6 +353,7 @@ class FigureEditorPanel(QWidget):
             self._doc = S.new_document()
             self._title.setText("Figure — no page")
             self._rebuild()
+            self.selection_changed.emit()    # the widgets palette goes quiet
             return
         self._fig.on_change(self._on_figure_changed)
         self._doc = self._fig.to_dict()
@@ -296,6 +361,7 @@ class FigureEditorPanel(QWidget):
         self.refresh_sources()
         self._rebuild()
         self.view.fit_page()
+        self.selection_changed.emit()        # the widgets palette reads the new page
 
     def refresh_sources(self) -> None:
         """Re-read the feeder pages' outputs, the sources' envelopes and run ids."""
@@ -310,6 +376,7 @@ class FigureEditorPanel(QWidget):
         if sig != getattr(self, "_catalog_sig", None):   # the tree only when it changed
             self._catalog_sig = sig
             self.sources_panel.set_catalog(catalog)
+            self.selection_changed.emit()    # the widgets palette re-reads the sources
             self.start.configure([dict(describe_envelope(c.get("env")), value=c["value"],
                                        label=c.get("label"), page=c.get("page"))
                                   for c in catalog])
@@ -360,6 +427,7 @@ class FigureEditorPanel(QWidget):
 
     def shutdown(self) -> None:
         self._worker.shutdown()
+        self._drop_preview_file()
 
     def busy(self) -> bool:
         return bool(self._worker.busy)
@@ -370,6 +438,7 @@ class FigureEditorPanel(QWidget):
         self.sources_panel.restyle()
         self.props.restyle()
         self.start.restyle()
+        self.preview.restyle()
         self.scene.update()
 
     # ── the document ───────────────────────────────────────────────────────────
@@ -1518,6 +1587,8 @@ class FigureEditorPanel(QWidget):
             self._rebuilding = False
         self.props.rebuild()
         self._sync_status()
+        if self.preview_active():
+            self.preview.set_stale(True)     # the page changed under the preview
 
     def _style_combo_count(self) -> int:
         return self._style_combo.count()
@@ -2220,6 +2291,223 @@ class FigureEditorPanel(QWidget):
         QTimer.singleShot(0, self._restore_display_renders)
         return out
 
+    def export_html(self, path: str, *, budget_mb: float = 400.0, t_frames: Any = None,
+                    max_px: Optional[int] = None) -> str:
+        """Export ▾ → Interactive HTML (2026-11-05): the page as one self-contained HTML
+        file — the editor's own SVG export as the picture, and over every image item a
+        live viewer of its source (:mod:`nodegraph.htmlview`) with the item's channels,
+        windows, colours and layers, so the reader scrubs T / Z / M, re-windows, toggles
+        the overlays and reads pixels in the page's own layout. Charts answer a hover with
+        their data; twins, zoom popouts and cursor followers scrub together. Montages,
+        pictures and everything else stay as drawn. ``t_frames`` narrows the embedded
+        timepoints (the frames grammar); ``budget_mb`` is shared over the image items."""
+        import datetime as _dt
+        import tempfile
+        from nodegraph.htmlview import BudgetExceeded, build_view, figure_html, write_html
+        doc = self._doc
+        page = dict(doc.get("page") or {})
+        self.render_all_now()
+        tmp = tempfile.mkdtemp(prefix="nd2fig_")
+        try:
+            svg_path = self.scene.export(os.path.join(tmp, "page.svg"), "svg",
+                                         int(page.get("dpi", 300)))
+            with open(svg_path, encoding="utf-8") as fh:
+                svg = fh.read()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        k = svg.find("<svg")
+        svg = svg[k:] if k >= 0 else svg
+        page_id = self.bound() or ""
+        try:
+            labels = dict(self._host.source_labels(page_id) or {})
+        except Exception:                      # noqa: BLE001 — a label is cosmetic
+            labels = {}
+        images = [it for it in doc.get("items", []) if it.get("kind") == "image"]
+        views: Dict[str, Any] = {}
+        per_item = float(budget_mb) / max(1, len(images))
+        for spec in images:
+            iid = spec["id"]
+            img = S.effective_image(doc, iid)
+            rid = self._run_ids.get(img.get("source") or "", "")
+            payload = self._payloads.get(rid)
+            if payload is None:
+                continue
+            r = self.render_now(iid)
+            if not isinstance(r, R.Rendered):
+                continue
+            plan = B.read_plan(doc, iid, self._envs, cursor=dict(self._cursor))
+            chans = [int(ch.get("c", 0)) for ch in (img.get("channels") or [])] or [0]
+            chans = [c for c in chans if c in r.clims] or chans[:1]
+            state_ch = {c: {"on": True, "lo": float(r.clims[c][0]), "hi": float(r.clims[c][1]),
+                            "gamma": float(r.gammas.get(c, 1.0)),
+                            "rgb": [int(v) for v in r.colors.get(c, (255, 255, 255))]}
+                        for c in chans if c in r.clims}
+            looks: Dict[str, Any] = {}
+            if r.settings is not None:
+                for tab in OV.TABS:
+                    try:
+                        looks[tab] = dataclasses.asdict(r.settings.group(tab))
+                    except Exception:          # noqa: BLE001
+                        pass
+            z = plan.z
+            zi = 0 if z in ("max", "mean") else int(z)
+            decor = dict(img.get("decor") or {})
+            sb: Any = ({"um": float(decor.get("scale_bar_um") or 0.0)}
+                       if decor.get("scale_bar_um") else False)
+            try:
+                vdoc = build_view(
+                    payload, title=labels.get(str(img.get("source")), str(img.get("source"))),
+                    max_px=int(max_px or R.DISPLAY_MAX_PX), channels=chans, t_frames=t_frames,
+                    m_frames=[int(plan.m)], z=(z if z in ("max", "mean") else "all"),
+                    overlays=bool(img.get("layers")),
+                    state={"channels": state_ch, "overlays": looks,
+                           "coords": (int(plan.m), int(plan.t), zi, chans[0])},
+                    budget_mb=per_item, scalebar=sb, timestamp="off",
+                    own_layers=list(self._host.own_layers(rid) or []), window=plan.window)
+            except BudgetExceeded as exc:
+                raise ValueError(f"{iid}: {exc}") from None
+            views[iid] = {"rect_mm": [float(v) for v in spec["rect_mm"]], "doc": vdoc,
+                          "letter": str(spec.get("letter") or ""),
+                          "flip": [bool(img.get("flip_x")), bool(img.get("flip_y"))]}
+        charts: Dict[str, Any] = {}
+        for spec in doc.get("items", []):
+            if spec.get("kind") != "chart":
+                continue
+            item = self._items.get(spec["id"])
+            if not isinstance(item, ChartItem) or not item.geometry:
+                continue
+            try:
+                geometry = json.loads(json.dumps(item.geometry, default=float))
+            except (TypeError, ValueError):
+                geometry = dict(item.geometry)
+                geometry.pop("stats", None)
+                geometry = json.loads(json.dumps(geometry, default=str))
+            series = item.series if isinstance(item.series, (list, tuple)) else []
+            charts[spec["id"]] = {
+                "rect_mm": [float(v) for v in spec["rect_mm"]], "geometry": geometry,
+                "series": [{"label": str(s.get("label", ""))} if isinstance(s, Mapping)
+                           else {"label": ""} for s in series]}
+        # linked items scrub together: twins, zoom popouts with their parent, cursor followers
+        parent: Dict[str, str] = {}
+
+        def find(a: str) -> str:
+            while parent.get(a, a) != a:
+                a = parent[a]
+            return a
+
+        def union(a: Optional[str], b: Optional[str]) -> None:
+            if a and b and a != "None" and b != "None":
+                parent[find(a)] = find(b)
+
+        for ln in doc.get("links", []):
+            kind = ln.get("kind")
+            if kind == "zoom":
+                union(str(ln.get("parent")), str(ln.get("child")))
+            elif kind == "twin":
+                union(str(ln.get("a")), str(ln.get("b")))
+            elif kind == "cursor":
+                ids = [str(i) for i in (ln.get("items") or [])]
+                for other in ids[1:]:
+                    union(ids[0], other)
+        followers = [it["id"] for it in images
+                     if LK.follows_cursor(S.effective_image(doc, it["id"]))]
+        for other in followers[1:]:
+            union(followers[0], other)
+        groups: Dict[str, List[str]] = {}
+        for iid in views:
+            groups.setdefault(find(iid), []).append(iid)
+        links = [g for g in groups.values() if len(g) > 1]
+        name = self._host.page_name(page_id) if page_id else "figure"
+        fig = {"title": name, "written": _dt.datetime.now().isoformat(timespec="seconds"),
+               "page": {"width_mm": float(page.get("width_mm", 180.0)),
+                        "height_mm": float(page.get("height_mm", 120.0)),
+                        "font_pt": float(page.get("font_pt", 8.0))},
+               "svg": svg, "views": views, "charts": charts, "links": links}
+        out = write_html(path, figure_html(fig, title=name))
+        self._host.status(f"interactive figure written: {out}")
+        QTimer.singleShot(0, self._restore_display_renders)
+        return out
+
+    # ── the interactive preview (2026-11-05) ───────────────────────────────────
+    def preview_active(self) -> bool:
+        """Is the Preview (not the page) showing?"""
+        body = getattr(self, "body", None)
+        return body is not None and body.currentWidget() is self.preview
+
+    def _preview_file(self) -> str:
+        import tempfile
+        d = os.path.join(tempfile.gettempdir(), "nd2studios_preview")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"figure_{os.getpid()}_{id(self):x}.html")
+
+    def _drop_preview_file(self) -> None:
+        p, self.preview_path = self.preview_path, ""
+        if p:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _on_preview_toggled(self, on: bool) -> None:
+        if bool(on) != self.preview_active():
+            self.set_preview(on)
+
+    def _sync_preview_btn(self, on: bool) -> None:
+        self._preview_btn.blockSignals(True)
+        self._preview_btn.setChecked(bool(on))
+        self._preview_btn.blockSignals(False)
+
+    def _open_preview_external(self) -> None:
+        if self.preview_path and os.path.exists(self.preview_path):
+            self._host.open_url(self.preview_path)
+
+    def set_preview(self, on: bool, *, max_px: int = PREVIEW_PX,
+                    budget_mb: float = PREVIEW_MB) -> Optional[str]:
+        """**Preview** (2026-11-05): the page as its Interactive HTML export, shown in the
+        page's place inside the Analysis workspace — built by :meth:`export_html` into a
+        temporary file at a preview budget (``max_px`` per image, ``budget_mb`` in all), so
+        it comes up in seconds; the preview's *Save as…* writes the export at the page's
+        own resolution. ``False`` shows the page again. Returns the file built, else
+        ``None``. Without QtWebEngine (or with ``NODELAB_WEBVIEW=0``) the file opens in the
+        system browser instead and the page stays on screen."""
+        on = bool(on)
+        if not on:
+            self.body.setCurrentWidget(self.split)
+            self._sync_preview_btn(False)
+            return None
+        if self._pid is None:
+            self._status.setText("preview: no figure page is shown")
+            self._sync_preview_btn(False)
+            return None
+        import datetime as _dt
+        path = self._preview_file()
+        self._status.setText("building the interactive preview…")
+        try:
+            self.export_html(path, budget_mb=float(budget_mb), max_px=int(max_px))
+        except Exception as exc:           # noqa: BLE001 — told, never raised into Qt
+            self._status.setText(f"preview failed: {exc}")
+            self._sync_preview_btn(False)
+            return None
+        self.preview_path = path
+        try:
+            size_mb = os.path.getsize(path) / 1e6
+        except OSError:
+            size_mb = 0.0
+        when = _dt.datetime.now().strftime("%H:%M:%S")
+        if self.preview.show_file(path):
+            self.preview.set_status(
+                f"built {when} · {size_mb:.1f} MB · images at {int(max_px)} px — Save as… "
+                f"writes the export at the page's resolution")
+            self.body.setCurrentWidget(self.preview)
+            self._sync_preview_btn(True)
+            self._status.setText("interactive preview — ✕ Back to the page to keep editing")
+        else:
+            self._host.open_url(path)
+            self._sync_preview_btn(False)
+            self._status.setText("QtWebEngine is not installed here — the interactive page "
+                                 "opened in your browser instead")
+        return path
+
     def export_dialog(self, fmt: str) -> None:
         bundle = fmt in ("bundle", "report")
         path = self._host.export_path("png" if bundle else fmt)
@@ -2227,6 +2515,8 @@ class FigureEditorPanel(QWidget):
             try:
                 if fmt == "report":
                     self.export_report(path)
+                elif fmt == "html":
+                    self.export_html(path)
                 elif bundle:
                     self.export_bundle(path, "png")
                 else:

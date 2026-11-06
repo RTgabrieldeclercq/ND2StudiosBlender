@@ -242,6 +242,9 @@ MODULES: Tuple[str, ...] = (
     # 2026-11-02: the tables' writer, the sibling of Export TIFF / Figure — appended, not
     # slotted beside them, for the same reason (the list's order is the link-drag menu's)
     "io.write_table",
+    # 2026-11-05: the standalone interactive HTML view, the sibling of Export Movie —
+    # appended for the same reason
+    "io.write_html",
 )
 
 
